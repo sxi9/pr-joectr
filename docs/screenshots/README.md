@@ -71,3 +71,7 @@ The sample configuration of shot 08 in the viewer. Counts are computed in the pa
 ## 12 · Installation check and measured hook latency
 
 ![Installation check and measured hook latency](12-doctor.png)
+
+## 13 · Test suite
+
+![Test suite](13-test-suite.png)
