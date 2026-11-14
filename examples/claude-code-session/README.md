@@ -24,6 +24,12 @@ directory to `/project` and the home directory to `~`. It holds 68 nodes and 120
 relationships, with keyed fingerprints of the secrets, never their values. `graph.json` is
 the same data as a `tainttrail-export/1` document for the browser viewer.
 
+`audit.md` is the output of `tainttrail audit --agent` on this graph: the deterministic
+report, followed by what a second headless Claude Code instance (Haiku, 12 turns, under one
+cent) found when it was given the graph through TaintTrail's read-only MCP server and asked
+to investigate. Its text is marked as model-written and every claim carries the query behind
+it.
+
 ## Look inside
 
 With TaintTrail installed:

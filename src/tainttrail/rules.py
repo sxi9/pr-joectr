@@ -142,8 +142,9 @@ LIMIT 1""",
 MATCH p = (u:Content {untrusted: true})-[:MENTIONS]->(f:Entity {sensitive: true})<-[:READS]-(c:ToolCall {id: $call})
 WHERE u.session_id = c.session_id AND u.seq < c.seq
   AND NOT EXISTS {
-    MATCH (t:Content)-[:MENTIONS]->(f)
+    MATCH (t:Content)-[tm:MENTIONS]->(f)
     WHERE t.session_id = c.session_id AND t.seq < c.seq AND coalesce(t.untrusted, false) = false
+      AND NOT coalesce(tm.weak, false)
       AND NOT EXISTS { MATCH (u2:Content {untrusted: true})-[:MENTIONS]->(f)
                        WHERE u2.session_id = c.session_id AND u2.seq < t.seq }
   }
@@ -255,8 +256,9 @@ RETURN DISTINCT d.id AS id, d.kind AS kind, d.value AS value, d.name AS name, co
   coalesce(d.local, false) AS local, coalesce(d.trusted, false) AS trusted,
   EXISTS { MATCH (u:Content {untrusted: true})-[:MENTIONS]->(d)
            WHERE u.session_id = c.session_id AND u.seq < c.seq } AS by_untrusted,
-  EXISTS { MATCH (t:Content)-[:MENTIONS]->(d)
+  EXISTS { MATCH (t:Content)-[tm:MENTIONS]->(d)
            WHERE t.session_id = c.session_id AND t.seq < c.seq AND coalesce(t.untrusted, false) = false
+             AND NOT coalesce(tm.weak, false)
              AND NOT EXISTS { MATCH (u2:Content {untrusted: true})-[:MENTIONS]->(d)
                               WHERE u2.session_id = c.session_id AND u2.seq < t.seq } } AS by_trusted,
   EXISTS { MATCH (q:Content {origin: 'user'})-[:MENTIONS]->(d)
@@ -563,8 +565,9 @@ class _Eval:
             """
             MATCH (c:ToolCall {id: $call}) MATCH (d:Entity {id: $id})
             RETURN coalesce(d.trusted, false) AS trusted, coalesce(d.local, false) AS local,
-              EXISTS { MATCH (t:Content)-[:MENTIONS]->(d)
+              EXISTS { MATCH (t:Content)-[tm:MENTIONS]->(d)
                        WHERE t.session_id = c.session_id AND t.seq < c.seq AND coalesce(t.untrusted, false) = false
+                         AND NOT coalesce(tm.weak, false)
                          AND NOT EXISTS { MATCH (u2:Content {untrusted: true})-[:MENTIONS]->(d)
                                           WHERE u2.session_id = c.session_id AND u2.seq < t.seq } } AS by_trusted,
               EXISTS { MATCH (q:Content {origin: 'user'})-[:MENTIONS]->(d)

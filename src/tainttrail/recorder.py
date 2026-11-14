@@ -619,6 +619,8 @@ class Recorder:
         refs = mentions + ([a.source] if a.source is not None else [])
         self._merge_entities(refs, event.ts)
         if mentions:
+            from .extract import is_ambiguous_host
+
             self.store.write(
                 """
                 MATCH (c:Content {id: $cid})
@@ -628,6 +630,14 @@ class Recorder:
                 """,
                 {"cid": cid, "ids": [m.id for m in mentions]},
             )
+            # `c.id` or `session.id` in a source file is almost never a host. The mention is kept,
+            # marked: it must not make such a host count as named by the project's own content.
+            weak = [m.id for m in mentions if m.kind == "host" and is_ambiguous_host(m.value)]
+            if weak:
+                self.store.write(
+                    "MATCH (c:Content {id: $cid})-[m:MENTIONS]->(e:Entity) WHERE e.id IN $ids SET m.weak = true",
+                    {"cid": cid, "ids": weak},
+                )
         if a.source is not None:
             self.store.write(
                 "MATCH (c:Content {id: $cid}) MATCH (e:Entity {id: $eid}) MERGE (c)-[:FROM]->(e)",

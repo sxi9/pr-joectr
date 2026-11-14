@@ -1,0 +1,7 @@
+{
+  "name": "tainttrail",
+  "description": "Attack-path guard for Claude Code. Records every prompt, tool call and tool result in a Relate graph and blocks a call that would send private data where untrusted content pointed. Adds hooks, a read-only MCP server over the graph, a skill and a command.",
+  "version": "0.1.0",
+  "author": { "name": "TaintTrail" },
+  "keywords": ["security", "prompt-injection", "data-exfiltration", "hooks", "mcp", "relate", "graph"]
+}

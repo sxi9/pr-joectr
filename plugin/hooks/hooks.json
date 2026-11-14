@@ -1,0 +1,44 @@
+{
+  "description": "TaintTrail guard: records prompts, tool calls and tool results in the project's graph, and denies or asks before a call that would complete an attack path. Needs the `tainttrail` command on PATH.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          { "type": "command", "command": "tainttrail hook claude-code", "timeout": 10 },
+          { "type": "command", "command": "command -v tainttrail >/dev/null 2>&1 || printf '%s\\n' '{\"systemMessage\": \"TaintTrail plugin: the tainttrail command is not on PATH, so this session is NOT guarded. Install it as the plugin README says, then start a new session.\"}'", "timeout": 5 }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          { "type": "command", "command": "tainttrail hook claude-code", "timeout": 10 }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          { "type": "command", "command": "tainttrail hook claude-code", "timeout": 10 }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          { "type": "command", "command": "tainttrail hook claude-code", "timeout": 10 }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "matcher": "*",
+        "hooks": [
+          { "type": "command", "command": "tainttrail hook claude-code", "timeout": 10 }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "tainttrail": {
+      "type": "stdio",
+      "command": "tainttrail",
+      "args": ["-C", "${CLAUDE_PROJECT_DIR}", "mcp"]
+    }
+  }
+}

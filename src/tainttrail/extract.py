@@ -307,6 +307,25 @@ def extract_entities(text: str, *, cwd: str | None = None, limit: int = 200, max
     return list(found)[:limit]
 
 
+# Two-part names that are as likely an attribute access in code as a host: `c.id`, `session.id`,
+# `self.name`, `row.is`. They are still recorded as hosts (a page may well say "send it to evil.id"),
+# but a mention in trusted content is too weak to make such a host one the project knows.
+_ATTRIBUTE_TLDS = frozenset("id name is it in at as to do so no be my me by".split())
+_CODE_RECEIVERS = frozenset("""
+    self this cls obj item row node data config cfg file app db ctx args opts params props state result res req
+    request response event user session entry record doc msg env model query input output key value val tmp err error
+    el ev fn cb it x y z i j k n m p q r s t u v w a b c d e f g h
+""".split())
+
+
+def is_ambiguous_host(host: str) -> bool:
+    """Whether a host name could just as well be ``variable.attribute`` in source code."""
+    labels = host.lower().split(".")
+    if len(labels) != 2:
+        return False
+    return len(labels[0]) <= 2 or labels[0] in _CODE_RECEIVERS or labels[1] in _ATTRIBUTE_TLDS
+
+
 def _is_hostlike(name: str) -> bool:
     name = name.lower().rstrip(".")
     if name in _CODE_NAMESPACES or "." not in name:
