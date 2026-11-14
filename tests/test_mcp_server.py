@@ -1011,9 +1011,6 @@ def test_reading_the_explanation_on_the_command_line_does_not_either(tmp_path, m
     assert (first, second) == ("ask", "ask")
 
 
-@pytest.mark.xfail(strict=False, reason="outside this module: `tainttrail explain` and `tainttrail log` print the host as it "
-                                        "is. Read in a later session, before the page names the host again, that output is "
-                                        "the first mention of the host and a trusted one. See the report for this build.")
 def test_reading_it_on_the_command_line_in_a_later_session_does_not_either(tmp_path, monkeypatch):
     def on_the_command_line(cfg, call):
         printed = subprocess.run([sys.executable, "-m", "tainttrail", "-C", str(cfg.root), "explain"],

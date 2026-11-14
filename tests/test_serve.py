@@ -1469,17 +1469,44 @@ def test_the_viewer_uses_no_regex_lookbehind():
 
 
 def test_what_other_tools_click_in_the_viewer_is_there():
-    """The demo video builder drives the viewer by visible text. A label that is reworded here breaks it there."""
-    scenes = VIEWER.parents[2] / "tools" / "demo-video" / "scenes.json"
-    if not scenes.is_file():
-        pytest.skip("no demo video script in this checkout")
+    """The demo video and the screenshots drive the viewer by id, class and visible text.
+
+    A name that is changed here breaks them there, and nothing else would say so until the next render.
+    """
+    tools = VIEWER.parents[2] / "tools"
+    scripts = [p for p in (tools / "demo-video" / "scenes.json", tools / "screenshots" / "shots.json") if p.is_file()]
+    if not scripts:
+        pytest.skip("no screenshot or video script in this checkout")
     sources = "\n".join(p.read_text(encoding="utf-8") for p in _OWN_SOURCES)
-    wanted = [step[key][len("text="):] for scene in json.loads(scenes.read_text(encoding="utf-8"))["scenes"]
-              if scene.get("kind") == "viewer" for step in scene.get("steps", []) for key in ("click", "scrollTo")
-              if str(step.get(key, "")).startswith("text=")]
-    assert wanted, "the viewer scene clicks nothing by text any more: drop this test"
-    for text in wanted:
-        assert f"'{text}'" in sources or f">{text}<" in sources, f"{text!r} is not a label of the viewer"
+    selectors = set()
+
+    def collect(node):
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key in ("click", "waitFor", "scrollTo") and isinstance(value, str):
+                    selectors.add(value)
+                else:
+                    collect(value)
+        elif isinstance(node, list):
+            for item in node:
+                collect(item)
+
+    for script in scripts:
+        collect(json.loads(script.read_text(encoding="utf-8")))
+    assert selectors, "neither tool selects anything in the viewer any more: drop this test"
+    for selector in sorted(selectors):
+        if selector.startswith("text="):
+            text = selector[len("text="):]
+            assert f"'{text}'" in sources or f">{text}<" in sources, f"{text!r} is not a label of the viewer"
+            continue
+        for kind, name in re.findall(r"([#.])([A-Za-z][\w-]*)", re.sub(r"\[[^\]]*\]", "", selector)):
+            assert re.search(rf"(?<![\w-]){re.escape(name)}(?![\w-])", sources), f"{kind}{name} ({selector}) is not in the viewer"
+        for attribute in re.findall(r"\[([a-z-]+)", selector):
+            if attribute.startswith("data-"):
+                camel = re.sub(r"-(\w)", lambda m: m.group(1).upper(), attribute[len("data-"):])
+                set_somewhere = (attribute in sources or f"dataset.{camel}" in sources
+                                 or re.search(rf"dataset:\s*\{{[^}}]*\b{re.escape(camel)}\b", sources))
+                assert set_somewhere, f"[{attribute}] ({selector}) is not set by the viewer"
 
 
 def test_viewer_sources_are_plain_ascii():
