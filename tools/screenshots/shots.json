@@ -155,8 +155,8 @@
       "id": "11",
       "name": "scenario-matrix",
       "kind": "terminal",
-      "label": "The whole suite: 105 replayed scenarios",
-      "note": "17 attacks modelled on public incident reports, 11 attack variants aimed at the edges of the rules, 10 ordinary workflows, 64 ordinary sessions written by a reviewer to find false alarms (32 were interrupted before the fixes), 3 harder cases. Every secret is a canary and every host is reserved; replay contacts nothing.",
+      "label": "The whole suite: 161 replayed scenarios",
+      "note": "17 attacks modelled on public incident reports, 64 attack variants written by two reviewers against the edges of the rules, 10 ordinary workflows, 64 ordinary sessions written to find false alarms (32 were interrupted before the fixes), 3 harder cases, and 3 known gaps that are not stopped yet and stay in the suite. Every secret is a canary and every host is reserved; replay contacts nothing.",
       "command": "TAINTTRAIL_KEY=screenshots-fixed-key {python} -m tainttrail demo all",
       "show": "tainttrail demo all"
     },
@@ -173,8 +173,8 @@
       "name": "test-suite",
       "kind": "terminal",
       "label": "Test suite",
-      "command": "{python} -m pytest -q -p no:cacheprovider 2>&1 | tail -6",
-      "show": "pytest -q",
+      "command": "{python} -m pytest -p no:cacheprovider 2>&1 | tail -6",
+      "show": "pytest",
       "timeout": 1500
     }
   ]

@@ -119,17 +119,17 @@
       "kind": "terminal",
       "seconds": 10,
       "chapter": "Results",
-      "where": "tainttrail demo all: 105 replayed scenarios, canary secrets, reserved hosts",
+      "where": "tainttrail demo all: 161 replayed scenarios, canary secrets, reserved hosts",
       "command": "TAINTTRAIL_KEY=demo-video-fixed-key {python} -m tainttrail demo all",
       "show": "tainttrail demo all",
       "tail": 19,
-      "highlight": "attacks stopped|attack variants|ordinary|canary secrets",
-      "caption": "17 attacks modelled on public incidents and 11 variants are stopped. 73 of 74 ordinary sessions run without a single question, and no canary secret leaves."
+      "highlight": "attacks stopped|attack variants|ordinary|known gaps|canary secrets",
+      "caption": "17 attacks modelled on public incidents and 64 variants written by reviewers are stopped. 73 of 74 ordinary sessions run without a question. No canary secret leaves; 3 known gaps are listed."
     },
     {
       "kind": "title",
       "seconds": 6,
-      "kicker": "Open source · runs offline · no account needed",
+      "kicker": "Runs offline · no account needed · one Relate file per project",
       "title": "pip install -e . && tainttrail init",
       "text": "A monitor, not a sandbox. What it cannot see is listed in the README.",
       "foot": "github.com/sxi9/pr-joectr",

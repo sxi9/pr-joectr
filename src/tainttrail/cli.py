@@ -546,8 +546,21 @@ def cmd_doctor(args: argparse.Namespace, cfg: Config) -> int:
             calls = sum(1 for s in result.steps if s.kind == "tool")
             timings.append((time.perf_counter() - started) * 1000 / max(1, calls * 2 + 2))
         per_event = statistics.median(timings)
-        line(per_event < 150, "hook latency", f"{per_event:.0f} ms per event in process (median of {args.rounds}); "
-             "a real hook adds interpreter start-up, about 70 ms")
+        # ... and as the agent runs it: a process of its own for every event, in that scratch project.
+        import subprocess
+
+        payload = json.dumps({"session_id": "doctor", "cwd": str(result.root), "hook_event_name": "PreToolUse",
+                              "tool_name": "Bash", "tool_input": {"command": "ls"}, "tool_use_id": "doctor"})
+        spent = []
+        for _ in range(args.rounds):
+            started = time.perf_counter()
+            subprocess.run([sys.executable, "-m", "tainttrail", "hook", "claude-code"], input=payload, text=True,
+                           capture_output=True, cwd=result.root, timeout=60, check=False)
+            spent.append((time.perf_counter() - started) * 1000)
+        whole = statistics.median(spent)
+        # The rest of it is starting Python and loading the engine.
+        line(whole < 1000, "hook latency", f"{whole:.0f} ms per hook process, as the agent runs it (median of {args.rounds}); "
+             f"{per_event:.0f} ms of that is rule and graph work")
     except Exception as exc:   # noqa: BLE001
         line(False, "hook latency", f"could not measure: {exc}")
     finally:

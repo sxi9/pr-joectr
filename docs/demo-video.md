@@ -23,7 +23,7 @@ export TAINTTRAIL_DB=examples/claude-code-session/graph.rl   # for shots 4 and 5
 | 4 | 0:58-1:18 | `tainttrail explain` | "Every hook event is a node in an embedded Relate graph, one file per project. The rule is a Cypher path query: untrusted content names a host, the call sends to it, and uploads a sensitive file. The path is the explanation." |
 | 5 | 1:18-1:36 | `tainttrail ui`, open the finding, press Run | "The same graph opens in the browser on Relate's WebAssembly build, offline. The query that blocked the call runs again in the page." |
 | 6 | 1:36-1:48 | `tainttrail scan --path examples/agent-config/project --home examples/agent-config/home` with `TAINTTRAIL_DB` pointing at a scratch file, then `tainttrail paths` and `tainttrail fix` | "Before anything runs, the same graph maps the agent's tools and finds the combinations that can leak, with the smallest permission change that breaks them." |
-| 7 | 1:48-1:55 | `tainttrail demo all` | "Seventeen attacks modelled on public incidents and eleven variants stopped; seventy-three of seventy-four ordinary sessions untouched. It is a monitor, not a sandbox. The limits are in the README." |
+| 7 | 1:48-1:55 | `tainttrail demo all` | "Seventeen attacks modelled on public incidents and sixty-four variants written by reviewers stopped; seventy-three of seventy-four ordinary sessions untouched; three known gaps listed. It is a monitor, not a sandbox. The limits are in the README." |
 
 Notes:
 

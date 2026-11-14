@@ -62,11 +62,11 @@ The sample configuration of shot 08 in the viewer. Counts are computed in the pa
 
 ![Capability map: servers, tools, what each can do, and the toxic paths between them](10-viewer-capability-map.png)
 
-## 11 · The whole suite: 105 replayed scenarios
+## 11 · The whole suite: 161 replayed scenarios
 
-17 attacks modelled on public incident reports, 11 attack variants aimed at the edges of the rules, 10 ordinary workflows, 64 ordinary sessions written by a reviewer to find false alarms (32 were interrupted before the fixes), 3 harder cases. Every secret is a canary and every host is reserved; replay contacts nothing.
+17 attacks modelled on public incident reports, 64 attack variants written by two reviewers against the edges of the rules, 10 ordinary workflows, 64 ordinary sessions written to find false alarms (32 were interrupted before the fixes), 3 harder cases, and 3 known gaps that are not stopped yet and stay in the suite. Every secret is a canary and every host is reserved; replay contacts nothing.
 
-![The whole suite: 105 replayed scenarios](11-scenario-matrix.png)
+![The whole suite: 161 replayed scenarios](11-scenario-matrix.png)
 
 ## 12 · Installation check and measured hook latency
 
