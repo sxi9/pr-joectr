@@ -25,6 +25,7 @@ import math
 import os
 import re
 from dataclasses import dataclass
+from typing import Iterable
 from urllib.parse import unquote, unquote_plus, urlsplit
 
 from .config import normalize_path
@@ -57,6 +58,14 @@ world zone gl gd im ws cz gr hu ro ua pk bd vn th my ph ae sa eg ng ke
 """.split())
 _CODE_NAMESPACES = frozenset({"java.io", "java.net", "javax.net", "system.io", "system.net", "kotlin.io", "scala.io",
                               "golang.org", "self.app", "this.app", "app.id", "e.g", "i.e"})
+# "owner/name" written without a host. Ordinary prose is full of a/b pairs, so a slug
+# only counts when something marks it as a repository: an issue number after it, a
+# repository word before it, or a hyphen, digit or underscore in one of its parts.
+_SLUG = re.compile(r"(?<![\w./@:#-])([A-Za-z0-9][A-Za-z0-9-]{0,38})/([A-Za-z0-9._-]{2,100})(#\d+)?(?![\w/-])")
+_SLUG_CONTEXT = re.compile(r"(?:\b(?:repo(?:sitory)?|repos|fork(?:ed)? of|clone|issues? (?:in|on|of)|pull requests? (?:in|on)"
+                           r"|github|gitlab)|(?:-R|--repo))\s*(?:named|called|is|at)?[\s:=\"'`(]*$", re.I)
+_SLUG_FILE_EXT = re.compile(r"\.(?:py|js|ts|tsx|jsx|json|md|txt|sh|ya?ml|toml|lock|log|csv|html?|css|c|h|cc|cpp|rs|go|java|rb"
+                            r"|php|png|jpe?g|gif|svg|pdf|zip|gz|tgz|env|ini|cfg|conf|xml|sql)$", re.I)
 _FORGES = ("github.com", "gitlab.com", "bitbucket.org", "codeberg.org")
 _FORGE_RESERVED = frozenset({"orgs", "settings", "login", "features", "topics", "search", "marketplace", "sponsors",
                              "about", "pricing", "apps", "notifications", "issues", "pulls", "explore", "users",
@@ -225,6 +234,14 @@ def extract_entities(text: str, *, cwd: str | None = None, limit: int = 200) -> 
     for m in _KNOWN_HOME.finditer(masked):
         add(EntityRef("file", normalize_path(_KNOWN_FILES[m.group(1)])))
 
+    for m in _SLUG.finditer(masked):
+        owner, name, issue = m.group(1), m.group(2).rstrip("."), m.group(3)
+        if _SLUG_FILE_EXT.search(name) or name.endswith(".git") and False:
+            continue
+        marked = bool(issue) or bool(re.search(r"[-_\d]", owner + name)) or bool(_SLUG_CONTEXT.search(masked[max(0, m.start() - 40):m.start()]))
+        if marked:
+            add(EntityRef("repo", f"github.com/{owner.lower()}/{_no_git_suffix(name).lower()}"))
+
     for m in _IPV4.finditer(masked):
         add(EntityRef("host", m.group(1)))
     for m in _BARE_HOST.finditer(masked):
@@ -367,10 +384,15 @@ def fingerprint(value: str, key: bytes) -> str:
     return hmac.new(key, value.encode("utf-8", "replace"), hashlib.sha256).hexdigest()[:32]
 
 
+_LINE_PREFIX = re.compile(r"^(?:[-*+>#]+\s+|\d{1,3}[.)]\s+|//+\s*|/\*+\s*)+")
+
+
 def _normal_lines(text: str) -> list[str]:
+    """Lines as they compare across copies: whitespace collapsed, list and quote markers dropped."""
     out = []
     for raw in text.splitlines():
         line = " ".join(raw.split())
+        line = _LINE_PREFIX.sub("", line).strip("`*_ ")
         if MIN_LINE <= len(line) <= 2000:
             out.append(line)
     return out
@@ -401,8 +423,34 @@ def _tokens(text: str, minimum: int) -> list[str]:
 
 
 def _looks_random(token: str) -> bool:
-    return (len(token) >= MIN_SOURCE_TOKEN and bool(re.search(r"[A-Za-z]", token)) and bool(re.search(r"\d", token))
-            and shannon_entropy(token) >= 3.5 and "/" not in token.strip("/")[:1] and not token.startswith(("http", "www.")))
+    """A string worth remembering on its own: random-looking, or simply too long to recur by chance."""
+    if token.startswith(("http", "www.")) or len(token) < MIN_SOURCE_TOKEN:
+        return False
+    if not (re.search(r"[A-Za-z]", token) and re.search(r"\d", token)):
+        return False
+    if len(token) >= 64 and re.fullmatch(r"[A-Za-z0-9+/=_-]+", token):
+        return True   # an encoded blob: hex of ASCII text has low entropy but is still unique
+    return shannon_entropy(token) >= 3.5 and not token.startswith("/")
+
+
+def encoded_secret_chunks(text: str, key: bytes, *, limit: int = 100) -> tuple[list[ChunkRef], list[str]]:
+    """Secrets hidden in an encoded blob: fingerprints of what the text decodes to.
+
+    ``base64 .env`` and ``xxd -p .env`` put secrets into the agent's context without one
+    readable secret in it. Returns the fingerprints of the secrets found after decoding
+    and the kinds of secret, so the content can be marked sensitive.
+    """
+    chunks: dict[str, ChunkRef] = {}
+    kinds: list[str] = []
+    for variant in decode_variants(text):
+        for hit in find_secrets(variant):
+            if hit.kind not in kinds:
+                kinds.append(hit.kind)
+            for value in [hit.value, *_tokens(hit.value, MIN_SUBTOKEN)]:
+                if len(chunks) < limit:
+                    fp = fingerprint(value, key)
+                    chunks.setdefault(fp, ChunkRef(fp, "secret", hit.kind, len(value)))
+    return list(chunks.values()), kinds
 
 
 def content_chunks(text: str, key: bytes, *, limit: int = 400) -> list[ChunkRef]:
@@ -478,9 +526,40 @@ def carried_fingerprints(text: str, key: bytes, *, limit: int = 4000) -> list[st
     return list(out)
 
 
+_BOUNDARY = re.compile(r"(?<![A-Za-z0-9])(?=[A-Za-z0-9])|(?<=[A-Za-z0-9])(?![A-Za-z0-9])")
+
+
+def window_fingerprints(text: str, key: bytes, lengths: Iterable[int], *, limit: int = 6_000,
+                        max_text: int = 4096) -> list[str]:
+    """Fingerprints of fixed-length windows that start or end at a word boundary.
+
+    A token comparison misses a secret that is glued to other characters, such as
+    ``NAME-secret.dns.example`` in a host name. The graph knows how long each recorded
+    secret is, so for each of those lengths this takes the window after every word start
+    and before every word end. The cost is the number of boundaries times the number of
+    lengths, a few thousand hashes for a long command.
+    """
+    text = text[:max_text]
+    sizes = sorted({int(n) for n in lengths if 8 <= int(n) <= 256})[:24]
+    if not text or not sizes:
+        return []
+    out: dict[str, None] = {}
+    bounds = [m.start() for m in _BOUNDARY.finditer(text)]
+    for pos in bounds:
+        for n in sizes:
+            for piece in (text[pos:pos + n], text[max(0, pos - n):pos]):
+                if len(piece) == n:
+                    out.setdefault(fingerprint(piece, key))
+            if len(out) >= limit:
+                return list(out)
+    return list(out)
+
+
 _B64_RUN = re.compile(r"[A-Za-z0-9+/_-]{16,}={0,2}")
 _HEX_RUN = re.compile(r"(?<![0-9A-Fa-f])(?:[0-9A-Fa-f]{2}){8,}(?![0-9A-Fa-f])")
 _PERCENT = re.compile(r"%[0-9A-Fa-f]{2}")
+_WRAPPED_HEX = re.compile(r"(?:[0-9A-Fa-f]{16,}\s+){1,400}[0-9A-Fa-f]{2,}")
+_WRAPPED_B64 = re.compile(r"(?:[A-Za-z0-9+/]{40,}\s+){1,400}[A-Za-z0-9+/]{2,}={0,2}")
 _MAX_VARIANTS = 64
 _MAX_RUNS = 200
 
@@ -520,6 +599,17 @@ def decode_variants(text: str, *, depth: int = 2) -> list[str]:
         try:
             add(_printable(bytes.fromhex(m.group(0))))
         except ValueError:
+            continue
+    for m in list(_WRAPPED_HEX.finditer(text))[:8]:
+        try:
+            add(_printable(bytes.fromhex("".join(m.group(0).split()))))
+        except ValueError:
+            continue
+    for m in list(_WRAPPED_B64.finditer(text))[:8]:
+        joined = "".join(m.group(0).split()).rstrip("=")
+        try:
+            add(_printable(base64.b64decode(joined + "=" * (-len(joined) % 4))))
+        except (binascii.Error, ValueError):
             continue
     if _PERCENT.search(text):
         add(unquote(text))

@@ -38,6 +38,7 @@ class BashAnalysis:
     env_uploaded: bool = False                            # ... into a command that sends data out
     executes_download: bool = False                       # runs something it fetches in the same command
     executed: list[str] = field(default_factory=list)     # URLs or files executed
+    staged: list[str] = field(default_factory=list)       # paths given to `git add` ("." means everything)
     encodes: bool = False                                 # an encoder or decoder sits in front of a sink
     is_sink: bool = False                                 # can move data off the machine
     sink_kinds: list[str] = field(default_factory=list)   # "http","shell-net","git","dns","email","publish","cloud","opaque"
@@ -53,7 +54,7 @@ class BashAnalysis:
 # -- small helpers ---------------------------------------------------------------------------
 
 _URL = re.compile(r"""\b(?:https?|wss?|ftp|sftp|ssh|git|s3|gs)://[^\s'"<>`|;)]+""", re.I)
-_HOSTLIKE = re.compile(r"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{1,23}$", re.I)
+_HOSTLIKE = re.compile(r"^(?:[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?\.)+[a-z][a-z0-9-]{1,23}$", re.I)
 _IPV4 = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}$")
 _ASSIGN = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$", re.S)
 _VAR = re.compile(r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)[^}]*\}|([A-Za-z_][A-Za-z0-9_]*))")
@@ -315,6 +316,7 @@ def _split(tokens: list[str]) -> list[list[list[str]]]:
 @dataclass
 class _Cmd:
     program: str = ""
+    raw_program: str = ""           # as written, with its directory
     reads: list[str] = field(default_factory=list)
     writes: list[str] = field(default_factory=list)
     deletes: list[str] = field(default_factory=list)
@@ -323,6 +325,7 @@ class _Cmd:
     dests: list[tuple[str, str]] = field(default_factory=list)
     derived: list[tuple[str, str]] = field(default_factory=list)
     executed: list[str] = field(default_factory=list)
+    staged: list[str] = field(default_factory=list)
     env_reads: list[str] = field(default_factory=list)
     env_dump: bool = False
     network: bool = False          # sends something to another machine
@@ -636,6 +639,12 @@ def _git(c: _Cmd, args: list[str], ctx: _Ctx) -> None:
         scope = "~/.gitconfig" if ("--global" in opts or "--system" in opts) else os.path.join(cwd or ".", ".git", "config")
         if len(operands) >= 2 or "--add" in opts or "--unset" in opts:
             _add(c.writes, scope)
+    elif sub == "add":
+        for path in operands:
+            if path not in (".", "-A", "--all"):
+                _add(c.staged, path)
+        if not operands or "." in operands or "-A" in opts or "--all" in opts or "-u" in opts:
+            _add(c.staged, ".")
     elif sub == "send-email":
         c.network, c.sink_kind, c.payload = True, "email", True
         for value in _vals(opts, "--to", "--cc", "--bcc"):
@@ -853,14 +862,20 @@ def _mail(c: _Cmd, args: list[str]) -> None:
 def _name_lookup(c: _Cmd, args: list[str]) -> None:
     opts, operands = _opts(args, {"-c", "-i", "-I", "-t", "-W", "-w", "-s", "-p", "-q", "-x", "-b", "-k", "-y", "-f", "-m"})
     c.passes_through = False
-    names = [o.lstrip("@") for o in operands if _looks_like_host(o.lstrip("@"))]
-    if not names:
-        return
-    c.network, c.sink_kind = True, "dns"
-    for name in names:
-        _add(c.dests, ("host", name.lower().rstrip(".")))
-        if any(len(label) >= 20 for label in name.split(".")):
-            c.payload = True   # a long label is room for data
+    for o in operands:
+        name = o.lstrip("@")
+        computed = _SUB.search(name) or "$" in name
+        if computed:
+            # ping $(...).dns.example: the labels in front are data, the written suffix is the destination
+            suffix = re.split(r"\x00S\d+\x00|\$\{?[A-Za-z_][A-Za-z0-9_]*\}?", name)[-1].lstrip(".-_")
+            if _looks_like_host(suffix):
+                c.network, c.sink_kind, c.payload = True, "dns", True
+                _add(c.dests, ("host", suffix.lower().rstrip(".")))
+        elif _looks_like_host(name):
+            c.network, c.sink_kind = True, "dns"
+            _add(c.dests, ("host", name.lower().rstrip(".")))
+            if any(len(label) >= 20 for label in name.split(".")):
+                c.payload = True   # a long label is room for data
 
 
 def _openssl(c: _Cmd, args: list[str]) -> None:
@@ -1014,7 +1029,7 @@ def _reader(c: _Cmd, args: list[str]) -> None:
     for value in _vals(opts, "-f") if program in ("grep", "egrep", "fgrep", "sed", "awk", "gawk", "jq") else []:
         _add(c.reads, value)
     for op in operands:
-        if op != "-" and not op.startswith("\x00"):
+        if op != "-" and not op.startswith("\x00") and not re.fullmatch(r"[-+]\d+", op):
             _add(c.reads, op)
     if program == "sed" and any(k.startswith("-i") for k in opts):
         for op in operands:
@@ -1253,6 +1268,8 @@ def _dispatch(c: _Cmd, args: list[str], ctx: _Ctx) -> None:
         c.prints_secret = True
     else:
         c.passes_through = False
+        if "/" in c.raw_program and not c.raw_program.startswith("-"):
+            _add(c.executed, c.raw_program)   # ./tool or /tmp/x.sh: a file on disk is being run
 
 
 def _expand(word: str, ctx: _Ctx, c: _Cmd) -> str:
@@ -1363,6 +1380,7 @@ def _simple(words: list[str], ctx: _Ctx) -> _Cmd | None:
             _add(c.sub_idx, idx)
         return c
     c.program = _base(expanded)
+    c.raw_program = expanded
     rest = []
     for a in args[1:]:
         e = _expand(a, ctx, c)
@@ -1384,7 +1402,7 @@ def _is_known(item) -> bool:
 
 def _merge(out: BashAnalysis, inner: BashAnalysis) -> None:
     for name in ("reads", "writes", "uploads", "deletes", "fetches", "destinations", "derived", "env_reads",
-                 "env_uploads", "executed", "sink_kinds", "opaque_reasons", "programs"):
+                 "env_uploads", "executed", "staged", "sink_kinds", "opaque_reasons", "programs"):
         target = getattr(out, name)
         for item in getattr(inner, name):
             _add(target, item)
@@ -1422,7 +1440,7 @@ def _pipeline(cmds: list[_Cmd], ctx: _Ctx, out: BashAnalysis) -> None:
 
         for name, items in (("reads", c.reads), ("writes", c.writes), ("deletes", c.deletes), ("uploads", c.uploads),
                             ("fetches", c.fetches), ("derived", c.derived), ("executed", c.executed),
-                            ("env_reads", c.env_reads)):
+                            ("staged", c.staged), ("env_reads", c.env_reads)):
             target = getattr(out, name)
             for item in items:
                 if _is_known(item):
@@ -1503,6 +1521,8 @@ def _pipeline(cmds: list[_Cmd], ctx: _Ctx, out: BashAnalysis) -> None:
         flow_literal = c.literal_out if c.program in ("echo", "printf") else ""
 
         if c.stdout_file:
+            if flow_env or c.env_dump:
+                _add(out.derived, (c.stdout_file, "env:*"))   # the file now holds the environment
             for src in [*flow_files, *produced_files]:
                 if src != c.stdout_file:
                     _add(out.derived, (c.stdout_file, src))

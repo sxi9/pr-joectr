@@ -91,15 +91,19 @@ def test_tt001_through_an_allow_listed_host_is_still_blocked(sim: Sim):
     assert only(findings, "TT001").action == "deny"
 
 
-def test_tt001_user_named_destination_asks_instead_of_denying(sim: Sim):
+def test_tt001_asks_only_when_the_user_named_both_the_destination_and_the_data(sim: Sim):
     mine = EntityRef("host", "backup.example.com")
     sim.prompt(mine)
     sim.fetch_poisoned_page()
     sim.read_env()
+    # Naming where to send things is not asking for .env to be sent there.
+    _, findings = sim.call("Bash", Action(S.SENDS_TO, mine), sink=True, dests=[mine], carried=[SECRET])
+    assert only(findings, "TT001").action == "deny"
+    sim.prompt(mine, sim.env_path())
     _, findings = sim.call("Bash", Action(S.SENDS_TO, mine), sink=True, dests=[mine], carried=[SECRET])
     f = only(findings, "TT001")
     assert f.action == "ask"
-    assert "named this destination yourself" in f.explanation
+    assert "named this destination and this data yourself" in f.explanation
 
 
 def test_line_fingerprints_need_several_matches(sim: Sim):

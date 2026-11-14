@@ -51,6 +51,8 @@ class Config:
     lock_timeout_ms: int = defaults.LOCK_TIMEOUT_MS
     # "auto" uses the `claude` CLI when it is on PATH; "none" keeps everything deterministic.
     llm: str = "auto"
+    # Tell the agent at session start that it is being watched and what a block means.
+    announce: bool = True
 
     @property
     def db_path(self) -> Path:
@@ -184,6 +186,8 @@ def _apply(cfg: Config, raw: dict[str, Any]) -> None:
         cfg.mode = mode
     if isinstance(raw.get("fail_closed"), bool):
         cfg.fail_closed = raw["fail_closed"]
+    if isinstance(raw.get("announce"), bool):
+        cfg.announce = raw["announce"]
     if raw.get("llm") in ("auto", "claude-cli", "none"):
         cfg.llm = raw["llm"]
     hosts = raw.get("hosts") or {}

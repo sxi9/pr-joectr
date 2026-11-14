@@ -8,7 +8,7 @@ only decisions that reach the harness are "ask" and "deny".
 from __future__ import annotations
 
 from . import rules, schema as S
-from .analyze import analyze_call, analyze_prompt, analyze_result
+from .analyze import analyze_call, analyze_memory, analyze_prompt, analyze_result
 from .config import Config
 from .model import Decision, Finding, HookEvent
 from .recorder import Recorder
@@ -38,6 +38,7 @@ class Guard:
         with store.transaction():
             if event.kind == "session_start":
                 rec.session_start(event)
+                self._read_inherited_memory(rec, event, cwd)
                 return Decision()
             if event.kind == "user_prompt":
                 rec.record_prompt(event, analyze_prompt(event.prompt, self.cfg, cwd=cwd))
@@ -47,6 +48,20 @@ class Guard:
             if event.kind == "post_tool":
                 return self._post_tool(store, rec, event, cwd)
         return Decision()
+
+    def _read_inherited_memory(self, rec: Recorder, event: HookEvent, cwd: str) -> None:
+        """Instruction files tainted in an earlier session enter this one without a tool call.
+
+        The harness loads them itself, so the guard reads them too: what they mention
+        (a host, a file) has to be in the graph for the rules to connect it to a later call.
+        """
+        for item in rec.inherited_memory(event.session_id):
+            try:
+                with open(item["path"], encoding="utf-8", errors="replace") as fh:
+                    text = fh.read(self.cfg.max_content_bytes)
+            except OSError:
+                continue
+            rec.update_content(item["id"], event, analyze_memory(text, self.cfg, cwd=cwd, name=item["name"]))
 
     def _pre_tool(self, store: Store, rec: Recorder, event: HookEvent, cwd: str) -> Decision:
         rec.ensure_session(event)

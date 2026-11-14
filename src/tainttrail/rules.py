@@ -33,6 +33,8 @@ from .store import Store
 # repeat by coincidence, so it takes several.
 MIN_LINE_CHUNKS = 3
 INJECTION_WARN_SCORE = 0.5
+# Below this, content that merely mentions a file or a command is treated as documentation.
+LIKELY_INJECTION = 0.3
 
 
 @dataclass(frozen=True)
@@ -68,6 +70,8 @@ RULES: dict[str, Rule] = {
              "A tool result reads like instructions aimed at the agent", "post"),
         Rule("TT010", "guard.tamper", "high", "ask",
              "The guard's own files or hook registration would be changed", "pre"),
+        Rule("TT011", "scope.crossed", "high", "ask",
+             "Private data read from one repository would be written to another", "pre"),
     )
 }
 
@@ -167,6 +171,44 @@ WHERE u.session_id = c.session_id AND u.seq < c.seq
 RETURN p
 ORDER BY u.seq
 LIMIT 1""",
+    # untrusted content -> download source <- downloaded file <- call that runs it
+    "TT007.staged": """
+MATCH p = (u:Content {untrusted: true})-[:MENTIONS]->(d:Entity)<-[:DERIVED_FROM]-(f:Entity)<-[:EXECUTES]-(c:ToolCall {id: $call})
+WHERE u.session_id = c.session_id AND u.seq < c.seq
+RETURN p
+ORDER BY u.seq
+LIMIT 1""",
+    "TT007.staged.host": """
+MATCH p = (u:Content {untrusted: true})-[:MENTIONS]->(h:Entity)<-[:ON_HOST]-(d:Entity)<-[:DERIVED_FROM]-(f:Entity)
+          <-[:EXECUTES]-(c:ToolCall {id: $call})
+WHERE u.session_id = c.session_id AND u.seq < c.seq
+RETURN p
+ORDER BY u.seq
+LIMIT 1""",
+    # untrusted content, then a read of repository P, then a write to repository Q
+    "TT011": """
+MATCH (c:ToolCall {id: $call})-[:SENDS_TO]->(q:Entity {kind: 'repo'})
+MATCH (r:ToolCall {session_id: c.session_id})-[:READS]->(p:Entity {kind: 'repo'})
+WHERE r.seq < c.seq AND p.id <> q.id
+MATCH (r)-[:RETURNED]->(s:Content {sensitive: true})
+MATCH (u:Content {session_id: c.session_id, untrusted: true})
+WHERE u.seq < r.seq
+  AND NOT EXISTS {
+    MATCH (t:Content {origin: 'user'})-[:MENTIONS]->(p)
+    WHERE t.session_id = c.session_id AND t.seq < c.seq
+  }
+RETURN u, r, p, s, c, q
+ORDER BY u.seq DESC, r.seq DESC
+LIMIT 1""",
+    # a copy of a sensitive file, written or staged in this session, behind a push
+    "egress.commit": """
+MATCH (c:ToolCall {id: $call})
+MATCH (w:ToolCall {session_id: c.session_id})-[e:WRITES|READS]->(f:Entity {kind: 'file'})
+WHERE w.seq <= c.seq AND coalesce(f.sensitive, false) AND f.value STARTS WITH $root
+  AND (coalesce(e.staged, false) OR (type(e) = 'WRITES' AND EXISTS { MATCH (f)-[:DERIVED_FROM]->(:Entity {sensitive: true}) }))
+OPTIONAL MATCH (f)-[:DERIVED_FROM]->(src:Entity {sensitive: true})
+RETURN f.id AS id, f.name AS name, f.kind AS kind, f.value AS path, w.id AS writer, src.id AS source
+ORDER BY w.seq DESC""",
     # earlier session's untrusted content <- tainted file <- this content
     "TT008": """
 MATCH p = (o:Content {id: $content})-[:FROM]->(e:Entity)-[:TAINTED_BY]->(u:Content)
@@ -199,7 +241,7 @@ RETURN c.session_id AS sid, c.seq AS seq, c.ts AS ts, c.tool AS tool,
 _Q_TARGETS = """
 MATCH (c:ToolCall {id: $call})-[r]->(d:Entity)
 WHERE type(r) IN $rels
-RETURN DISTINCT d.id AS id, d.kind AS kind, d.value AS value, d.name AS name,
+RETURN DISTINCT d.id AS id, d.kind AS kind, d.value AS value, d.name AS name, coalesce(r.via, '') AS via,
   coalesce(d.local, false) AS local, coalesce(d.trusted, false) AS trusted,
   EXISTS { MATCH (u:Content {untrusted: true})-[:MENTIONS]->(d)
            WHERE u.session_id = c.session_id AND u.seq < c.seq } AS by_untrusted,
@@ -214,7 +256,7 @@ _Q_CARRIED_SENSITIVE = """
 MATCH (c:ToolCall {id: $call})-[:CARRIES]->(k:Chunk)<-[:HAS_CHUNK]-(p:Content {sensitive: true})
 WITH p, collect(DISTINCT k) AS ks
 OPTIONAL MATCH (p)-[:FROM]->(src:Entity)
-RETURN p.id AS content, src.name AS source,
+RETURN p.id AS content, src.name AS source, src.id AS source_id,
        size([k IN ks WHERE k.kind IN ['secret', 'token']]) AS strong,
        size([k IN ks WHERE k.kind = 'line']) AS lines,
        [k IN ks WHERE k.kind = 'secret' | k.hint] AS hints
@@ -262,6 +304,7 @@ LIMIT 1""",
     S.CHUNK: "MATCH (n:Chunk {id: $id}) RETURN properties(n) AS p",
 }
 
+_SCRIPT_NAME = re.compile(r"(?:\.(?:sh|bash|zsh|py|pl|rb|js|mjs|ps1|bat|cmd|exe|bin|run|command|appimage)|/(?:install|setup|bootstrap|run)[\w.-]*)$", re.I)
 _TAMPER_COMMAND = re.compile(r"TAINTTRAIL_DISABLE|tainttrail\s+uninstall|-m\s+tainttrail\s+uninstall")
 _SETTINGS_FILE = re.compile(r"/\.claude/settings(\.local)?\.json$")
 
@@ -428,6 +471,24 @@ class _Eval:
             query=query, params=params or {},
         )
 
+    def _injection_score(self, content_id: str) -> float:
+        node, _ = self.describe(S.CONTENT, content_id)
+        return float(node["props"].get("injection_score") or 0.0)
+
+    def provenance(self, entity_id: str) -> dict[str, Any]:
+        """Who named an entity earlier in the session, and whether it is on the allow-list."""
+        return self.store.one(
+            """
+            MATCH (c:ToolCall {id: $call}) MATCH (d:Entity {id: $id})
+            RETURN coalesce(d.trusted, false) AS trusted, coalesce(d.local, false) AS local,
+              EXISTS { MATCH (t:Content)-[:MENTIONS]->(d)
+                       WHERE t.session_id = c.session_id AND t.seq < c.seq AND coalesce(t.untrusted, false) = false } AS by_trusted,
+              EXISTS { MATCH (q:Content {origin: 'user'})-[:MENTIONS]->(d)
+                       WHERE q.session_id = c.session_id AND q.seq < c.seq } AS by_user
+            """,
+            {"call": self.call_id, "id": entity_id},
+        ) or {"trusted": False, "local": False, "by_trusted": False, "by_user": False}
+
     def title_of(self, label: str, node_id: str | None) -> str:
         if not node_id:
             return "untrusted content"
@@ -438,41 +499,63 @@ class _Eval:
 
     def egress(self) -> list[Finding]:
         call = self.call
-        if call is None or not call.is_sink:
+        if call is None:
+            return []
+        args_leave = bool(call.extra.get("args_leave"))   # an MCP tool nobody labelled a sink
+        if not call.is_sink and not args_leave:
             return []
         dests = self.targets(S.SENDS_TO)
-        external = [d for d in dests if not d["local"]]
-        if dests and not external:
+        direct = [d for d in dests if d["via"] != "suffix"]
+        parents = [d for d in dests if d["via"] == "suffix"]   # the domains a host sits under
+        external = [d for d in direct if not d["local"]]
+        if direct and not external:
             return []  # everything stays on this machine or the local network
-        safe_ids = {d["id"] for d in external if d["trusted"] or d["by_user"]}
+
+        def under(host: dict[str, Any]) -> list[dict[str, Any]]:
+            return [p for p in parents if host["kind"] == "host" and host["value"].endswith("." + p["value"])]
+
+        safe_ids = {d["id"] for d in external if d["trusted"] or d["by_user"]
+                    or any(p["trusted"] or p["by_user"] for p in under(d))}
         for d in external:  # a URL is as safe as its host
-            if d["kind"] == "url" and d["id"] not in safe_ids:
-                host = _host_id(d["value"])
-                if host in safe_ids:
-                    safe_ids.add(d["id"])
+            if d["kind"] == "url" and d["id"] not in safe_ids and _host_id(d["value"]) in safe_ids:
+                safe_ids.add(d["id"])
         all_safe = bool(external) and all(d["id"] in safe_ids for d in external)
         if not external and call.extra.get("dest_trusted"):
             all_safe = True
-        user_named = bool(external) and all(_named_by_user(d, external) for d in external)
-        injected = [
-            d for d in external
-            if d["by_untrusted"] and not d["by_trusted"] and not d["trusted"] and not d["by_user"]
-        ]
-        injected.sort(key=lambda d: _SPECIFICITY.get(d["kind"], 9))
+        user_named = bool(external) and all(
+            _named_by_user(d, external) or any(p["by_user"] for p in under(d)) for d in external)
+
+        def is_injected(d: dict[str, Any]) -> bool:
+            return d["by_untrusted"] and not d["by_trusted"] and not d["trusted"] and not d["by_user"]
+
+        injected = [d for d in external if is_injected(d) and d["id"] not in safe_ids]
+        # A parent domain that only untrusted content named taints every host under it.
+        injected += [p for p in parents if is_injected(p) and not p["local"]
+                     and any(h["id"] not in safe_ids for h in external if h in external and p in under(h))]
+        injected.sort(key=lambda d: (_SPECIFICITY.get(d["kind"], 9), -len(d["value"])))
 
         carried = [
             r for r in self.store.run(_Q_CARRIED_SENSITIVE, {"call": self.call_id})
             if r["strong"] >= 1 or r["lines"] >= MIN_LINE_CHUNKS
         ]
         uploaded = self.store.run(_Q_UPLOADED_SENSITIVE, {"call": self.call_id})
-        primary = (injected or external or [None])[0]
-        dest_name = primary["value"] if primary else "an unknown destination"
+        committed: list[dict[str, Any]] = []
+        if call.sink_kind == "git":
+            committed = [c for c in self.store.run(CYPHER["egress.commit"].strip(),
+                                                   {"call": self.call_id, "root": self._root_prefix()})
+                         if not self._git_ignored(c["path"])]
+            seen = {u["id"] for u in uploaded}
+            uploaded += [c for c in {c["id"]: c for c in committed}.values() if c["id"] not in seen]
+        primary = (injected or sorted(external, key=lambda d: _SPECIFICITY.get(d["kind"], 9)) or [None])[0]
+        dest_name = _dest_name(primary)
 
         if carried or uploaded:
             what = _describe_payload(carried, uploaded)
             f = self._sensitive_egress(primary, injected, carried, uploaded, what, dest_name,
-                                       user_named, all_safe)
+                                       user_named, all_safe, committed)
             return [f] if f else []
+        if not call.is_sink:
+            return []   # an unlabelled tool is only judged on evidence of what it carries
 
         payload = bool(call.extra.get("carries_payload", True))
         followed = bool(self.store.scalar(_Q_FOLLOWED_LINK, {"call": self.call_id}, 0))
@@ -484,12 +567,16 @@ class _Eval:
             more = " Sensitive data has also been read in this session." if self.sensitive_in_session else ""
             f = self.finding(
                 "TT003", action="ask", severity=sev,
-                title=f"Data would go to {d['value']}, which only untrusted content named",
-                explanation=(f"{_cap(source)} named {d['value']}. Nothing you typed and no trusted content "
+                title=f"Data would go to {_dest_name(d)}, which only untrusted content named",
+                explanation=(f"{_cap(source)} named {_dest_name(d)}. Nothing you typed and no trusted content "
                              f"mentions it, and this call sends data there.{more}"),
                 path=path, query=query, params=params,
             )
             return [f] if f else []
+
+        crossed = self.scope_crossed() if payload else []
+        if crossed:
+            return crossed
 
         if self.untrusted_in_session and self.sensitive_in_session and payload and not all_safe and not followed:
             row = self.store.one(CYPHER["TT002"].strip(), {"call": self.call_id})
@@ -512,10 +599,66 @@ class _Eval:
             return [f] if f else []
         return []
 
+    def scope_crossed(self) -> list[Finding]:
+        """TT011: private data from one repository, a write to another, untrusted content before both."""
+        row = self.store.one(CYPHER["TT011"].strip(), {"call": self.call_id})
+        if not row:
+            return []
+        p_name, q_name = row["p"]["props"].get("value"), row["q"]["props"].get("value")
+        path = [
+            self.step(S.CONTENT, row["u"]["id"], rel="in the same session", role="untrusted"),
+            self.step(S.TOOL_CALL, row["r"]["id"], rel=S.READS, forward=True),
+            self.step(S.ENTITY, row["p"]["id"], rel="in the same session", role="sensitive"),
+            self.step(S.TOOL_CALL, row["c"]["id"], rel=S.SENDS_TO, forward=True),
+            self.step(S.ENTITY, row["q"]["id"], role="destination"),
+        ]
+        f = self.finding(
+            "TT011", action="ask",
+            title=f"Data read from {p_name} would be written to {q_name}",
+            explanation=(f"After reading untrusted content ({path[0].title}), the agent read private data from "
+                         f"{p_name}, which you did not mention, and this call writes to {q_name}. A summary leaves "
+                         "no fingerprint, so check what is being written."),
+            path=path, query=CYPHER["TT011"].strip(), params={"call": self.call_id},
+        )
+        return [f] if f else []
+
+    def _root_prefix(self) -> str:
+        return (self.cfg.root.as_posix().rstrip("/") + "/") if self.cfg is not None else "/"
+
+    def _git_ignored(self, path: str) -> bool:
+        """Whether the project's top-level .gitignore covers a path. A plain reading, not git's full rules."""
+        if self.cfg is None or not path:
+            return False
+        root = self.cfg.root.as_posix().rstrip("/")
+        if not path.startswith(root + "/"):
+            return False
+        rel = path[len(root) + 1:]
+        try:
+            with open(f"{root}/.gitignore", encoding="utf-8", errors="replace") as fh:
+                patterns = [ln.strip() for ln in fh if ln.strip() and not ln.startswith("#")]
+        except OSError:
+            return False
+        import fnmatch
+
+        ignored = False
+        for pattern in patterns:
+            negate = pattern.startswith("!")
+            pat = pattern.lstrip("!").lstrip("/")
+            if pat.endswith("/"):
+                hit = rel.startswith(pat) or ("/" + pat) in ("/" + rel + "/")
+            else:
+                hit = (fnmatch.fnmatch(rel, pat) or fnmatch.fnmatch(rel.rsplit("/", 1)[-1], pat)
+                       or rel.startswith(pat + "/"))
+            if hit:
+                ignored = not negate
+        return ignored
+
     def _sensitive_egress(self, primary, injected, carried, uploaded, what, dest_name,
-                          user_named, all_safe) -> Finding | None:
+                          user_named, all_safe, committed=()) -> Finding | None:
         dest_id = primary["id"] if primary else None
         use_upload = bool(uploaded) and not carried
+        if committed and not carried and all(u["id"] in {c["id"] for c in committed} for u in uploaded):
+            return self._committed_egress(primary, committed, dest_name)
         if injected:
             key = "TT001.upload.injected" if use_upload else "TT001.carry.injected"
             path, query, params = self.run_path(key, dest=dest_id)
@@ -544,16 +687,24 @@ class _Eval:
                 explanation = (f"This call would send {what} to {dest_name}. The session holds untrusted content "
                                f"({source}), which can steer the agent, so sensitive data is not allowed to leave.")
                 severity = "high"
-            action = "ask" if (user_named and not injected) else "deny"
+            # Naming the destination is not the same as asking for this data to go there.
+            sources_named = self._sources_named_by_user(carried, uploaded)
+            action = "ask" if (user_named and sources_named and not injected) else "deny"
             if action == "ask":
-                explanation += " You named this destination yourself, so you can approve it."
+                explanation += " You named this destination and this data yourself, so you can approve it."
             return self.finding("TT001", action=action, severity=severity,
                                 title=f"{_cap(what)} would be sent to {dest_name}",
                                 explanation=explanation, path=path, query=query, params=params)
 
         # No untrusted content anywhere upstream: a leak, not an injection.
-        single_credential = (not uploaded and len(carried) == 1 and carried[0]["strong"] == 1
-                             and carried[0]["lines"] == 0)
+        # One credential and nothing else: a token in a header, or one variable expanded
+        # into the command. A file, the whole environment or copied lines are not that.
+        named_vars = [u for u in uploaded if u.get("kind") == "env" and u["name"] != "*"]
+        other_uploads = [u for u in uploaded if u not in named_vars]
+        carried_secrets = sum(len(set(c.get("hints") or [])) or (1 if c["strong"] else 0) for c in carried)
+        copied_lines = any(c["lines"] >= MIN_LINE_CHUNKS for c in carried)
+        single_credential = (not other_uploads and not copied_lines
+                             and carried_secrets + len(named_vars) == 1)
         if user_named:
             action, severity = "allow", "info"
             tail = "You named this destination in your prompt."
@@ -568,6 +719,43 @@ class _Eval:
                             explanation=f"This call would send {what} to {dest_name}. {tail}",
                             path=path, query=query, params=params)
 
+    def _sources_named_by_user(self, carried, uploaded) -> bool:
+        """Did the user's own prompts mention every sensitive thing this call carries?"""
+        ids = [u["id"] for u in uploaded] + [c["source_id"] for c in carried if c.get("source_id")]
+        if not ids or any(c.get("source_id") is None for c in carried):
+            return False
+        return all(self.provenance(i)["by_user"] for i in ids)
+
+    def _committed_egress(self, primary, committed, dest_name) -> Finding | None:
+        """A push after a copy of a sensitive file was written or staged in this session."""
+        top = committed[0]
+        path = [self.step(S.ENTITY, top["source"], rel=S.DERIVED_FROM, forward=False, role="sensitive")] if top.get("source") else []
+        path += [
+            self.step(S.ENTITY, top["id"], rel=S.WRITES, forward=False, role="sensitive"),
+            self.step(S.TOOL_CALL, top["writer"], rel="in the same session"),
+            self.step(S.TOOL_CALL, self.call_id, rel=S.SENDS_TO if primary else None),
+        ]
+        if primary:
+            path.append(self.step(S.ENTITY, primary["id"], role="destination"))
+        query = CYPHER["egress.commit"].strip()
+        params = {"call": self.call_id, "root": self._root_prefix()}
+        origin = f", a copy of {path[0].title}," if top.get("source") else ""
+        if self.untrusted_in_session:
+            source = self.title_of(S.CONTENT, self.ctx.get("last_untrusted"))
+            return self.finding(
+                "TT001", action="deny", severity="high",
+                title=f"A push to {dest_name} would carry {top['name']}",
+                explanation=(f"{_cap(top['name'])}{origin} was written or staged in this session and is not ignored "
+                             f"by git, and this call pushes to {dest_name}. The session holds untrusted content "
+                             f"({source}), so sensitive data is not allowed to leave this way."),
+                path=path, query=query, params=params)
+        return self.finding(
+            "TT006", action="ask", severity="high",
+            title=f"A push to {dest_name} would carry {top['name']}",
+            explanation=(f"{_cap(top['name'])}{origin} was written or staged in this session and is not ignored by "
+                         f"git, and this call pushes to {dest_name}. Approve it if that is intended."),
+            path=path, query=query, params=params)
+
     # -- TT004 ---------------------------------------------------------------------------
 
     def steered_read(self) -> list[Finding]:
@@ -576,8 +764,11 @@ class _Eval:
         path, query, params = self.run_path("TT004")
         if not path:
             return []
+        # A setup guide that mentions .env is not an attack. Text that reads like
+        # instructions to the agent and points at a credentials file is.
+        pointed = self._injection_score(path[0].node_id) >= LIKELY_INJECTION
         f = self.finding(
-            "TT004", action="ask",
+            "TT004", action="ask" if pointed else "allow", severity="high" if pointed else "info",
             title=f"{_cap(path[0].title)} pointed the agent at {path[1].title}",
             explanation=(f"{_cap(path[0].title)} mentions {path[1].title}, which holds sensitive data, and the agent "
                          "is now reading it. Nothing you typed asked for that file."),
@@ -635,15 +826,55 @@ class _Eval:
                 d for d in sources
                 if d["by_untrusted"] and not d["by_trusted"] and not d["trusted"] and not d["by_user"]
             ]
-            injected.sort(key=lambda d: _SPECIFICITY.get(d["kind"], 9))
+            injected.sort(key=lambda d: (_SPECIFICITY.get(d["kind"], 9), -len(d["value"])))
             if injected:
                 d = injected[0]
                 path, query, params = self.run_path("TT007.download", dest=d["id"])
                 f = self.finding(
                     "TT007", action="deny",
-                    title=f"Code from {d['value']} would be downloaded and run",
-                    explanation=(f"{_cap(path[0].title if path else 'untrusted content')} named {d['value']}, and "
+                    title=f"Code from {_dest_name(d)} would be downloaded and run",
+                    explanation=(f"{_cap(path[0].title if path else 'untrusted content')} named {_dest_name(d)}, and "
                                  "this command downloads from it and runs the result. Nothing you typed mentions "
+                                 "that source."),
+                    path=path, query=query, params=params,
+                )
+                return [f] if f else []
+        saved = [(t, src) for t, src in call.extra.get("derived", []) if _SCRIPT_NAME.search(t)
+                 and src.startswith("url:")]
+        if saved and not call.executes_download:
+            sources = [d for d in self.targets(S.FETCHES) if not d["local"] and d["via"] != "suffix"]
+            injected = [d for d in sources if d["by_untrusted"] and not d["by_trusted"] and not d["trusted"]
+                        and not d["by_user"]]
+            injected.sort(key=lambda d: (_SPECIFICITY.get(d["kind"], 9), -len(d["value"])))
+            if injected:
+                d = injected[0]
+                path, query, params = self.run_path("TT007.download", dest=d["id"])
+                name = saved[0][0].rsplit("/", 1)[-1]
+                f = self.finding(
+                    "TT007", action="ask", severity="high",
+                    title=f"A script would be saved from {_dest_name(d)}, which only untrusted content named",
+                    explanation=(f"{_cap(path[0].title if path else 'untrusted content')} named {_dest_name(d)}, and "
+                                 f"this command saves {name} from there. Running it later will be blocked; decide "
+                                 "now whether you want it on disk at all."),
+                    path=path, query=query, params=params,
+                )
+                return [f] if f else []
+        if any(a.rel == S.EXECUTES and a.entity.kind == "file" for a in call.actions):
+            # Download now, run later: the file on disk still came from where it came from.
+            for key in ("TT007.staged", "TT007.staged.host"):
+                path, query, params = self.run_path(key)
+                if not path:
+                    continue
+                named = path[1]
+                who = self.provenance(named.node_id)
+                if who["trusted"] or who["by_trusted"] or who["by_user"] or who["local"]:
+                    continue
+                file_step = path[-2]
+                f = self.finding(
+                    "TT007", action="deny",
+                    title=f"{_cap(file_step.title)} was downloaded from {named.title} and would now be run",
+                    explanation=(f"{_cap(path[0].title)} named {named.title}. An earlier command downloaded "
+                                 f"{file_step.title} from there, and this call runs it. Nothing you typed mentions "
                                  "that source."),
                     path=path, query=query, params=params,
                 )
@@ -652,8 +883,11 @@ class _Eval:
             row = self.store.one(_Q_CARRIED_UNTRUSTED, {"call": self.call_id, "kinds": ["line"]})
             if row and row["n"] >= 1:
                 path, query, params = self.run_path("TT007.copied")
+                # Copying an install command from documentation is ordinary work. Copying it
+                # from text that reads like instructions to the agent is not.
+                likely = bool(path) and self._injection_score(path[0].node_id) >= LIKELY_INJECTION
                 f = self.finding(
-                    "TT007", action="ask", severity="high",
+                    "TT007", action="ask" if likely else "allow", severity="high" if likely else "info",
                     title="A network command was copied from untrusted content",
                     explanation=(f"This command repeats text from {path[0].title if path else 'untrusted content'} "
                                  "and it reaches the network. Run it only if you would have typed it yourself."),
@@ -699,6 +933,18 @@ class _Eval:
 
 
 _SPECIFICITY = {"repo": 0, "email": 1, "mcp": 2, "url": 3, "host": 4}
+
+
+def _dest_name(dest: dict[str, Any] | None) -> str:
+    """How a destination is named in a sentence: the host for a URL, the value otherwise."""
+    if not dest:
+        return "an unknown destination"
+    if dest["kind"] == "url":
+        host = _host_id(dest["value"])
+        return host.split(":", 1)[1] if host else dest["value"]
+    if dest["kind"] == "mcp":
+        return f"the {str(dest['value']).split('/', 1)[0]} MCP server"
+    return str(dest["value"])
 
 
 def _host_id(url: str) -> str | None:
@@ -754,14 +1000,20 @@ def _cap(text: str) -> str:
 def _describe_payload(carried: list[dict[str, Any]], uploaded: list[dict[str, Any]]) -> str:
     """What the call carries, in words. Never the data itself."""
     if uploaded:
-        names = [u["name"] or u["id"] for u in uploaded]
-        names = ["the process environment" if n in ("*", "env:*") else n for n in names]
-        head = names[0] if len(names) == 1 else f"{names[0]} and {len(names) - 1} more"
-        return f"the contents of {head}" if not head.startswith("the ") else head
+        names = []
+        for u in uploaded:
+            name = u["name"] or u["id"]
+            if u.get("kind") == "env":
+                names.append("the process environment" if name == "*" else f"${name}")
+            else:
+                names.append(f"the contents of {name}")
+        return names[0] if len(names) == 1 else f"{names[0]} and {len(names) - 1} more"
     top = carried[0]
     source = top.get("source") or "sensitive content"
     if top["strong"]:
-        n = top["strong"]
+        # One secret can match through several fingerprints (the value and its parts);
+        # count kinds of secret, not fingerprints.
+        n = len(set(top.get("hints") or [])) or 1
         return f"{n} secret{'s' if n != 1 else ''} from {source}"
     return f"text copied from {source}"
 

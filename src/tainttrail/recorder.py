@@ -75,6 +75,20 @@ class Recorder:
         self._trust_git_remotes(event)
         return self._inherit_memory(event)
 
+    def inherited_memory(self, session_id: str) -> list[dict[str, Any]]:
+        """The instruction files a session inherited as untrusted memory: id, path and name."""
+        return self.store.run(
+            """
+            MATCH (:Session {id: $sid})-[:RECEIVED]->(c:Content {origin: 'memory'})-[:FROM]->(e:Entity)
+            RETURN c.id AS id, e.value AS path, e.name AS name ORDER BY id
+            """,
+            {"sid": session_id},
+        )
+
+    def update_content(self, content_id: str, event: HookEvent, analysis: ContentAnalysis, *, seq: int = 0) -> None:
+        """Replace what is known about a content node: used once the text behind it has been read."""
+        self._write_content(content_id, event, seq, analysis)
+
     def next_seq(self, session_id: str) -> int:
         seq = self.store.scalar(
             "MATCH (s:Session {id: $id}) SET s.last_seq = coalesce(s.last_seq, 0) + 1 RETURN s.last_seq",
@@ -221,9 +235,15 @@ class Recorder:
         if existing and self.store.one("MATCH (c:ToolCall {id: $id}) RETURN c.id AS id", {"id": existing}):
             return existing
         if carried is None:
-            from .extract import carried_fingerprints
+            from .extract import carried_fingerprints, window_fingerprints
 
-            carried = carried_fingerprints(analysis.arg_text, self.cfg.key()) if analysis.arg_text else []
+            carried = []
+            if analysis.arg_text:
+                key = self.cfg.key()
+                carried = carried_fingerprints(analysis.arg_text, key)
+                # A secret glued to other characters (NAME-secret.dns.example) is no token of
+                # its own. The graph knows how long each recorded secret is; try those windows.
+                carried += window_fingerprints(analysis.arg_text, key, self.secret_lengths())
         carried = list(dict.fromkeys(carried))
 
         with self.store.transaction():
@@ -285,6 +305,20 @@ class Recorder:
                 {"id": cid, "min_lines": COPY_TAINT_MIN_CHUNKS},
             )
         return cid
+
+    def secret_lengths(self) -> list[int]:
+        """The lengths of every secret value fingerprinted so far."""
+        row = self.store.one("MATCH (m:Meta {key: 'secret_lengths'}) RETURN m.values AS v")
+        return [int(n) for n in (row["v"] if row and row["v"] else [])]
+
+    def _remember_secret_lengths(self, lengths: Iterable[int]) -> None:
+        new = {int(n) for n in lengths if 8 <= int(n) <= 256}
+        if not new:
+            return
+        known = set(self.secret_lengths())
+        if not new <= known:
+            self.store.write("MERGE (m:Meta {key: 'secret_lengths'}) SET m.values = $v",
+                             {"v": sorted(known | new)[:64]})
 
     def set_decision(self, call_id: str, action: str) -> None:
         self.store.write(
@@ -409,7 +443,21 @@ class Recorder:
             "MATCH (e:Entity) WHERE e.id IN $ids AND coalesce(e.untrusted, false) RETURN e.id AS id",
             {"ids": ids},
         )
-        return {r["id"] for r in rows}
+        tainted = {r["id"] for r in rows}
+        # A file inside a directory that came from elsewhere (a clone, an extracted archive).
+        files = [i for i in ids if i.startswith("file:") and i not in tainted]
+        if files:
+            roots = self.store.run(
+                """
+                MATCH (d:Entity {kind: 'file'})-[:DERIVED_FROM]->(src:Entity)
+                WHERE coalesce(d.untrusted, false) AND src.kind IN ['url', 'host', 'repo']
+                RETURN DISTINCT d.value AS path
+                """
+            )
+            for row in roots:
+                prefix = (row["path"] or "").rstrip("/") + "/"
+                tainted.update(i for i in files if i[5:].startswith(prefix))
+        return tainted
 
     def trust_entity(self, entity_id: str) -> bool:
         """A human reviewed this file: forget its taint. Returns False if it is unknown."""
@@ -509,6 +557,7 @@ class Recorder:
                     {"id": c.id, "kind": c.kind, "hint": c.hint, "length": int(c.length)} for c in chunks
                 ]},
             )
+            self._remember_secret_lengths(c.length for c in chunks if c.kind == "secret")
 
     def entity_row(self, ref: EntityRef) -> dict[str, Any]:
         """Node properties for an entity, with the flags the project's config gives it."""
