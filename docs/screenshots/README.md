@@ -20,16 +20,54 @@ Rule TT001 on the real session. The path runs from the untrusted file to the hos
 
 ![The blocked call, its attack path, and the Cypher query that found it](03-attack-path.png)
 
-## 04 · All 30 scenarios: 17 attacks, 10 ordinary workflows, 3 harder cases
+## 04 · The same graph in the browser, on Relate's WebAssembly build
 
-Attack scenarios are modelled on public incident reports. Every secret is a canary and every host is reserved; replay contacts nothing.
+tainttrail ui serves a static viewer on 127.0.0.1. The recorded session is loaded into an in-memory Relate store in the page; every number on screen is the result of a Cypher query run there. Nothing leaves the machine.
 
-![All 30 scenarios: 17 attacks, 10 ordinary workflows, 3 harder cases](04-scenario-matrix.png)
+![The same graph in the browser, on Relate's WebAssembly build](04-viewer-overview.png)
 
-## 05 · Installation check and measured hook latency
+## 05 · The blocked call as a path, with the query that found it run again in the page
 
-![Installation check and measured hook latency](05-doctor.png)
+Rule TT001 on the real session. The stored Cypher query was run in the browser with the Run button; the nodes and relationships it returned are the ones highlighted in the diagram.
 
-## 06 · Test suite
+![The blocked call as a path, with the query that found it run again in the page](05-viewer-attack-path.png)
 
-![Test suite](06-test-suite.png)
+## 06 · Session timeline: what each call touched and what it brought into the context
+
+The real session, call by call. Untrusted and sensitive content are marked where they entered; the denied call shows the destination only untrusted content named and the file it would have uploaded.
+
+![Session timeline: what each call touched and what it brought into the context](06-viewer-timeline.png)
+
+## 07 · Read-only Cypher console in the browser
+
+Any read query against the recorded graph, run on Relate WASM. Here: every destination that only untrusted content named, and the calls that tried to send there.
+
+![Read-only Cypher console in the browser](07-viewer-console.png)
+
+## 08 · Before anything runs: what the agent is configured with
+
+tainttrail scan reads agent configuration into the same graph: MCP servers, their tools with capability labels, permission rules, credential names. This is the sample setup in examples/agent-config (four MCP servers for Claude Code, two for Cursor).
+
+![Before anything runs: what the agent is configured with](08-capability-scan.png)
+
+## 09 · Toxic tool combinations, and the smallest change that breaks them
+
+A toxic path is a source of untrusted text, a tool that reads private data and a way out, on one agent. fix searches for the cheapest set of permission changes that leaves no path open, and checks it by applying the change inside a Relate transaction, re-running the path query and rolling back.
+
+![Toxic tool combinations, and the smallest change that breaks them](09-toxic-paths-and-fix.png)
+
+## 10 · Capability map: servers, tools, what each can do, and the toxic paths between them
+
+The sample configuration of shot 08 in the viewer. Counts are computed in the page by the same path query the command line uses.
+
+![Capability map: servers, tools, what each can do, and the toxic paths between them](10-viewer-capability-map.png)
+
+## 11 · The whole suite: 105 replayed scenarios
+
+17 attacks modelled on public incident reports, 11 attack variants aimed at the edges of the rules, 10 ordinary workflows, 64 ordinary sessions written by a reviewer to find false alarms (32 were interrupted before the fixes), 3 harder cases. Every secret is a canary and every host is reserved; replay contacts nothing.
+
+![The whole suite: 105 replayed scenarios](11-scenario-matrix.png)
+
+## 12 · Installation check and measured hook latency
+
+![Installation check and measured hook latency](12-doctor.png)

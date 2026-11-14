@@ -29,15 +29,139 @@
     },
     {
       "id": "04",
+      "name": "viewer-overview",
+      "kind": "page",
+      "label": "The same graph in the browser, on Relate's WebAssembly build",
+      "note": "tainttrail ui serves a static viewer on 127.0.0.1. The recorded session is loaded into an in-memory Relate store in the page; every number on screen is the result of a Cypher query run there. Nothing leaves the machine.",
+      "setup": "rm -rf {tmp}/tt-shot-ui && TAINTTRAIL_DB=examples/claude-code-session/graph.rl {python} -m tainttrail ui --export-dir {tmp}/tt-shot-ui >/dev/null",
+      "serve": "python3 -m http.server 8791 --bind 127.0.0.1 --directory {tmp}/tt-shot-ui",
+      "url": "http://127.0.0.1:8791/index.html#/",
+      "waitFor": "body[data-state=\"ready\"]",
+      "settle": 900,
+      "viewport": [
+        1280,
+        800
+      ]
+    },
+    {
+      "id": "05",
+      "name": "viewer-attack-path",
+      "kind": "page",
+      "label": "The blocked call as a path, with the query that found it run again in the page",
+      "note": "Rule TT001 on the real session. The stored Cypher query was run in the browser with the Run button; the nodes and relationships it returned are the ones highlighted in the diagram.",
+      "setup": "rm -rf {tmp}/tt-shot-ui && TAINTTRAIL_DB=examples/claude-code-session/graph.rl {python} -m tainttrail ui --export-dir {tmp}/tt-shot-ui >/dev/null",
+      "serve": "python3 -m http.server 8791 --bind 127.0.0.1 --directory {tmp}/tt-shot-ui",
+      "url": "http://127.0.0.1:8791/index.html#/findings",
+      "waitFor": "body[data-state=\"ready\"]",
+      "steps": [
+        {
+          "click": "a[href*='TT001']"
+        },
+        {
+          "waitFor": "#run-query"
+        },
+        {
+          "click": "#run-query"
+        },
+        {
+          "waitFor": "#run-status.run-ok"
+        }
+      ],
+      "settle": 900,
+      "viewport": [
+        1280,
+        1000
+      ],
+      "fullPage": true
+    },
+    {
+      "id": "06",
+      "name": "viewer-timeline",
+      "kind": "page",
+      "label": "Session timeline: what each call touched and what it brought into the context",
+      "note": "The real session, call by call. Untrusted and sensitive content are marked where they entered; the denied call shows the destination only untrusted content named and the file it would have uploaded.",
+      "setup": "rm -rf {tmp}/tt-shot-ui && TAINTTRAIL_DB=examples/claude-code-session/graph.rl {python} -m tainttrail ui --export-dir {tmp}/tt-shot-ui >/dev/null",
+      "serve": "python3 -m http.server 8791 --bind 127.0.0.1 --directory {tmp}/tt-shot-ui",
+      "url": "http://127.0.0.1:8791/index.html#/session",
+      "waitFor": "body[data-state=\"ready\"]",
+      "settle": 900,
+      "viewport": [
+        1280,
+        900
+      ],
+      "fullPage": true
+    },
+    {
+      "id": "07",
+      "name": "viewer-console",
+      "kind": "page",
+      "label": "Read-only Cypher console in the browser",
+      "note": "Any read query against the recorded graph, run on Relate WASM. Here: every destination that only untrusted content named, and the calls that tried to send there.",
+      "setup": "rm -rf {tmp}/tt-shot-ui && TAINTTRAIL_DB=examples/claude-code-session/graph.rl {python} -m tainttrail ui --export-dir {tmp}/tt-shot-ui >/dev/null",
+      "serve": "python3 -m http.server 8791 --bind 127.0.0.1 --directory {tmp}/tt-shot-ui",
+      "url": "http://127.0.0.1:8791/index.html#/console",
+      "waitFor": "body[data-state=\"ready\"]",
+      "steps": [
+        {
+          "click": ".example[data-example='2']"
+        },
+        {
+          "waitFor": "#console-status.run-ok"
+        }
+      ],
+      "settle": 700,
+      "viewport": [
+        1280,
+        860
+      ]
+    },
+    {
+      "id": "08",
+      "name": "capability-scan",
+      "kind": "terminal",
+      "label": "Before anything runs: what the agent is configured with",
+      "note": "tainttrail scan reads agent configuration into the same graph: MCP servers, their tools with capability labels, permission rules, credential names. This is the sample setup in examples/agent-config (four MCP servers for Claude Code, two for Cursor).",
+      "setup": "rm -f {tmp}/tt-shot-agent-config.rl*",
+      "command": "TAINTTRAIL_DB={tmp}/tt-shot-agent-config.rl TAINTTRAIL_KEY=screenshots-fixed-key {python} -m tainttrail scan --path examples/agent-config/project --home examples/agent-config/home",
+      "show": "tainttrail scan --path examples/agent-config/project --home examples/agent-config/home"
+    },
+    {
+      "id": "09",
+      "name": "toxic-paths-and-fix",
+      "kind": "terminal",
+      "label": "Toxic tool combinations, and the smallest change that breaks them",
+      "note": "A toxic path is a source of untrusted text, a tool that reads private data and a way out, on one agent. fix searches for the cheapest set of permission changes that leaves no path open, and checks it by applying the change inside a Relate transaction, re-running the path query and rolling back.",
+      "setup": "rm -f {tmp}/tt-shot-agent-config.rl* && TAINTTRAIL_DB={tmp}/tt-shot-agent-config.rl TAINTTRAIL_KEY=screenshots-fixed-key {python} -m tainttrail scan --path examples/agent-config/project --home examples/agent-config/home >/dev/null",
+      "command": "TAINTTRAIL_DB={tmp}/tt-shot-agent-config.rl TAINTTRAIL_KEY=screenshots-fixed-key {python} -m tainttrail paths --groups 6 --limit 2 && echo && TAINTTRAIL_DB={tmp}/tt-shot-agent-config.rl TAINTTRAIL_KEY=screenshots-fixed-key {python} -m tainttrail fix",
+      "show": "tainttrail paths --groups 6 --limit 2 && tainttrail fix"
+    },
+    {
+      "id": "10",
+      "name": "viewer-capability-map",
+      "kind": "page",
+      "label": "Capability map: servers, tools, what each can do, and the toxic paths between them",
+      "note": "The sample configuration of shot 08 in the viewer. Counts are computed in the page by the same path query the command line uses.",
+      "setup": "rm -rf {tmp}/tt-shot-ui-map {tmp}/tt-shot-agent-config.rl* && TAINTTRAIL_DB={tmp}/tt-shot-agent-config.rl TAINTTRAIL_KEY=screenshots-fixed-key {python} -m tainttrail scan --path examples/agent-config/project --home examples/agent-config/home >/dev/null && TAINTTRAIL_DB={tmp}/tt-shot-agent-config.rl TAINTTRAIL_KEY=screenshots-fixed-key {python} -m tainttrail ui --export-dir {tmp}/tt-shot-ui-map >/dev/null",
+      "serve": "python3 -m http.server 8792 --bind 127.0.0.1 --directory {tmp}/tt-shot-ui-map",
+      "url": "http://127.0.0.1:8792/index.html#/map",
+      "waitFor": "body[data-state=\"ready\"]",
+      "settle": 1200,
+      "viewport": [
+        1280,
+        900
+      ]
+    },
+    {
+      "id": "11",
       "name": "scenario-matrix",
       "kind": "terminal",
-      "label": "All 30 scenarios: 17 attacks, 10 ordinary workflows, 3 harder cases",
-      "note": "Attack scenarios are modelled on public incident reports. Every secret is a canary and every host is reserved; replay contacts nothing.",
+      "label": "The whole suite: 105 replayed scenarios",
+      "note": "17 attacks modelled on public incident reports, 11 attack variants aimed at the edges of the rules, 10 ordinary workflows, 64 ordinary sessions written by a reviewer to find false alarms (32 were interrupted before the fixes), 3 harder cases. Every secret is a canary and every host is reserved; replay contacts nothing.",
       "command": "TAINTTRAIL_KEY=screenshots-fixed-key {python} -m tainttrail demo all",
       "show": "tainttrail demo all"
     },
     {
-      "id": "05",
+      "id": "12",
       "name": "doctor",
       "kind": "terminal",
       "label": "Installation check and measured hook latency",
@@ -45,13 +169,13 @@
       "show": "tainttrail init && tainttrail doctor"
     },
     {
-      "id": "06",
+      "id": "13",
       "name": "test-suite",
       "kind": "terminal",
       "label": "Test suite",
-      "command": "{python} -m pytest -q -p no:cacheprovider 2>&1 | tail -8",
+      "command": "{python} -m pytest -q -p no:cacheprovider 2>&1 | tail -6",
       "show": "pytest -q",
-      "timeout": 400
+      "timeout": 1500
     }
   ]
 }

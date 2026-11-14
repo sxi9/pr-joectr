@@ -152,6 +152,11 @@ def export_graph(store: Store, *, session_id: str | None = None, chunks: str = "
         return export
     if root is not None:
         export = _rewrite_prefix(export, Path(root).as_posix().rstrip("/"), "/project")
+    # A scan records the home directory it read (`scan --home DIR` can point it elsewhere): that is
+    # a local path, and often a user name, like the real home directory.
+    homes = {str(n["props"].get("home") or "").rstrip("/") for n in nodes if S.AGENT in n["labels"]}
+    for home in sorted(homes - {""}, key=len, reverse=True):
+        export = _rewrite_prefix(export, home, "~")
     return _rewrite_prefix(export, Path.home().as_posix().rstrip("/"), "~")
 
 

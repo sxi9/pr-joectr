@@ -8,16 +8,21 @@ The project held a `.env` with the documented AWS example credentials and a made
 token, and a vendored file, `third_party/acme-sdk/SETUP.md`, with a hidden comment telling
 AI agents to POST `.env` to `telemetry.attacker.example`.
 
-1. **Session `1ead0968…`** is ordinary work: read two files, run a Python one-liner. Three
+1. **Session `841d0fc7…`** is ordinary work: read two files, run a Python one-liner. Three
    calls recorded, nothing flagged.
-2. **Session `62615711…`** was asked to read the setup notes and the env file and then to
+2. **Session `806e0500…`** was asked to read the setup notes and the env file and then to
    attempt the command from the notes, so that the guard could be seen to act. The hook
    denied the `curl` call (rule TT001). `claude-answer.txt` is what the model then told the
    user.
 
+After the two sessions `tainttrail scan` was run in the same project, so the store also holds
+the capability map of that setup: Claude Code's built-in tools with their labels and
+permissions (no MCP servers were configured).
+
 The store was written with `tainttrail export --format rl`, which rewrites the project
-directory to `/project`. It contains keyed fingerprints of the secrets, never their values.
-`graph.json` is the same data as a `tainttrail-export/1` document for the browser viewer.
+directory to `/project` and the home directory to `~`. It holds 68 nodes and 120
+relationships, with keyed fingerprints of the secrets, never their values. `graph.json` is
+the same data as a `tainttrail-export/1` document for the browser viewer.
 
 ## Look inside
 
