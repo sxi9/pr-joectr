@@ -558,8 +558,36 @@ def window_fingerprints(text: str, key: bytes, lengths: Iterable[int], *, limit:
 _B64_RUN = re.compile(r"[A-Za-z0-9+/_-]{16,}={0,2}")
 _HEX_RUN = re.compile(r"(?<![0-9A-Fa-f])(?:[0-9A-Fa-f]{2}){8,}(?![0-9A-Fa-f])")
 _PERCENT = re.compile(r"%[0-9A-Fa-f]{2}")
-_WRAPPED_HEX = re.compile(r"(?:[0-9A-Fa-f]{16,}\s+){1,400}[0-9A-Fa-f]{2,}")
-_WRAPPED_B64 = re.compile(r"(?:[A-Za-z0-9+/]{40,}\s+){1,400}[A-Za-z0-9+/]{2,}={0,2}")
+_HEX_LINE = re.compile(r"[0-9A-Fa-f]{16,}")
+_B64_LINE = re.compile(r"[A-Za-z0-9+/]{40,}={0,2}")
+
+
+def _wrapped_blobs(text: str, *, limit: int = 8) -> list[tuple[str, str]]:
+    """Encoded output that a tool broke into lines (``xxd -p``, ``base64``), joined back together.
+
+    One pass over the lines: consecutive lines that are entirely hex, or entirely
+    base64, form one blob. Written as a scan because the obvious regular expression
+    backtracks quadratically on a long unbroken run.
+    """
+    out: list[tuple[str, str]] = []
+    run: list[str] = []
+    kind = ""
+
+    def flush() -> None:
+        if len(run) >= 2 and len(out) < limit:
+            out.append((kind, "".join(run)))
+
+    for raw in text.splitlines():
+        line = raw.strip()
+        this = "hex" if _HEX_LINE.fullmatch(line) else ("b64" if _B64_LINE.fullmatch(line) else "")
+        if this and (not run or this == kind or {this, kind} == {"hex", "b64"}):
+            kind = this if not run else ("b64" if "b64" in (this, kind) else "hex")
+            run.append(line)
+        else:
+            flush()
+            run, kind = ([line], this) if this else ([], "")
+    flush()
+    return out
 _MAX_VARIANTS = 64
 _MAX_RUNS = 200
 
@@ -600,15 +628,13 @@ def decode_variants(text: str, *, depth: int = 2) -> list[str]:
             add(_printable(bytes.fromhex(m.group(0))))
         except ValueError:
             continue
-    for m in list(_WRAPPED_HEX.finditer(text))[:8]:
+    for kind, joined in _wrapped_blobs(text):
         try:
-            add(_printable(bytes.fromhex("".join(m.group(0).split()))))
-        except ValueError:
-            continue
-    for m in list(_WRAPPED_B64.finditer(text))[:8]:
-        joined = "".join(m.group(0).split()).rstrip("=")
-        try:
-            add(_printable(base64.b64decode(joined + "=" * (-len(joined) % 4))))
+            if kind == "hex":
+                add(_printable(bytes.fromhex(joined)))
+            else:
+                joined = joined.rstrip("=")
+                add(_printable(base64.b64decode(joined + "=" * (-len(joined) % 4))))
         except (binascii.Error, ValueError):
             continue
     if _PERCENT.search(text):
@@ -630,8 +656,9 @@ def decode_variants(text: str, *, depth: int = 2) -> list[str]:
 
 # -- injection score ---------------------------------------------------------------------------------
 
-_CRED_WORDS = (r"(?:\.env\b|id_rsa|ssh[ _-]?keys?|private[ _-]?keys?|api[ _-]?keys?|access[ _-]?tokens?|credentials?"
-               r"|secrets?|passwords?|environment variables|auth(?:entication)? tokens?)")
+_CRED_WORDS = (r"(?:\.env\b|id_rsa|ssh[ _-]?keys?|private[ _-]?keys?|api[ _-]?(?:keys?|tokens?)|access[ _-]?tokens?"
+               r"|credentials?|secrets?|passwords?|environment variables|your environment|auth(?:entication)? tokens?"
+               r"|output of (?:the )?[`'\"]?(?:env|printenv)[`'\"]?)")
 _SEND_VERBS = r"(?:send|post|upload|attach|include|paste|transmit|share|e-?mail|append|forward|submit|exfiltrate|leak)"
 _AGENT_WORDS = r"(?:AI|LLM|language model|assistant|agent|claude|copilot|chatgpt|gemini|cursor|model)s?"
 _INJECTION_MARKERS: tuple[tuple[str, float, re.Pattern[str]], ...] = (
@@ -651,7 +678,17 @@ _INJECTION_MARKERS: tuple[tuple[str, float, re.Pattern[str]], ...] = (
         re.I)),
     ("secrecy", 0.25, re.compile(
         r"\b(?:do not|don't|never|without)\b[^.\n]{0,30}\b(?:tell|mention|reveal|inform|alert|notify|show|asking)\b"
-        r"[^.\n]{0,30}\b(?:user|human|developer|anyone|operator)\b", re.I)),
+        r"[^.\n]{0,30}\b(?:user|human|developer|anyone|operator)\b"
+        r"|\bdo (?:this|it|so) (?:silently|quietly)\b|\bwithout (?:telling|asking|notifying|mentioning)\b", re.I)),
+    ("note-for-agent", 0.3, re.compile(
+        r"\((?:for|to) (?:the |any |all )?[\w -]{0,24}(?:agents?|assistants?)\)", re.I)),
+    ("read-then-send", 0.4, re.compile(
+        _CRED_WORDS + r"[^\n]{0,80}\n?[^\n]{0,160}\b" + _SEND_VERBS + r"\b[^\n]{0,80}https?://", re.I)),
+    ("secret-in-url-template", 0.4, re.compile(
+        r"https?://[^\s<>]*[?&=/][^\s]*<[^>]{0,60}(?:token|key|secret|password|credential|\.env)[^>]{0,60}>", re.I)),
+    ("permission-waiver", 0.3, re.compile(
+        r"\b(?:does(?:n't| not) care about privacy|no need to (?:ask|confirm|check with)|(?:do not|don't) (?:ask|wait) for "
+        r"(?:permission|confirmation|approval)|put everything you find)\b", re.I)),
     ("send-to-url", 0.1, re.compile(r"\b" + _SEND_VERBS + r"\b[^.\n]{0,80}https?://", re.I)),
     ("hidden-comment", 0.3, re.compile(
         r"<!--(?:(?!-->).){0,400}?\b(?:assistant|agent|AI|ignore|instruction|must|system)\b(?:(?!-->).){0,400}?-->", re.I | re.S)),

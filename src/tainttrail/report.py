@@ -85,7 +85,11 @@ _Q_CALLS = """
 MATCH (c:ToolCall {session_id: $sid})
 OPTIONAL MATCH (c)-[:RETURNED]->(o:Content)
 OPTIONAL MATCH (f:Finding)-[:FLAGS]->(c)
-WITH c, o, [x IN collect(DISTINCT f) WHERE x.action IN ['ask', 'deny'] OR x.intended IN ['ask', 'deny'] | x.rule] AS rules
+WITH c, o, collect(DISTINCT f) AS on_call
+OPTIONAL MATCH (g:Finding)-[:FLAGS]->(o)
+WITH c, o, on_call, collect(DISTINCT g) AS on_result
+WITH c, o, on_call + on_result AS found
+WITH c, o, [x IN found WHERE x.action IN ['ask', 'deny'] OR x.intended IN ['ask', 'deny'] OR x.rule = 'TT009' | x.rule] AS rules
 RETURN 'call' AS kind, c.seq AS seq, coalesce(c.num, c.seq) AS num, c.id AS id, c.tool AS tool, c.summary AS summary,
        c.decision AS decision, c.status AS status, coalesce(c.is_sink, false) AS is_sink, c.agent AS agent,
        c.ts AS ts, coalesce(o.untrusted, false) AS untrusted, coalesce(o.sensitive, false) AS sensitive,
