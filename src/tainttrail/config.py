@@ -119,13 +119,21 @@ class Config:
         secrets it protects.
         """
         env = os.environ.get("TAINTTRAIL_KEY")
-        if env:
-            return env.encode("utf-8")
+        if env and len(env) >= MIN_ENV_KEY:
+            return env.encode("utf-8")   # for tests and demos, where fingerprints have to be repeatable
+        cached = self.__dict__.get("_key")
+        if cached is not None:
+            return cached
+        key = self._file_key()
+        self.__dict__["_key"] = key
+        return key
+
+    def _file_key(self) -> bytes:
         path = self.home / KEY_FILENAME
         key = _read_key(path)
         if key is not None:
             return key
-        self.home.mkdir(parents=True, exist_ok=True)
+        self.home.mkdir(mode=0o700, parents=True, exist_ok=True)
         key = secrets.token_bytes(32)
         # Written whole under another name, then linked into place: a hook killed half way cannot
         # leave an empty key file behind, and two hooks racing on first use agree on one key.
@@ -149,6 +157,9 @@ class Config:
             except OSError:
                 pass
         return key
+
+
+MIN_ENV_KEY = 16
 
 
 def _read_key(path: Path) -> bytes | None:
@@ -219,6 +230,10 @@ def load_config(cwd: str | os.PathLike[str] | None = None) -> Config:
         cfg = Config(root=root, home=home)
         cfg.config_error = f"{path} has a value of the wrong kind ({exc}); the defaults are in use"
         _apply(cfg, {k: raw[k] for k in ("mode", "fail_closed") if k in raw})
+    env_key = os.environ.get("TAINTTRAIL_KEY")
+    if env_key and len(env_key) < MIN_ENV_KEY and not cfg.config_error:
+        cfg.config_error = (f"TAINTTRAIL_KEY is shorter than {MIN_ENV_KEY} characters and is ignored: a guessable "
+                            "key makes fingerprints guessable. The project's own key is used")
     env_mode = os.environ.get("TAINTTRAIL_MODE")
     if env_mode in defaults.MODES:
         cfg.mode = env_mode

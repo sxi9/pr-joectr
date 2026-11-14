@@ -231,7 +231,7 @@ def test_tt002_asks_when_all_three_conditions_meet_without_direct_evidence(sim: 
     f = only(findings, "TT002")
     assert (f.action, f.severity) == ("ask", "medium")
     assert roles(f) == ["untrusted", "call", "sensitive"]
-    assert "precaution, not proof" in f.explanation
+    assert "Check what it sends" in f.explanation
 
 
 def test_tt002_is_silent_for_trusted_or_payload_free_calls(sim: Sim):

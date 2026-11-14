@@ -265,17 +265,22 @@ class Recorder:
         existing = self.call_id(event)
         if existing and self.store.one("MATCH (c:ToolCall {id: $id}) RETURN c.id AS id", {"id": existing}):
             return existing
+        pieces: dict[str, str] = {}
         if carried is None:
-            from .extract import carried_fingerprints, window_fingerprints
+            from .extract import carried_pieces, window_pieces
 
             carried = []
             if analysis.arg_text:
                 key = self.cfg.key()
-                carried = carried_fingerprints(analysis.arg_text, key)
+                pieces = carried_pieces(analysis.arg_text, key)
                 # A secret glued to other characters (NAME-secret.dns.example) is no token of
                 # its own. The graph knows how long each recorded secret is; try those windows.
-                carried += window_fingerprints(analysis.arg_text, key, self.secret_lengths())
+                for fp, piece in window_pieces(analysis.arg_text, key, self.secret_lengths()).items():
+                    pieces.setdefault(fp, piece)
+                carried = list(pieces)
         carried = list(dict.fromkeys(carried))
+        if pieces:
+            self._withhold_matched_secrets(analysis, pieces)
 
         with self.store.transaction():
             seq = self.next_seq(event.session_id)
@@ -336,6 +341,35 @@ class Recorder:
                 {"id": cid, "min_lines": COPY_TAINT_MIN_CHUNKS},
             )
         return cid
+
+    def _withhold_matched_secrets(self, analysis: CallAnalysis, pieces: dict[str, str]) -> None:
+        """Take out of a call's summary and entity values what its own fingerprints show to be a secret.
+
+        The guard has just recognised these characters as a recorded secret. Writing them into the
+        summary, into a URL or host entity, and from there into the finding and the block message,
+        would make the graph of an incident (the one people export and share) a copy of the secret
+        it stopped.
+        """
+        rows = self.store.run(
+            "UNWIND $ids AS id MATCH (k:Chunk {id: id}) WHERE k.kind IN ['secret', 'token'] RETURN k.id AS id",
+            {"ids": list(pieces)},
+        )
+        found = sorted({pieces[r["id"]] for r in rows if len(pieces[r["id"]]) >= 6}, key=len, reverse=True)
+        if not found:
+            return
+        pattern = re.compile("|".join(re.escape(piece) for piece in found), re.I)
+
+        def clean(text: str) -> str:
+            return pattern.sub("«secret»", text)
+
+        def safe(ref: EntityRef) -> EntityRef:
+            value = clean(ref.value)
+            return ref if value == ref.value else EntityRef(ref.kind, value)
+
+        analysis.summary = clean(analysis.summary)
+        for action in analysis.actions:
+            action.entity = safe(action.entity)
+        analysis.destinations = [safe(d) for d in analysis.destinations]
 
     def secret_lengths(self) -> list[int]:
         """The lengths of every secret value fingerprinted so far."""
@@ -542,8 +576,10 @@ class Recorder:
                     "title": f.title, "explanation": f.explanation, "session_id": f.session_id,
                     "target_id": f.target_id, "target_label": f.target_label, "ts": f.ts,
                     "intended": f.intended or f.action, "query": f.query,
-                    "params_json": json.dumps(f.params, sort_keys=True),
-                    "path_json": json.dumps([asdict(step) for step in f.path]),
+                    # Not ASCII-escaped: an export rewrites directory prefixes as text, and a
+                    # path with a non-ASCII character must still be found.
+                    "params_json": json.dumps(f.params, sort_keys=True, ensure_ascii=False),
+                    "path_json": json.dumps([asdict(step) for step in f.path], ensure_ascii=False),
                 }},
             )
             by_label: dict[str, list[dict[str, Any]]] = {}

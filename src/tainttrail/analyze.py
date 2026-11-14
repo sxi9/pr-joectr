@@ -20,6 +20,7 @@ from .bashparse import BashAnalysis, analyze_bash
 from .classify import load_catalog, match_server, parse_tool_name
 from .config import Config
 from .extract import (
+    safe_entity,
     content_chunks, encoded_secret_chunks, extract_entities, file_entity, find_secrets, find_urls, fingerprint, host_entity, host_of,
     injection_score, normalize_url, redact, repo_entity, url_entity,
 )
@@ -37,8 +38,10 @@ _RECIPIENT_KEYS = {"to", "recipient", "recipients", "cc", "bcc", "email", "chann
                    "user", "user_id", "thread_ts", "conversation", "room", "team", "assignee"}
 _PATH_KEYS = {"path", "paths", "file", "file_path", "filepath", "filename", "source", "destination", "directory",
               "dir", "notebook_path"}
-_ID_KEYS = ("owner", "repo", "repository", "project", "number", "issue_number", "pull_number", "id", "key", "name",
-            "query", "q", "path", "url", "channel", "ref")
+# What goes into the short handle of an MCP call. Not `key`, `name`, `query` or `q`: those carry
+# free text, and an argument called `key` is as often a credential as an identifier.
+_ID_KEYS = ("owner", "repo", "repository", "project", "number", "issue_number", "pull_number", "id", "path", "url",
+            "channel", "ref")
 _MENTION = re.compile(r"(?<![\w@])@((?:~|\.{1,2})?/?[\w.-]+(?:/[\w.-]+)*\.?[\w-]*)")
 _FORGE_HOST = {"github": "github.com", "gitlab": "gitlab.com"}
 # Suffixes that are not themselves a party: nobody "names" co.uk by naming docs.shop.co.uk. This
@@ -237,7 +240,7 @@ def analyze_call(tool_name: str, tool_input: dict, cfg: Config, *, cwd: str, lab
         b.add(S.READS, file_entity(root, cwd))
         pattern = str(tool_input.get("pattern") or tool_input.get("glob") or "")
         call.arg_text = pattern
-        call.summary = f"{tool} {pattern}".strip()[:120]
+        call.summary = f"{tool} {pattern}".strip()
     elif tool == "WebFetch":
         url = str(tool_input.get("url") or "")
         if url and "://" not in url:
@@ -246,19 +249,19 @@ def analyze_call(tool_name: str, tool_input: dict, cfg: Config, *, cwd: str, lab
         call.is_sink, call.sink_kind = True, "http"
         call.extra["carries_payload"] = _url_room(url)
         call.arg_text = url
-        call.summary = "WebFetch " + (normalize_url(url) or url).split("://", 1)[-1][:120]
+        call.summary = "WebFetch " + (normalize_url(url) or url).split("://", 1)[-1]
     elif tool == "WebSearch":
         query = str(tool_input.get("query") or "")
         call.is_sink, call.sink_kind = True, "search"
         call.extra["dest_trusted"] = True     # the query goes to the search provider
         call.extra["carries_payload"] = True
         call.arg_text = query
-        call.summary = f"WebSearch {query!r}"[:120]
+        call.summary = f"WebSearch {query!r}"
     elif tool == "Bash":
         _analyze_bash(call, b, str(tool_input.get("command") or ""), cfg, cwd)
     elif tool in SUBAGENT_TOOLS:
         call.arg_text = str(tool_input.get("prompt") or "")[:limit]
-        call.summary = f"{tool}: {tool_input.get('description') or tool_input.get('subagent_type') or 'sub-agent'}"[:120]
+        call.summary = f"{tool}: {tool_input.get('description') or tool_input.get('subagent_type') or 'sub-agent'}"
     else:
         call.arg_text = _flat_text(tool_input, limit)
         call.summary = tool
@@ -268,7 +271,33 @@ def analyze_call(tool_name: str, tool_input: dict, cfg: Config, *, cwd: str, lab
     call.actions = b.build()
     call.destinations = list(b.destinations.values())
     call.summary = redact(call.summary, 200) if call.summary else tool_name
+    _safe_call(call, cfg)
     return call
+
+
+def _safe_call(call: CallAnalysis, cfg: Config) -> None:
+    """Replace credential-like parts of entity values (a token in a URL path, a secret in a host name)."""
+    key = cfg.key()
+    renamed: dict[str, str] = {}
+
+    def safe(ref: EntityRef) -> EntityRef:
+        new = safe_entity(ref, key)
+        if new is not ref:
+            renamed[ref.id] = new.id
+        return new
+
+    call.actions = [Action(a.rel, safe(a.entity), a.props) for a in call.actions]
+    call.destinations = [safe(d) for d in call.destinations]
+    if renamed and call.extra.get("derived"):
+        call.extra["derived"] = [(renamed.get(t, t), renamed.get(src, src)) for t, src in call.extra["derived"]]
+
+
+def _safe_content(a: ContentAnalysis, cfg: Config) -> ContentAnalysis:
+    key = cfg.key()
+    a.mentions = list(dict.fromkeys(safe_entity(m, key) for m in a.mentions))
+    if a.source is not None:
+        a.source = safe_entity(a.source, key)
+    return a
 
 
 def _analyze_bash(call: CallAnalysis, b: _Builder, command: str, cfg: Config, cwd: str) -> None:
@@ -398,6 +427,7 @@ def _analyze_mcp(call: CallAnalysis, b: _Builder, server: str, tool: str, tool_i
     call.summary = f"{server}.{tool} {call.extra['mcp_key']}".strip()
 
 
+_OWN_COMMAND = re.compile(r"(?:^|[\s;&|(/])(?:tainttrail|python[\d.]{0,6}\s{1,4}-m\s{1,4}tainttrail)(?:\s|$)")
 # Arguments that name the remote object a call reads or writes (a page, an issue, a channel).
 _OBJECT_KEYS = frozenset({"id", "page_id", "pageid", "issueid", "issue_id", "channel_id", "channel", "document_id",
                           "doc_id", "project_id", "ticket_id", "thread_id", "conversation_id"})
@@ -420,7 +450,7 @@ def _mcp_key(by_key: dict[str, str]) -> str:
             parts.append(f"#{value}" if key.endswith("number") else value)
         if len(parts) >= 3:
             break
-    return " ".join(parts)[:100]
+    return redact(" ".join(parts), 100)
 
 
 # -- results -----------------------------------------------------------------------------------
@@ -588,9 +618,9 @@ def analyze_result(tool_name: str, tool_input: dict, tool_response: Any, call: C
         ba = call.extra.get("bash")
         if not isinstance(ba, BashAnalysis):
             ba = analyze_bash(str(tool_input.get("command") or ""), cwd)
-        reads = [file_entity(p, cwd) for p in ba.reads]
-        fetched = [url_entity(u) for u in ba.fetches]
-        fetched = [u for u in fetched if u is not None]
+        key = cfg.key()
+        reads = [safe_entity(file_entity(p, cwd), key) for p in ba.reads]
+        fetched = [safe_entity(u, key) for u in (url_entity(u) for u in ba.fetches) if u is not None]
         # A response from this machine is not third-party text. (A local service can relay stored
         # third-party text; `paths.untrusted` and the injection score still apply to what it returns.)
         all_local = bool(fetched) and all(cfg.is_local_host(host_of(u.value) or "") for u in fetched)
@@ -615,6 +645,10 @@ def analyze_result(tool_name: str, tool_input: dict, tool_response: Any, call: C
             a.source = fetched[0]
         elif len(reads) == 1 and not fetched:
             a.source = reads[0]
+        if "tainttrail" in ba.programs or _OWN_COMMAND.search(str(tool_input.get("command") or "")):
+            # What the guard itself prints (explain, log, query) repeats hosts and links from the
+            # graph. It names nothing: no mention, no fingerprint.
+            a.mentions, a.chunks = [], []
     is_memory_file = a.source is not None and a.source.kind == "file" and is_instruction_file(a.source.value)
     if has_text and a.injection_score >= 0.5 and not a.untrusted and not is_memory_file:
         # Text addressed to the agent inside a "trusted" file or tool result is the attack
@@ -623,7 +657,7 @@ def analyze_result(tool_name: str, tool_input: dict, tool_response: Any, call: C
     if not has_text:
         a.untrusted = a.sensitive = False
         a.reasons = []
-    return a
+    return _safe_content(a, cfg)
 
 
 def analyze_memory(text: str, cfg: Config, *, cwd: str, name: str) -> ContentAnalysis:
@@ -633,7 +667,7 @@ def analyze_memory(text: str, cfg: Config, *, cwd: str, name: str) -> ContentAna
     a.sensitive = False
     a.reasons = [f"inherited:{name}"]
     a.excerpt = f"{name} was written by an earlier session that held untrusted content"
-    return a
+    return _safe_content(a, cfg)
 
 
 def prompt_file_mentions(prompt: str, cwd: str) -> list[EntityRef]:
@@ -652,7 +686,7 @@ def analyze_attachment(path_ref: EntityRef, text: str, cfg: Config, *, cwd: str,
     a = analyze_result("Read", {"file_path": path_ref.value}, {"type": "text", "file": {"content": text}}, call, cfg,
                        cwd=cwd, tainted_sources=tainted_sources)
     a.origin = "attached"
-    return a
+    return _safe_content(a, cfg)
 
 
 def analyze_prompt(prompt: str, cfg: Config, *, cwd: str) -> ContentAnalysis:
@@ -681,4 +715,4 @@ def analyze_prompt(prompt: str, cfg: Config, *, cwd: str) -> ContentAnalysis:
     # a bucket the user typed is the host the upload goes to
     for m in re.finditer(r"\bs3://([a-z0-9][a-z0-9.-]{1,62})", prompt):
         also(EntityRef("host", f"{m.group(1)}.s3.amazonaws.com"))
-    return a
+    return _safe_content(a, cfg)

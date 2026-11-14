@@ -147,7 +147,7 @@ def _archive(store: Store, cfg: Config, session: dict[str, Any]) -> Path:
     started = _dt.datetime.fromtimestamp((session["started"] or 0) / 1000, _dt.timezone.utc)
     safe = re.sub(r"[^A-Za-z0-9_.-]", "_", str(session["id"]))[:48]
     directory = archive_dir(cfg)
-    directory.mkdir(parents=True, exist_ok=True)
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     target = directory / f"{started:%Y%m%dT%H%M%SZ}-{safe}.json"
     temp = target.with_name(target.name + f".tmp-{os.getpid()}")
     fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)

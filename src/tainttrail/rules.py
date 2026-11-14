@@ -144,6 +144,8 @@ WHERE u.session_id = c.session_id AND u.seq < c.seq
   AND NOT EXISTS {
     MATCH (t:Content)-[:MENTIONS]->(f)
     WHERE t.session_id = c.session_id AND t.seq < c.seq AND coalesce(t.untrusted, false) = false
+      AND NOT EXISTS { MATCH (u2:Content {untrusted: true})-[:MENTIONS]->(f)
+                       WHERE u2.session_id = c.session_id AND u2.seq < t.seq }
   }
 RETURN p
 ORDER BY u.seq
@@ -242,6 +244,9 @@ RETURN c.session_id AS sid, c.seq AS seq, c.ts AS ts, c.tool AS tool,
 """
 
 # Where a call sends, fetches or executes, and who named each place earlier in the session.
+# A mention in trusted content counts only if no untrusted content had named the place before it:
+# once a page has named a host, command output that repeats the name (`echo`, a log, this guard's
+# own `explain`) must not turn the host into one the project knows.
 _Q_TARGETS = """
 MATCH (c:ToolCall {id: $call})-[r]->(d:Entity)
 WHERE type(r) IN $rels
@@ -250,7 +255,9 @@ RETURN DISTINCT d.id AS id, d.kind AS kind, d.value AS value, d.name AS name, co
   EXISTS { MATCH (u:Content {untrusted: true})-[:MENTIONS]->(d)
            WHERE u.session_id = c.session_id AND u.seq < c.seq } AS by_untrusted,
   EXISTS { MATCH (t:Content)-[:MENTIONS]->(d)
-           WHERE t.session_id = c.session_id AND t.seq < c.seq AND coalesce(t.untrusted, false) = false } AS by_trusted,
+           WHERE t.session_id = c.session_id AND t.seq < c.seq AND coalesce(t.untrusted, false) = false
+             AND NOT EXISTS { MATCH (u2:Content {untrusted: true})-[:MENTIONS]->(d)
+                              WHERE u2.session_id = c.session_id AND u2.seq < t.seq } } AS by_trusted,
   EXISTS { MATCH (q:Content {origin: 'user'})-[:MENTIONS]->(d)
            WHERE q.session_id = c.session_id AND q.seq < c.seq } AS by_user
 ORDER BY id
@@ -362,8 +369,26 @@ _GUARD_WORDS = re.compile(r"hooks|tainttrail|disableAllHooks", re.I)
 # -- titles ------------------------------------------------------------------------------
 
 
+def _name(text: Any, limit: int = 60) -> str:
+    """A name from the outside world, fit to stand inside one of the guard's own sentences.
+
+    File names, URL paths, host names and command lines are chosen by whoever wrote the content
+    the guard is watching, and the guard repeats them to the model and in the permission prompt.
+    So: one line (a line break in a name would let it start a paragraph of its own), printable
+    characters only, and too short to be a sentence.
+    """
+    line = " ".join("".join(ch if ch.isprintable() else " " for ch in str(text)).split())
+    if len(line) <= limit:
+        return line
+    head = (limit - 1) * 2 // 3
+    return line[:head] + "…" + line[len(line) - (limit - 1 - head):]
+
+
 def _short_url(url: str) -> str:
-    return re.sub(r"^[a-z][a-z0-9+.-]*://", "", url)
+    """A link as shown in a sentence: its host and the start of its path."""
+    rest = re.sub(r"^[a-z][a-z0-9+.-]*://", "", str(url))
+    host, sep, path = rest.partition("/")
+    return _name(host, 60) + (sep + _name(path, 30) if path else "")
 
 
 def content_title(props: dict[str, Any], src_kind: str | None = None, src_value: str | None = None,
@@ -372,17 +397,17 @@ def content_title(props: dict[str, Any], src_kind: str | None = None, src_value:
     if origin == "user":
         return "your prompt"
     if origin == "memory":
-        return f"{src_name or 'an instruction file'}, loaded at session start"
+        return f"{_name(src_name or 'an instruction file')}, loaded at session start"
     if src_kind == "url" and src_value:
         return f"web page {_short_url(src_value)}"
     if src_kind == "file" and src_name:
-        return f"contents of {src_name}"
+        return f"contents of {_name(src_name)}"
     if src_kind == "host" and src_value:
-        return f"response from {src_value}"
+        return f"response from {_name(src_value)}"
     if src_value:
-        return str(src_value)
+        return _name(src_value)
     if tool:
-        return f"output of {tool}"
+        return f"output of {_name(tool, 80)}"
     return "tool output"
 
 
@@ -394,18 +419,18 @@ def node_title(node: dict[str, Any], extra: dict[str, Any] | None = None) -> str
     if S.CONTENT in labels:
         return content_title(p, extra.get("src_kind"), extra.get("src_value"), extra.get("src_name"), extra.get("tool"))
     if S.TOOL_CALL in labels:
-        return f"call #{p.get('num') or p.get('seq') or '?'}  {p.get('summary') or p.get('tool') or ''}".rstrip()
+        return f"call #{p.get('num') or p.get('seq') or '?'}  {_name(p.get('summary') or p.get('tool') or '', 120)}".rstrip()
     if S.ENTITY in labels:
         kind, value = p.get("kind"), str(p.get("value") or "")
         if kind == "file":
-            return f"file {p.get('name') or value}"
+            return f"file {_name(p.get('name') or value)}"
         if kind == "url":
             return _short_url(value)
         if kind == "env":
-            return "the process environment" if value == "*" else f"${value}"
+            return "the process environment" if value == "*" else f"${_name(value)}"
         if kind == "repo":
-            return f"repository {value}"
-        return value
+            return f"repository {_name(value)}"
+        return _name(value)
     if S.CHUNK in labels:
         kind, hint = p.get("kind"), p.get("hint") or ""
         if kind == "secret":
@@ -533,7 +558,9 @@ class _Eval:
             MATCH (c:ToolCall {id: $call}) MATCH (d:Entity {id: $id})
             RETURN coalesce(d.trusted, false) AS trusted, coalesce(d.local, false) AS local,
               EXISTS { MATCH (t:Content)-[:MENTIONS]->(d)
-                       WHERE t.session_id = c.session_id AND t.seq < c.seq AND coalesce(t.untrusted, false) = false } AS by_trusted,
+                       WHERE t.session_id = c.session_id AND t.seq < c.seq AND coalesce(t.untrusted, false) = false
+                         AND NOT EXISTS { MATCH (u2:Content {untrusted: true})-[:MENTIONS]->(d)
+                                          WHERE u2.session_id = c.session_id AND u2.seq < t.seq } } AS by_trusted,
               EXISTS { MATCH (q:Content {origin: 'user'})-[:MENTIONS]->(d)
                        WHERE q.session_id = c.session_id AND q.seq < c.seq } AS by_user
             """,
@@ -651,8 +678,7 @@ class _Eval:
                 title=f"Outbound call to {dest_name} in a session that holds untrusted content and sensitive data",
                 explanation=(f"This session has read untrusted content ({path[0].title if path else 'earlier'}) "
                              f"and sensitive data ({path[2].title if path else 'earlier'}). This call can carry "
-                             f"data to {dest_name}. No copy of the sensitive data was found in it, so this is a "
-                             "precaution, not proof."),
+                             f"data to {dest_name}. Check what it sends before you allow it."),
                 path=path, query=CYPHER["TT002"].strip(), params={"call": self.call_id},
             )
             return [f] if f else []
@@ -1091,10 +1117,10 @@ def _dest_name(dest: dict[str, Any] | None) -> str:
         return "an unknown destination"
     if dest["kind"] == "url":
         host = _host_id(dest["value"])
-        return host.split(":", 1)[1] if host else dest["value"]
+        return _name(host.split(":", 1)[1]) if host else _short_url(dest["value"])
     if dest["kind"] == "mcp":
-        return f"the {str(dest['value']).split('/', 1)[0]} MCP server"
-    return str(dest["value"])
+        return f"the {_name(str(dest['value']).split('/', 1)[0], 40)} MCP server"
+    return _name(dest["value"])
 
 
 def _host_id(url: str) -> str | None:

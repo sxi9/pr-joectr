@@ -24,7 +24,7 @@ STILL_ASKED = {"p51-long-mixed-deploy-and-notify"}
 
 @pytest.fixture(autouse=True)
 def _key(monkeypatch):
-    monkeypatch.setenv("TAINTTRAIL_KEY", "scenario-key")
+    monkeypatch.setenv("TAINTTRAIL_KEY", "scenario-test-key-not-a-secret")
 
 
 def test_the_suite_has_the_expected_shape():

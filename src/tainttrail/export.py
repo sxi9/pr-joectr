@@ -102,9 +102,16 @@ def export_graph(store: Store, *, session_id: str | None = None, chunks: str = "
     ids: dict[str, str] = {}
     taken: set[str] = set()
     nodes: list[dict[str, Any]] = []
+    key_text = _key_text(store)
     for eid, row in raw.items():
         labels = [lbl for lbl in row["labels"] if lbl in S.NODE_LABELS] or list(row["labels"])
         props = dict(row["props"])
+        # Keyed hashes of whole texts pair a hook's two events while a session runs. In an export
+        # they would only be a way to test guesses at the key.
+        for name in _LIVE_ONLY:
+            props.pop(name, None)
+        if key_text and key_text in str(props.get("excerpt") or ""):
+            props["excerpt"] = ""    # the agent read the fingerprint key: it does not leave with the graph
         if S.CAPABILITY in labels:
             node_id = f"cap:{props.get('name')}"
         else:
@@ -148,6 +155,18 @@ def export_graph(store: Store, *, session_id: str | None = None, chunks: str = "
     return _rewrite_prefix(export, Path.home().as_posix().rstrip("/"), "~")
 
 
+_LIVE_ONLY = ("sha", "input_sha")
+
+
+def _key_text(store: Store) -> str:
+    """The fingerprint key of the project the store belongs to, as its key file holds it."""
+    try:
+        text = (Path(store.path).parent / "key").read_text(encoding="ascii").strip()
+    except (OSError, ValueError):
+        return ""
+    return text if len(text) >= 32 else ""
+
+
 def _rewrite_prefix(export: dict[str, Any], prefix: str, replacement: str) -> dict[str, Any]:
     """Write a directory prefix as something shorter everywhere, ids included, so ids still match.
 
@@ -158,13 +177,20 @@ def _rewrite_prefix(export: dict[str, Any], prefix: str, replacement: str) -> di
         return export
     pattern = re.compile(re.escape(prefix) + r"(?=/|$|[\"'\s:,)\]}])")
 
-    def walk(value: Any) -> Any:
+    def walk(value: Any, name: str = "") -> Any:
         if isinstance(value, str):
+            if name.endswith("_json"):
+                # JSON inside a property: rewrite what it holds, not its text, so the result does
+                # not depend on how a non-ASCII character in a path happened to be escaped.
+                try:
+                    return json.dumps(walk(json.loads(value)), ensure_ascii=False, sort_keys=name == "params_json")
+                except ValueError:
+                    pass
             return pattern.sub(replacement, value) if prefix in value else value
         if isinstance(value, list):
             return [walk(v) for v in value]
         if isinstance(value, dict):
-            return {k: walk(v) for k, v in value.items()}
+            return {k: walk(v, str(k)) for k, v in value.items()}
         return value
 
     return walk(export)
@@ -317,7 +343,10 @@ def cmd_export(args: argparse.Namespace, cfg: Config) -> int:
     if text is not None:
         if args.out:
             try:
-                Path(args.out).write_text(text, encoding="utf-8")
+                # An export holds every command line, URL and excerpt of a session: owner only.
+                fd = os.open(args.out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    fh.write(text)
             except OSError as exc:
                 print(f"tainttrail export: cannot write {args.out}: {exc.strerror or exc}", file=sys.stderr)
                 return 1

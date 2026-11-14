@@ -128,7 +128,8 @@ class Store:
         target = Path(self.path)
         if self.read_only and not target.exists():
             raise StoreMissing(f"no TaintTrail graph at {self.path}; nothing has been recorded yet")
-        target.parent.mkdir(parents=True, exist_ok=True)
+        if not target.parent.exists():
+            target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         self._acquire_file_lock(deadline)
         try:
             if self.read_only:

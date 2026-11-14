@@ -123,6 +123,45 @@ def normalize_url(url: str) -> str | None:
     return f"{scheme}://{netloc}{path}"
 
 
+_ANY_SCHEME = re.compile(r"""\b[a-z][a-z0-9+.-]{1,20}://[^\s<>"'`\\\x00-\x1f]+""", re.I)
+
+
+def _safe_part(part: str, key: bytes) -> str:
+    """A path segment or host label, or a short keyed hash of it when it looks like a credential."""
+    if len(part) < 16:
+        return part
+    if find_secrets(part) or (len(part) >= 20 and _random_looking(part)):
+        return f"«{fingerprint(part, key)[:10]}»"
+    return part
+
+
+def safe_entity(ref: EntityRef, key: bytes) -> EntityRef:
+    """The entity with nothing credential-like in its value.
+
+    Entity values are stored, shown and exported like summaries, so they get the same care: a
+    token in a URL path (``/bot<token>/sendMessage``), a secret glued into a host name, a key in
+    a file name. The part is replaced by a short keyed hash of itself, so the same URL still
+    meets itself in one node and two different tokens stay two nodes.
+    """
+    value = ref.value
+    if ref.kind == "url":
+        scheme, sep, rest = value.partition("://")
+        host, slash, path = rest.partition("/")
+        name, colon, port = host.partition(":")
+        name = ".".join(_safe_part(label, key) for label in name.split("."))
+        path = "/".join(_safe_part(seg, key) for seg in path.split("/"))
+        value = f"{scheme}{sep}{name}{colon}{port}{slash}{path}"
+    elif ref.kind == "host":
+        value = ".".join(_safe_part(label, key) for label in value.split("."))
+    elif ref.kind == "file":
+        value = "/".join(seg if not (len(seg) >= 16 and find_secrets(seg)) else f"«{fingerprint(seg, key)[:10]}»"
+                         for seg in value.split("/"))
+    elif ref.kind == "email":
+        local, at, domain = value.partition("@")
+        value = f"{_safe_part(local, key)}{at}{domain}"
+    return ref if value == ref.value else EntityRef(ref.kind, value)
+
+
 def url_entity(url: str) -> EntityRef | None:
     norm = normalize_url(url)
     return EntityRef("url", norm[:500]) if norm else None
@@ -219,6 +258,11 @@ def extract_entities(text: str, *, cwd: str | None = None, limit: int = 200, max
         add(host_entity(host_of(url) or ""))
         add(repo_entity(url))
     masked = _URL.sub(lambda m: " " * len(m.group(0)), masked)
+    # Any other scheme (mongodb+srv://user:password@host, amqp://, smtp://): the host is named, and the
+    # run is blanked so that "password@host" is never taken for an e-mail address.
+    for m in _ANY_SCHEME.finditer(masked):
+        add(host_entity(host_of(m.group(0)) or ""))
+    masked = _ANY_SCHEME.sub(lambda m: " " * len(m.group(0)), masked)
 
     for m in _SCP_REPO.finditer(masked):
         add(EntityRef("repo", f"{m.group(1).lower()}/{_no_git_suffix(m.group(2)).lower()}"))
@@ -288,7 +332,8 @@ class SecretHit:
 _GENERIC_NAME = r"(?:password|passwd|pwd|secret|token(?!iz)|api[_-]?key|access[_-]?key|private[_-]?key|auth(?!or)|credential)"
 _SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str], int], ...] = (
     ("private_key", re.compile(r"-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----.*?(?:-----END (?:[A-Z0-9 ]+ )?PRIVATE KEY-----|\Z)", re.S), 0),
-    ("aws_access_key_id", re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"), 0),
+    # Bounded by its own alphabet, not by word boundaries: glued to lower-case filler it is still a key id.
+    ("aws_access_key_id", re.compile(r"(?<![A-Z0-9])(?:AKIA|ASIA)[0-9A-Z]{16}(?![A-Z0-9])"), 0),
     ("aws_secret_access_key", re.compile(r"(?i)aws.{0,24}?(?:secret|sk)[A-Za-z_]{0,16}\s*[=:]\s*[\"']?([A-Za-z0-9/+=]{40})(?![A-Za-z0-9/+=])"), 1),
     ("github_token", re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{22,})\b"), 0),
     ("gitlab_token", re.compile(r"\bglpat-[A-Za-z0-9_-]{20,}"), 0),
@@ -336,6 +381,12 @@ _NAME_ENDS_IN_CREDENTIAL_WORD = re.compile(
 _IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*")
 
 
+def _credential_name(text: str, m: "re.Match[str]") -> bool:
+    """Whether the name of a ``name = value`` hit ends in a credential word."""
+    name = re.match(r"[\w.-]+", text[m.start():m.start(1)])
+    return bool(name and _NAME_ENDS_IN_CREDENTIAL_WORD.search(name.group(0)))
+
+
 def _plausible_assignment(text: str, m: "re.Match[str]", value: str) -> bool:
     """Whether a ``name = value`` hit can be a credential at all.
 
@@ -344,10 +395,9 @@ def _plausible_assignment(text: str, m: "re.Match[str]", value: str) -> bool:
     for secrets fingerprints ordinary words, and the next commit message that repeats one is then
     "carrying a secret".
     """
-    head = text[m.start():m.start(1)]
-    name = re.match(r"[\w.-]+", head)
-    if not name or not _NAME_ENDS_IN_CREDENTIAL_WORD.search(name.group(0)):
+    if not _credential_name(text, m):
         return False            # token_type, AUTH_USER_MODEL, password_hint, secret.txt
+    head = text[m.start():m.start(1)]
     quoted = head.rstrip()[-1:] in ("\"", "'")
     after = text[m.end(1):m.end(1) + 1]
     if not quoted and _IDENTIFIER.fullmatch(value):
@@ -356,8 +406,13 @@ def _plausible_assignment(text: str, m: "re.Match[str]", value: str) -> bool:
     return True
 
 
-def find_secrets(text: str) -> list[SecretHit]:
-    """Credentials in the text, recognised by their shape. Non-overlapping, in order."""
+def find_secrets(text: str, *, strict: bool = True) -> list[SecretHit]:
+    """Credentials in the text, recognised by their shape. Non-overlapping, in order.
+
+    ``strict`` is for fingerprints and for calling a content sensitive: a ``name = value`` hit
+    must then be a plausible credential, because a wrong one makes an ordinary word evidence.
+    Redaction passes ``strict=False``: one word too many replaced in an excerpt costs nothing.
+    """
     if not text:
         return []
     hits: list[SecretHit] = []
@@ -372,7 +427,7 @@ def find_secrets(text: str) -> list[SecretHit]:
                     continue
                 if value.startswith(("http://", "https://", "/", "./", "~/")) or value.endswith((":", "=")):
                     continue
-                if not _plausible_assignment(text, m, value):
+                if not (_plausible_assignment(text, m, value) if strict else _credential_name(text, m)):
                     continue
             if kind == "env_value" and (
                     shannon_entropy(value) < 3.8 or value.startswith("-") or "=" in value.rstrip("=")
@@ -393,22 +448,79 @@ def find_secrets(text: str) -> list[SecretHit]:
     return out
 
 
+# Shapes that matter when text is stored or shown, on top of what find_secrets knows: the commonest
+# ways an agent puts a working credential on a command line or gets one back.
+_REDACT_ONLY: tuple[tuple[str, "re.Pattern[str]"], ...] = (
+    ("authorization", re.compile(
+        r"(?i)\b(?:proxy-)?authorization\b[\"']?\s*[:=]\s*[\"']?(?:(?:bearer|basic|token|digest|negotiate)\s+)?([^\s\"'`,;]{8,})")),
+    ("bearer", re.compile(r"(?i)\bbearer\s+([A-Za-z0-9._~+/=-]{16,})")),
+    ("password", re.compile(r"(?<![\w-])(?:-u|--user)[ =]+[\"']?[^\s:\"']{1,64}:([^\s\"'@]{3,})")),
+    ("password", re.compile(
+        r"(?i)(?<![\w-])--(?:password|passwd|pass|token|secret|api-?key|passphrase|auth-token|access-token)[ =]+[\"']?([^\s\"'`]{3,})")),
+    ("secret", re.compile(
+        r"(?i)[?&](?:key|api_?key|sig|signature|code|pass|password|auth|token|access_token|secret|client_secret)=([^&\s\"'`#]{4,})")),
+    ("secret", re.compile(r"(?i)[\"'](?:pass|key|passphrase|pwd)[\"']\s*:\s*[\"']([^\"']{4,})[\"']")),
+)
+_LONG_TOKEN = re.compile(r"[A-Za-z0-9+=_-]{20,}")
+_BLOB = re.compile(r"[A-Za-z0-9+/]{32,}={0,2}")
+
+
+def _random_looking(token: str) -> bool:
+    """A string of 20+ characters that is not a word, an identifier or a path segment.
+
+    ``air_quality_station_measurements_2023`` is an identifier: its parts are words and numbers.
+    ``canary_dbpass_7Qz4Lm9Xr2Tb`` is not: one part mixes letters and digits.
+    """
+    if not (any(ch.isalpha() for ch in token) and any(ch.isdigit() for ch in token)):
+        return False
+    if shannon_entropy(token) < 3.5:
+        return False
+    return any(len(part) >= 6 and any(ch.isalpha() for ch in part) and any(ch.isdigit() for ch in part)
+               for part in re.split(r"[_=+-]+", token))
+
+
+def _blank_unrecognised(line: str) -> str:
+    """Replace what still looks like key material: encoded blobs and long random-looking strings."""
+    def blob(m: "re.Match[str]") -> str:
+        text = m.group(0)
+        mixed = any(c.isupper() for c in text) and any(c.islower() for c in text) and any(c.isdigit() for c in text)
+        return f"«{len(text)} encoded characters»" if mixed and shannon_entropy(text) >= 4.5 else text
+
+    line = _BLOB.sub(blob, line)
+    return _LONG_TOKEN.sub(lambda m: "«token»" if _random_looking(m.group(0)) else m.group(0), line)
+
+
 def redact(text: str, max_len: int = 240) -> str:
-    """One line of the text with every secret replaced by its kind in guillemets."""
+    """One line of the text, with every credential replaced by its kind in guillemets, then cut.
+
+    Redaction comes first and the cut second, and the cut never lands inside a long token: a
+    token that is recognised only by its full shape would otherwise keep its first characters.
+    """
     if not text:
         return ""
     head = text[: max(max_len * 8, 4096)]
+    spans: list[tuple[int, int, str]] = [(h.start, h.end, h.kind) for h in find_secrets(head, strict=False)]
+    for kind, pattern in _REDACT_ONLY:
+        spans += [(m.start(1), m.end(1), kind) for m in pattern.finditer(head)]
+    spans.sort(key=lambda span: (span[0], -(span[1] - span[0])))
     parts: list[str] = []
     pos = 0
-    for h in find_secrets(head):
-        if h.start < pos:
+    for start, end, kind in spans:
+        if start < pos:
             continue
-        parts.append(head[pos:h.start])
-        parts.append(f"«{h.kind}»")
-        pos = h.end
+        parts.append(head[pos:start])
+        parts.append(f"«{kind}»")
+        pos = end
     parts.append(head[pos:])
-    line = " ".join("".join(parts).split())
-    return line if len(line) <= max_len else line[: max_len - 1].rstrip() + "…"
+    line = _blank_unrecognised(" ".join("".join(parts).split()))
+    if len(line) <= max_len:
+        return line
+    cut = max_len - 1
+    start = line.rfind(" ", 0, cut) + 1
+    end = line.find(" ", cut)
+    if (end if end >= 0 else len(line)) - start >= 16 and start > 0:
+        cut = start      # the cut would fall inside a long token: leave the token out
+    return line[:cut].rstrip() + "…"
 
 
 # -- fingerprints -----------------------------------------------------------------------------------
@@ -551,9 +663,18 @@ def carried_fingerprints(text: str, key: bytes, *, limit: int = 4000) -> list[st
     Looks at the text as written and at what it decodes to. Only ids are returned; the
     caller keeps those that exist as ``Chunk`` nodes.
     """
+    return list(carried_pieces(text, key, limit=limit))
+
+
+def carried_pieces(text: str, key: bytes, *, limit: int = 4000) -> dict[str, str]:
+    """``carried_fingerprints`` with the piece of text behind each fingerprint.
+
+    The caller needs the pieces for one thing: when a fingerprint turns out to be a recorded
+    secret, that piece must not be written down again in the call's summary or in a URL.
+    """
     if not text:
-        return []
-    out: dict[str, None] = {}
+        return {}
+    out: dict[str, str] = {}
 
     def take(piece: str) -> None:
         candidates = _tokens(piece, MIN_SINK_TOKEN) + _normal_lines(piece) + find_urls(piece)
@@ -564,14 +685,14 @@ def carried_fingerprints(text: str, key: bytes, *, limit: int = 4000) -> list[st
         for cand in candidates:
             if len(out) >= limit:
                 return
-            out.setdefault(fingerprint(cand, key))
+            out.setdefault(fingerprint(cand, key), cand)
 
     take(text)
     for variant in decode_variants(text):
         if len(out) >= limit:
             break
         take(variant)
-    return list(out)
+    return out
 
 
 _BOUNDARY = re.compile(r"(?<![A-Za-z0-9])(?=[A-Za-z0-9])|(?<=[A-Za-z0-9])(?![A-Za-z0-9])")
@@ -587,20 +708,26 @@ def window_fingerprints(text: str, key: bytes, lengths: Iterable[int], *, limit:
     and before every word end. The cost is the number of boundaries times the number of
     lengths, a few thousand hashes for a long command.
     """
+    return list(window_pieces(text, key, lengths, limit=limit, max_text=max_text))
+
+
+def window_pieces(text: str, key: bytes, lengths: Iterable[int], *, limit: int = 6_000,
+                  max_text: int = 4096) -> dict[str, str]:
+    """``window_fingerprints`` with the window of text behind each fingerprint."""
     text = text[:max_text]
     sizes = sorted({int(n) for n in lengths if 8 <= int(n) <= 256})[:24]
     if not text or not sizes:
-        return []
-    out: dict[str, None] = {}
+        return {}
+    out: dict[str, str] = {}
     bounds = [m.start() for m in _BOUNDARY.finditer(text)]
     for pos in bounds:
         for n in sizes:
             for piece in (text[pos:pos + n], text[max(0, pos - n):pos]):
                 if len(piece) == n:
-                    out.setdefault(fingerprint(piece, key))
+                    out.setdefault(fingerprint(piece, key), piece)
             if len(out) >= limit:
-                return list(out)
-    return list(out)
+                return out
+    return out
 
 
 _B64_RUN = re.compile(r"[A-Za-z0-9+/_-]{16,}={0,2}")

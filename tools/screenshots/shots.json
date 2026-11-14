@@ -6,7 +6,7 @@
       "kind": "terminal",
       "label": "The same scripted attack, without the guard and with it",
       "note": "Scenario a02: a web page tells the agent to POST .env. The replay sends real Claude Code hook payloads through the adapter. Without the guard three canary secrets leave; with it the upload is denied.",
-      "command": "TAINTTRAIL_KEY=shots {python} -m tainttrail demo run a02 --compare --brief",
+      "command": "TAINTTRAIL_KEY=screenshots-fixed-key {python} -m tainttrail demo run a02 --compare --brief",
       "show": "tainttrail demo run a02 --compare --brief"
     },
     {
@@ -33,7 +33,7 @@
       "kind": "terminal",
       "label": "All 30 scenarios: 17 attacks, 10 ordinary workflows, 3 harder cases",
       "note": "Attack scenarios are modelled on public incident reports. Every secret is a canary and every host is reserved; replay contacts nothing.",
-      "command": "TAINTTRAIL_KEY=shots {python} -m tainttrail demo all",
+      "command": "TAINTTRAIL_KEY=screenshots-fixed-key {python} -m tainttrail demo all",
       "show": "tainttrail demo all"
     },
     {
@@ -41,7 +41,7 @@
       "name": "doctor",
       "kind": "terminal",
       "label": "Installation check and measured hook latency",
-      "command": "cd {tmp} && rm -rf tt-shot-doctor && mkdir tt-shot-doctor && cd tt-shot-doctor && git init -q . && TAINTTRAIL_KEY=shots {python} -m tainttrail init >/dev/null && TAINTTRAIL_KEY=shots {python} -m tainttrail doctor | sed -e 's#{root}#<repo>#g' -e 's#/tmp/[^ ]*tt-shot-doctor#<project>#g'",
+      "command": "cd {tmp} && rm -rf tt-shot-doctor && mkdir tt-shot-doctor && cd tt-shot-doctor && git init -q . && TAINTTRAIL_KEY=screenshots-fixed-key {python} -m tainttrail init >/dev/null && TAINTTRAIL_KEY=screenshots-fixed-key {python} -m tainttrail doctor | sed -e 's#{root}#<repo>#g' -e 's#/tmp/[^ ]*tt-shot-doctor#<project>#g'",
       "show": "tainttrail init && tainttrail doctor"
     },
     {

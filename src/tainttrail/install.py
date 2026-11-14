@@ -236,7 +236,7 @@ def init(cfg: Config, *, scope: str = "project", python: str | None = None, mode
         else:
             done.append(f"kept existing {conf}")
     else:
-        cfg.home.mkdir(parents=True, exist_ok=True)
+        cfg.home.mkdir(mode=0o700, parents=True, exist_ok=True)
         conf = cfg.home / CONFIG_FILENAME
         if not conf.exists():
             conf.write_text(text, encoding="utf-8")

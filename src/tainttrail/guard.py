@@ -141,26 +141,40 @@ def strictest(findings: list[Finding]) -> Finding | None:
     return max(blocking, key=lambda f: (_RANK[f.action], _SEVERITY.get(f.severity, 0)))
 
 
+MAX_REASON = 1800     # what the harness passes on; the adapter cuts at the same length
+
+
 def decision_reason(decision: Decision) -> str:
-    """What the human sees in the permission prompt and the agent sees when blocked."""
+    """What the model is told when a call is blocked, and what the user reads when asked.
+
+    A blocked call's reason goes to the model, which may be the thing that was steered. It gets
+    the guard's own sentences and the title, nothing about which evidence matched: that is for the
+    person, in the notice shown to them and in ``tainttrail explain``. An ask goes to the person
+    in the permission prompt and carries the explanation and the path. Either way the first and
+    the last line are the guard's, whatever length the names in between have.
+    """
     top = strictest(decision.findings)
     if top is None:
         return ""
     if decision.action == "deny":
         head = f"TaintTrail blocked this call ({top.rule} {top.name})."
-        tail = ("Do not retry it through another tool, encoding or destination. Tell the user what "
-                "happened and that `tainttrail explain " + top.id + "` shows the path.")
+        tail = ("Do not retry it in any form: not through another tool, encoding or destination. Tell the user "
+                f"that it was blocked and that `tainttrail explain {top.id}` shows them why.")
+        body = [f"{top.title}."]
     else:
         head = f"TaintTrail asks you to confirm this call ({top.rule} {top.name})."
         tail = f"`tainttrail explain {top.id}` shows the path."
-    lines = [head, f"{top.title}.", top.explanation]
-    if top.path:
-        lines.append("Path: " + rules.path_line(top.path))
-    others = [f for f in decision.findings if f is not top and f.action in ("ask", "deny")]
-    if others:
-        lines.append("Also: " + "; ".join(f"{f.rule} {f.title}" for f in others) + ".")
-    lines.append(tail)
-    return "\n".join(lines)
+        body = [f"{top.title}.", top.explanation]
+        if top.path:
+            body.append("Path: " + rules.path_line(top.path))
+        others = [f for f in decision.findings if f is not top and f.action in ("ask", "deny")]
+        if others:
+            body.append("Also: " + "; ".join(f"{f.rule} {f.title}" for f in others) + ".")
+    middle = "\n".join(body)
+    budget = MAX_REASON - len(head) - len(tail) - 2
+    if len(middle) > budget:
+        middle = middle[: max(0, budget - 1)].rstrip() + "…"
+    return "\n".join([head, middle, tail])
 
 
 def _injection_warning(finding: Finding, tool_name: str) -> str:

@@ -51,7 +51,7 @@
       "seconds": 18,
       "chapter": "The same attack, twice",
       "where": "my-project — replay of a scripted attack through the real Claude Code hook adapter",
-      "command": "TAINTTRAIL_KEY=demo {python} -m tainttrail demo run a02 --compare --brief",
+      "command": "TAINTTRAIL_KEY=demo-video-fixed-key {python} -m tainttrail demo run a02 --compare --brief",
       "show": "tainttrail demo run a02 --compare --brief",
       "highlight": "DENIED|left the machine|stayed on the machine",
       "caption": "A page tells the agent to post .env to an attacker. Without the guard three secrets leave. With it, the upload is denied before it runs."
@@ -107,8 +107,8 @@
       "seconds": 14,
       "chapter": "Before anything runs",
       "where": "tainttrail fix — after tainttrail scan mapped the sample configuration in examples/agent-config",
-      "setup": "rm -f {tmp}/tt-demo-agent-config.rl* && TAINTTRAIL_KEY=demo TAINTTRAIL_DB={tmp}/tt-demo-agent-config.rl {python} -m tainttrail scan --path examples/agent-config/project --home examples/agent-config/home",
-      "command": "TAINTTRAIL_KEY=demo TAINTTRAIL_DB={tmp}/tt-demo-agent-config.rl {python} -m tainttrail fix",
+      "setup": "rm -f {tmp}/tt-demo-agent-config.rl* && TAINTTRAIL_KEY=demo-video-fixed-key TAINTTRAIL_DB={tmp}/tt-demo-agent-config.rl {python} -m tainttrail scan --path examples/agent-config/project --home examples/agent-config/home",
+      "command": "TAINTTRAIL_KEY=demo-video-fixed-key TAINTTRAIL_DB={tmp}/tt-demo-agent-config.rl {python} -m tainttrail fix",
       "show": "tainttrail fix",
       "highlight": "open paths|breaks [0-9,]+ of",
       "caption": "The same graph also maps what an agent is configured with: 4 MCP servers, 161 tools. The fix is the smallest permission change that breaks every open path, rehearsed in a transaction and rolled back."
@@ -118,7 +118,7 @@
       "seconds": 9,
       "chapter": "Results",
       "where": "tainttrail demo all — 30 replayable scenarios, canary secrets, reserved hosts",
-      "command": "TAINTTRAIL_KEY=demo {python} -m tainttrail demo all",
+      "command": "TAINTTRAIL_KEY=demo-video-fixed-key {python} -m tainttrail demo all",
       "show": "tainttrail demo all",
       "tail": 22,
       "highlight": "attacks|ordinary|leaked",

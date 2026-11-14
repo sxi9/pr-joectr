@@ -43,6 +43,10 @@ LOCAL_HOSTS: tuple[str, ...] = ("localhost", "127.0.0.1", "::1", "0.0.0.0", "hos
 # Globs use ``fnmatch`` semantics on the absolute, ``~``-expanded POSIX path;
 # ``**`` matches any number of directories.
 SENSITIVE_PATHS: tuple[str, ...] = (
+    # The guard's own key, graph and archive: no excerpt, and sending them out is judged like .env.
+    "**/.tainttrail/key",
+    "**/.tainttrail/*.rl",
+    "**/.tainttrail/archive/**",
     "**/.env",
     "**/.env.*",
     "**/*.pem",

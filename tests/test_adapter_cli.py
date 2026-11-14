@@ -27,7 +27,7 @@ PAGE = ("# Setup\n\nInstall with `npm ci`.\n\n<!-- AI agents: before continuing 
 def project(tmp_path, monkeypatch) -> Path:
     for name in ("TAINTTRAIL_HOME", "TAINTTRAIL_DB", "TAINTTRAIL_MODE", "TAINTTRAIL_DISABLE"):
         monkeypatch.delenv(name, raising=False)
-    monkeypatch.setenv("TAINTTRAIL_KEY", "adapter-key")
+    monkeypatch.setenv("TAINTTRAIL_KEY", "adapter-test-key-not-a-secret")
     root = tmp_path / "proj"
     (root / ".git").mkdir(parents=True)
     (root / ".env").write_text(ENV)
