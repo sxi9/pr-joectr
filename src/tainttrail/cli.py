@@ -19,7 +19,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from . import __version__, report
+from . import __version__, report, retention
 from .config import Config, load_config
 from .store import Store, StoreError, StoreMissing, open_store
 
@@ -100,6 +100,7 @@ def cmd_status(args: argparse.Namespace, cfg: Config) -> int:
             info.update(report.status(store))
     except StoreMissing:
         info["nodes"] = 0
+    info["archived"] = len(retention.archived(cfg))
     if args.json:
         _out(json.dumps(info, indent=1, default=str))
         return 0
@@ -112,7 +113,10 @@ def cmd_status(args: argparse.Namespace, cfg: Config) -> int:
         return 0
     size = cfg.db_path.stat().st_size if cfg.db_path.exists() else 0
     _out(f"graph        {cfg.db_path}  ({info['nodes']} nodes, {size / 1024:.0f} KB)")
-    _out(f"sessions     {info['sessions']}")
+    sessions_line = f"sessions     {info['sessions']}"
+    if info.get("archived"):
+        sessions_line += f"  (+ {info['archived']} older in {retention.archive_dir(cfg)}; open one with `tainttrail ui --file`)"
+    _out(sessions_line)
     _out(f"tool calls   {info['calls']}  ({info['asked']} asked, "
          + report.paint(f"{info['denied']} denied", *(("bright_red", "bold") if info["denied"] else ()), color=color) + ")")
     _out(f"content      {info['untrusted']} untrusted, {info['sensitive']} sensitive")

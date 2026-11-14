@@ -58,6 +58,12 @@ not_sensitive = []  # exceptions to the sensitive list
 [rules]
 # Override one rule: "allow", "ask", "deny" or "off". Example:
 # TT002 = "deny"
+
+[limits]
+# The graph is opened and closed for every hook event, which costs about 45 ms per thousand
+# nodes. Past this many session nodes the oldest sessions move to .tainttrail/archive/ as
+# export files (`tainttrail ui --file <one>` opens them). 0 keeps every session live.
+# max_live_nodes = 1500
 """
 
 

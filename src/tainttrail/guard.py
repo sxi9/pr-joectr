@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import os
 
-from . import rules, schema as S
+from . import retention, rules, schema as S
 from .analyze import (
     analyze_attachment, analyze_call, analyze_memory, analyze_prompt, analyze_result, prompt_file_mentions,
 )
@@ -57,6 +57,8 @@ class Guard:
             if event.kind == "session_start":
                 rec.session_start(event)
                 self._read_inherited_memory(rec, event, cwd)
+                # The start of a session is the one moment when nothing is waiting on the guard.
+                retention.prune(store, self.cfg, keep=(event.session_id,))
                 return Decision()
             if event.kind == "user_prompt":
                 rec.record_prompt(event, analyze_prompt(event.prompt, self.cfg, cwd=cwd))

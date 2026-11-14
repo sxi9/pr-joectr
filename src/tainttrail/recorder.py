@@ -17,7 +17,8 @@ from urllib.parse import urlsplit
 
 from . import schema as S
 from .config import Config
-from .model import CallAnalysis, ContentAnalysis, EntityRef, Finding, HookEvent, ToolLabels
+from .defaults import MAX_CHUNKS_UNTRUSTED
+from .model import CallAnalysis, ChunkRef, ContentAnalysis, EntityRef, Finding, HookEvent, ToolLabels
 from .store import Store
 
 _SECRETISH_ENV = re.compile(r"KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|PRIVATE|AUTH", re.I)
@@ -555,7 +556,7 @@ class Recorder:
                 "MATCH (c:Content {id: $cid}) MATCH (e:Entity {id: $eid}) MERGE (c)-[:FROM]->(e)",
                 {"cid": cid, "eid": a.source.id},
             )
-        chunks = a.chunks[: self.cfg.max_chunks]
+        chunks = self._chunks_worth_keeping(a)
         if chunks:
             self.store.write(
                 """
@@ -572,6 +573,21 @@ class Recorder:
                 ]},
             )
             self._remember_secret_lengths(c.length for c in chunks if c.kind == "secret")
+
+    def _chunks_worth_keeping(self, a: ContentAnalysis) -> list[ChunkRef]:
+        """The fingerprints of a content that a rule can ever look up.
+
+        Fingerprints answer two questions: did sensitive text leave (the content is
+        sensitive), and was third-party text copied into a command or a file (the content
+        is untrusted). Ordinary project files and command output are neither, and
+        fingerprinting every line of them added thousands of nodes per session that no
+        query would ever match, to a graph that is loaded for every hook event.
+        """
+        if a.sensitive:
+            return a.chunks[: self.cfg.max_chunks]
+        if a.untrusted:
+            return a.chunks[: min(self.cfg.max_chunks, MAX_CHUNKS_UNTRUSTED)]
+        return [c for c in a.chunks if c.kind == "secret"][: self.cfg.max_chunks]
 
     def entity_row(self, ref: EntityRef) -> dict[str, Any]:
         """Node properties for an entity, with the flags the project's config gives it."""

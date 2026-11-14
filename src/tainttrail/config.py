@@ -48,6 +48,7 @@ class Config:
     max_content_bytes: int = defaults.MAX_CONTENT_BYTES
     max_chunks: int = defaults.MAX_CHUNKS_PER_CONTENT
     max_entities: int = defaults.MAX_ENTITIES_PER_CONTENT
+    max_live_nodes: int = defaults.MAX_LIVE_NODES
     lock_timeout_ms: int = defaults.LOCK_TIMEOUT_MS
     # "auto" uses the `claude` CLI when it is on PATH; "none" keeps everything deterministic.
     llm: str = "auto"
@@ -204,6 +205,9 @@ def _apply(cfg: Config, raw: dict[str, Any]) -> None:
         value = limits.get(name)
         if isinstance(value, int) and value > 0:
             setattr(cfg, name, value)
+    live = limits.get("max_live_nodes")
+    if isinstance(live, int) and not isinstance(live, bool) and live >= 0:
+        cfg.max_live_nodes = live   # 0 keeps every session in the live graph
 
 
 def _extend(base: tuple[str, ...], extra: Any, replace: Any = None) -> tuple[str, ...]:

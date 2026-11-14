@@ -152,5 +152,11 @@ MODES: tuple[str, ...] = ("monitor", "guard", "strict")
 
 MAX_CONTENT_BYTES = 262_144
 MAX_CHUNKS_PER_CONTENT = 400
+# Untrusted text that holds nothing sensitive is fingerprinted to notice copies of it; fewer suffice.
+MAX_CHUNKS_UNTRUSTED = 150
+# The live graph is opened and closed for every hook event, at about 45 ms per thousand
+# nodes. Past this many session nodes the oldest sessions move to archive files. 0 keeps
+# everything.
+MAX_LIVE_NODES = 1_500
 MAX_ENTITIES_PER_CONTENT = 200
 LOCK_TIMEOUT_MS = 4_000
