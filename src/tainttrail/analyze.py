@@ -532,6 +532,25 @@ def analyze_memory(text: str, cfg: Config, *, cwd: str, name: str) -> ContentAna
     return a
 
 
+def prompt_file_mentions(prompt: str, cwd: str) -> list[EntityRef]:
+    """Files named with ``@path`` in a prompt. The harness inserts their contents without a tool call."""
+    refs: dict[str, EntityRef] = {}
+    for m in _MENTION.finditer(prompt or ""):
+        ref = file_entity(m.group(1).rstrip(".,;:"), cwd)
+        refs.setdefault(ref.id, ref)
+    return list(refs.values())
+
+
+def analyze_attachment(path_ref: EntityRef, text: str, cfg: Config, *, cwd: str,
+                       tainted_sources: Iterable[str] = frozenset()) -> ContentAnalysis:
+    """A file the user attached to a prompt, judged exactly as if the agent had read it."""
+    call = CallAnalysis(tool="Read", actions=[Action(S.READS, path_ref)], labels=ToolLabels())
+    a = analyze_result("Read", {"file_path": path_ref.value}, {"type": "text", "file": {"content": text}}, call, cfg,
+                       cwd=cwd, tainted_sources=tainted_sources)
+    a.origin = "attached"
+    return a
+
+
 def analyze_prompt(prompt: str, cfg: Config, *, cwd: str) -> ContentAnalysis:
     """What the user typed. Never untrusted; it is the one voice the agent works for."""
     prompt = prompt or ""

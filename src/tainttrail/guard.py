@@ -7,8 +7,12 @@ only decisions that reach the harness are "ask" and "deny".
 
 from __future__ import annotations
 
+import os
+
 from . import rules, schema as S
-from .analyze import analyze_call, analyze_memory, analyze_prompt, analyze_result
+from .analyze import (
+    analyze_attachment, analyze_call, analyze_memory, analyze_prompt, analyze_result, prompt_file_mentions,
+)
 from .config import Config
 from .model import Decision, Finding, HookEvent
 from .recorder import Recorder
@@ -42,6 +46,7 @@ class Guard:
                 return Decision()
             if event.kind == "user_prompt":
                 rec.record_prompt(event, analyze_prompt(event.prompt, self.cfg, cwd=cwd))
+                self._read_attachments(rec, event, cwd)
                 return Decision()
             if event.kind == "pre_tool":
                 return self._pre_tool(store, rec, event, cwd)
@@ -62,6 +67,24 @@ class Guard:
             except OSError:
                 continue
             rec.update_content(item["id"], event, analyze_memory(text, self.cfg, cwd=cwd, name=item["name"]))
+
+    def _read_attachments(self, rec: Recorder, event: HookEvent, cwd: str) -> None:
+        """``@path`` in a prompt puts a file into the context with no tool call for a hook to see.
+
+        The guard reads the same file, so that a secrets file attached this way counts as
+        sensitive content of the session and a vendored one as untrusted.
+        """
+        refs = prompt_file_mentions(event.prompt, cwd)[:8]
+        tainted = rec.tainted_sources([r.id for r in refs])
+        for ref in refs:
+            try:
+                if not os.path.isfile(ref.value) or os.path.getsize(ref.value) > 4 * self.cfg.max_content_bytes:
+                    continue
+                with open(ref.value, encoding="utf-8", errors="replace") as fh:
+                    text = fh.read(self.cfg.max_content_bytes)
+            except OSError:
+                continue
+            rec.record_attachment(event, analyze_attachment(ref, text, self.cfg, cwd=cwd, tainted_sources=tainted))
 
     def _pre_tool(self, store: Store, rec: Recorder, event: HookEvent, cwd: str) -> Decision:
         rec.ensure_session(event)

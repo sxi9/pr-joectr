@@ -201,6 +201,20 @@ class Recorder:
         )
         return cid
 
+    def record_attachment(self, event: HookEvent, analysis: ContentAnalysis) -> str:
+        """Content the harness put into the context itself, such as a file named with ``@path`` in a prompt."""
+        self.ensure_session(event)
+        seq = self.next_seq(event.session_id)
+        cid = f"{event.session_id}:attached:{seq}"
+        self._write_content(cid, event, seq, analysis)
+        self.store.write(
+            "MATCH (s:Session {id: $sid}) MATCH (c:Content {id: $cid}) MERGE (s)-[:RECEIVED]->(c)",
+            {"sid": event.session_id, "cid": cid},
+        )
+        if analysis.sensitive and analysis.source is not None and analysis.source.kind == "file":
+            self.store.write("MATCH (e:Entity {id: $id}) SET e.sensitive = true", {"id": analysis.source.id})
+        return cid
+
     # -- tool calls ------------------------------------------------------------------------
 
     def call_id(self, event: HookEvent) -> str | None:

@@ -288,9 +288,10 @@ one bit at a time will pass, at best with a question to the user. Specifically:
 
 - Matching is by content. Base64, hex, percent-encoding, JSON escapes and two levels of
   nesting are undone; compression, base32, reversal and anything a script computes are not.
-- It sees what hooks see. `@file` mentions, slash commands the user types and anything done
-  with hooks disabled never reach it. A program the agent writes and then runs is judged by
-  its command line, not by what it does.
+- It sees what hooks see. Slash commands the user types and anything done with hooks
+  disabled never reach it. A file attached with `@path` is read by the guard at prompt time,
+  since no tool call announces it. A program the agent writes and then runs is judged by its
+  command line, not by what it does.
 - Trust starts from paths and sources: a file in the repository is trusted unless it sits
   under a vendored directory, was downloaded or cloned in a recorded session, or reads like
   instructions. A repository you do not trust should be marked untrusted in the config.

@@ -99,7 +99,8 @@ ORDER BY seq
 
 _Q_RECEIVED = """
 MATCH (:Session {id: $sid})-[:RECEIVED]->(p:Content)
-RETURN CASE p.origin WHEN 'memory' THEN 'memory' ELSE 'prompt' END AS kind, p.seq AS seq, null AS num, p.id AS id,
+RETURN CASE p.origin WHEN 'memory' THEN 'memory' WHEN 'attached' THEN 'attached' ELSE 'prompt' END AS kind,
+       p.seq AS seq, null AS num, p.id AS id,
        p.origin AS tool, p.excerpt AS summary, 'allow' AS decision, 'done' AS status, false AS is_sink,
        'main' AS agent, p.ts AS ts, coalesce(p.untrusted, false) AS untrusted,
        coalesce(p.sensitive, false) AS sensitive, 0.0 AS injection, [] AS rules
@@ -315,6 +316,8 @@ def render_timeline(rows: list[dict[str, Any]], *, color: bool = False, width: i
             tool, what = paint(f"{'prompt':<11}", "green", color=color), r["summary"] or ""
         elif r["kind"] == "memory":
             tool, what = paint(f"{'memory':<11}", "magenta", color=color), r["summary"] or ""
+        elif r["kind"] == "attached":
+            tool, what = paint(f"{'@file':<11}", "green", color=color), r["summary"] or ""
         else:
             name = r["tool"] or ""
             if name.startswith("mcp__"):
