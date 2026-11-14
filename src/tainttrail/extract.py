@@ -17,6 +17,7 @@ percent-encoding, because that is how copied data is usually wrapped.
 
 from __future__ import annotations
 
+
 import base64
 import binascii
 import hashlib
@@ -400,10 +401,18 @@ _NAME_ENDS_IN_CREDENTIAL_WORD = re.compile(
 _IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*")
 
 
+_ENV_SUFFIX = re.compile(r"(?i)(?:[_-]?(?:prod|production|dev|development|stag(?:e|ing)|stg|test|qa|live|local|old|new"
+                         r"|backup|primary|secondary|base|main|default|v?\d+))+$")
+
+
 def _credential_name(text: str, m: "re.Match[str]") -> bool:
     """Whether the name of a ``name = value`` hit ends in a credential word."""
     name = re.match(r"[\w.-]+", text[m.start():m.start(1)])
-    return bool(name and _NAME_ENDS_IN_CREDENTIAL_WORD.search(name.group(0)))
+    if not name:
+        return False
+    word = name.group(0)
+    word = _ENV_SUFFIX.sub("", word) or word    # DB_PASSWORD_PROD, API_KEY_V2, SECRET_KEY_BASE are credentials too
+    return bool(_NAME_ENDS_IN_CREDENTIAL_WORD.search(word))
 
 
 def _plausible_assignment(text: str, m: "re.Match[str]", value: str) -> bool:
@@ -420,7 +429,8 @@ def _plausible_assignment(text: str, m: "re.Match[str]", value: str) -> bool:
     quoted = head.rstrip()[-1:] in ("\"", "'")
     after = text[m.end(1):m.end(1) + 1]
     if not quoted and _IDENTIFIER.fullmatch(value):
-        if "." in value or after in ("(", "[", ".") or not any(ch.isdigit() for ch in value):
+        passphrase = len(value) >= 16 and value.islower() and value.isalpha()     # correcthorsebatterystaple
+        if "." in value or after in ("(", "[", ".") or (not any(ch.isdigit() for ch in value) and not passphrase):
             return False        # request.form, create_access_token(...), hashedPassword, postgres
     return True
 
@@ -932,12 +942,14 @@ _INJECTION_MARKERS: tuple[tuple[str, float, "re.Pattern[str] | Callable[[str], b
         r"<\s*/?\s*(?:system|assistant|instructions?)\s*>|\[/?INST\]|^#{2,3}\s*(?:system|instructions?)\s*:"
         r"|^#{2,3}\s*system\s+(?:prompt|message)\b|<\|(?:im_start|system|assistant)\|>|BEGIN (?:SYSTEM|ADMIN) (?:PROMPT|MESSAGE)",
         re.I | re.M)),
-    # "model" and "cursor" are everyday nouns (Django models, database cursors) and a bare "agent" is
-    # usually a user agent or a build agent. An agent is addressed when the text names an AI assistant,
-    # qualifies the agent ("AI agents", "coding agents") or speaks to it ("agents: ...").
+    # "model" and "cursor" are everyday nouns (Django models, database cursors). An agent is addressed
+    # when the text names an AI assistant, qualifies the agent ("AI agents", "coding agents"), speaks
+    # to it ("agents: ...") or tells agents what they must do, unless that is a user agent, a build
+    # agent or another agent of that kind.
     ("addressed-to-agent", 0.3, re.compile(
         r"\b" + _ADDRESSEE + r"\b[^.\n]{0,60}\b" + _MODAL + r"\b"
         r"|\bagents?\s*[:,]\s*[^.\n]{0,80}\b" + _MODAL + r"\b"
+        r"|(?<!user )(?<!user-)(?<!build )(?<!ssh )(?<!monitoring )(?<!transfer )\bagents?\b[^.\n]{0,60}\b" + _MODAL + r"\b"
         r"|\b(?:attention|note (?:to|for)|message for|instructions? for)\b[^.\n]{0,24}\b(?:" + _ADDRESSEE + r"|agents?)\b", re.I)),
     ("new-instructions", 0.3, re.compile(
         r"\b(?:new|updated|additional|important|urgent|special|system)\s+(?:instructions?|task|directive)s?\b\s*[:\-]", re.I)),

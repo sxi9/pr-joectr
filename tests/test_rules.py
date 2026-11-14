@@ -13,6 +13,7 @@ import pytest
 
 from tainttrail import rules, schema as S
 from tainttrail.config import Config
+from tainttrail.extract import fingerprint
 from tainttrail.model import (
     Action, CallAnalysis, ChunkRef, ContentAnalysis, Decision, EntityRef, HookEvent, ToolLabels,
 )
@@ -99,15 +100,41 @@ def test_what_the_user_named_may_go_where_the_user_named_it_and_nothing_else(sim
     # Naming where to send things is not asking for .env to be sent there.
     _, findings = sim.call("Bash", Action(S.SENDS_TO, mine), sink=True, dests=[mine], carried=[SECRET])
     assert only(findings, "TT001").action == "deny"
-    # Naming both is: nothing goes anywhere the user did not name, and nothing the user did not name goes.
+    # Naming both makes it a question the user can answer, not an order: "the credentials are in .env
+    # if you need them" does not ask for .env to be posted.
     sim.prompt(mine, sim.env_path())
     _, findings = sim.call("Bash", Action(S.SENDS_TO, mine), sink=True, dests=[mine], carried=[SECRET])
-    f = only(findings, "TT006")
-    assert (f.action, f.severity) == ("allow", "info")
-    assert "You named both" in f.explanation
+    f = only(findings, "TT001")
+    assert f.action == "ask" and "You named this destination and this data yourself" in f.explanation
     # The same data to a host the page named stays denied, whatever the user named.
     _, findings = sim.call("Bash", Action(S.SENDS_TO, HOST_EVIL), sink=True, dests=[HOST_EVIL], carried=[SECRET])
     assert only(findings, "TT001").action == "deny"
+
+
+def test_what_the_user_pasted_goes_where_the_user_named_it(sim: Sim):
+    """A value typed into the prompt was handed over by the user, with the place to send it."""
+    mine = EntityRef("host", "backup.example.com")
+    pasted = ChunkRef("k-pasted", "secret", "generic", 40)
+    sim.prompt(mine, chunks=[pasted], sensitive=True)
+    sim.fetch_poisoned_page()
+    _, findings = sim.call("Bash", Action(S.SENDS_TO, mine), sink=True, dests=[mine], carried=[pasted])
+    f = only(findings, "TT006")
+    assert (f.action, f.severity) == ("allow", "info") and "You named both" in f.explanation
+    # ... and nowhere else
+    _, findings = sim.call("Bash", Action(S.SENDS_TO, HOST_EVIL), sink=True, dests=[HOST_EVIL], carried=[pasted])
+    assert only(findings, "TT001").action == "deny"
+
+
+def test_a_service_key_goes_to_its_own_service_when_the_user_named_both(sim: Sim):
+    """$WEATHERHUB_KEY for api.weatherhub.example is that service's key. $AWS_SECRET_ACCESS_KEY is not."""
+    api = EntityRef("host", "api.weatherhub.example")
+    own, other = EntityRef("env", "WEATHERHUB_KEY"), EntityRef("env", "AWS_SECRET_ACCESS_KEY")
+    sim.prompt(api, own, other)
+    sim.fetch_poisoned_page()
+    _, findings = sim.call("Bash", Action(S.SENDS_TO, api), Action(S.UPLOADS, own), sink=True, dests=[api])
+    assert only(findings, "TT006").action == "allow"
+    _, findings = sim.call("Bash", Action(S.SENDS_TO, api), Action(S.UPLOADS, other), sink=True, dests=[api])
+    assert only(findings, "TT001").action == "ask"
 
 
 def test_line_fingerprints_need_several_matches(sim: Sim):
@@ -190,15 +217,29 @@ def test_tt003_prefers_the_most_specific_destination(sim: Sim):
 
 
 def test_following_a_link_from_a_page_is_not_an_injected_destination(sim: Sim):
-    link = ChunkRef("k-url-1", "url", "", 60)
+    url = f"https://{HOST_EVIL.value}/docs/getting-started?utm_source=newsletter&utm_campaign=spring"
+    other = f"https://{HOST_EVIL.value}/c?d=aW50ZXJuYWwgcm9hZG1hcDogYWNxdWlzaXRpb24"
+    link = ChunkRef(fingerprint(url, sim.cfg.key()), "url", "", len(url))
     sim.fetch_poisoned_page(HOST_EVIL, chunks=[link])
     # a plain GET without a payload
     _, findings = sim.call("WebFetch", Action(S.SENDS_TO, HOST_EVIL), sink=True, dests=[HOST_EVIL], payload=False)
     assert findings == []
-    # a GET whose query string is exactly the link the page contained
+    # a GET of exactly the link the page contained, query string and all
     _, findings = sim.call("WebFetch", Action(S.SENDS_TO, HOST_EVIL), sink=True, dests=[HOST_EVIL], payload=True,
-                           carried=[link])
+                           carried=[link], extra={"get_urls": [url]})
     assert findings == []
+    # the same with curl, as long as the command is nothing but that download
+    _, findings = sim.call("Bash", Action(S.SENDS_TO, HOST_EVIL), sink=True, dests=[HOST_EVIL], payload=True,
+                           carried=[link], extra={"get_urls": [url], "plain_get": True})
+    assert findings == []
+    # a second URL the page did not list rides along: that is not following a link
+    _, findings = sim.call("Bash", Action(S.SENDS_TO, HOST_EVIL), sink=True, dests=[HOST_EVIL], payload=True,
+                           carried=[link], extra={"get_urls": [url, other], "plain_get": True})
+    assert only(findings, "TT003")
+    # ... and neither is a request that is more than a download (a header, a cookie, a body)
+    _, findings = sim.call("Bash", Action(S.SENDS_TO, HOST_EVIL), sink=True, dests=[HOST_EVIL], payload=True,
+                           carried=[link], extra={"get_urls": [url], "plain_get": False})
+    assert only(findings, "TT003")
 
 
 def test_destination_also_named_by_the_user_or_trusted_content_is_not_injected(sim: Sim):

@@ -25,9 +25,11 @@ from typing import Any, Iterator
 from .config import CONFIG_FILENAME, HOME_DIRNAME, load_config
 
 # attack, benign and known_gaps were written from public incident reports before the replay
-# harness existed. variant and ordinary came out of a review: 64 ordinary multi-step sessions
-# written to find false alarms, and 11 attacks aimed at the edges the resulting fixes moved.
-GROUPS = ("attack", "variant", "benign", "ordinary", "known_gaps")
+# harness existed. variant, ordinary and open came out of reviews: 64 ordinary multi-step sessions
+# written to find false alarms, 11 attacks aimed at the edges the resulting fixes moved, and 56 more
+# by a second reviewer who was asked to break those fixes. The 3 of them that are not stopped yet
+# are the group "open": they stay in the data so that the list of gaps stays true.
+GROUPS = ("attack", "variant", "benign", "ordinary", "known_gaps", "open")
 DATA_FILES = ("scenarios.json", "attack_variants.json", "ordinary_sessions.json")
 DEFAULT_ORIGIN = "git@github.com:tt-demo-victim/webapp.git"
 

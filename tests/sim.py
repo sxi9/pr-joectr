@@ -38,9 +38,9 @@ class Sim:
     def start(self) -> list[str]:
         return self.rec.session_start(self.event("session_start"))
 
-    def prompt(self, *mentions: EntityRef, chunks=()) -> str:
+    def prompt(self, *mentions: EntityRef, chunks=(), sensitive: bool = False) -> str:
         a = ContentAnalysis(origin="user", text_bytes=10, excerpt="a prompt", mentions=list(mentions),
-                            chunks=list(chunks))
+                            chunks=list(chunks), sensitive=sensitive)
         return self.rec.record_prompt(self.event("user_prompt", prompt="..."), a)
 
     def call(self, tool: str, *actions: Action, sink: bool = False, dests=(), carried=(),

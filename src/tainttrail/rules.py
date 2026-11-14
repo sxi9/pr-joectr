@@ -19,6 +19,7 @@ content did.
 
 from __future__ import annotations
 
+
 import json
 import re
 from dataclasses import dataclass, replace
@@ -27,6 +28,7 @@ from urllib.parse import urlsplit
 
 from . import schema as S
 from .config import Config
+from .extract import fingerprint
 from .model import CallAnalysis, ContentAnalysis, Finding, PathStep
 from .store import Store
 
@@ -271,7 +273,8 @@ ORDER BY id
 # call READS the entity this call writes to. A text that merely mentions the source does not
 # qualify, which is why a repository needs SENDS_TO and an MCP object its `object` flag.
 _SAME_OBJECT = """EXISTS { MATCH (p)<-[:RETURNED]-(r:ToolCall)-[:READS]->(e:Entity)<-[x:SENDS_TO|REFERENCES]-(c)
-           WHERE (e.kind = 'repo' AND type(x) = 'SENDS_TO') OR (e.kind = 'mcp' AND coalesce(x.object, false)) }"""
+           WHERE (e.kind = 'repo' AND type(x) = 'SENDS_TO' AND coalesce(p.untrusted, false))
+              OR (e.kind = 'mcp' AND coalesce(x.object, false)) }"""
 
 _Q_CARRIED_SENSITIVE = """
 MATCH (c:ToolCall {id: $call})-[:CARRIES]->(k:Chunk)<-[:HAS_CHUNK]-(p:Content {sensitive: true})
@@ -290,7 +293,8 @@ _Q_SENSITIVE_ELSEWHERE = """
 MATCH (c:ToolCall {id: $call})
 MATCH (p:Content {session_id: c.session_id, sensitive: true}) WHERE p.seq < c.seq
 OPTIONAL MATCH (p)-[:FROM]->(src:Entity)
-RETURN p.id AS id, src.id AS source, """ + _SAME_OBJECT + """ AS same_object
+RETURN p.id AS id, src.id AS source, """ + _SAME_OBJECT + """ AS same_object,
+       EXISTS { MATCH (p)<-[:RETURNED]-(r2:ToolCall)-[ro:READS]->(:Entity {kind: 'mcp'}) WHERE coalesce(ro.object, false) } AS has_object
 """
 
 # How much the untrusted content of the session reads like instructions, at most.
@@ -366,7 +370,6 @@ LIMIT 1""",
 _SCRIPT_NAME = re.compile(r"(?:\.(?:sh|bash|zsh|py|pl|rb|js|mjs|ps1|bat|cmd|exe|bin|run|command|appimage)|/(?:install|setup|bootstrap|run)[\w.-]*)$", re.I)
 _TAMPER_COMMAND = re.compile(r"TAINTTRAIL_DISABLE|tainttrail\s+uninstall|-m\s+tainttrail\s+uninstall")
 _SETTINGS_FILE = re.compile(r"/\.claude/settings(\.local)?\.json$")
-_GUARD_WORDS = re.compile(r"hooks|tainttrail|disableAllHooks", re.I)
 
 
 # -- titles ------------------------------------------------------------------------------
@@ -630,6 +633,10 @@ class _Eval:
                                  and self.store.scalar(_Q_NAMED_BY_SECRETS_FILE, {"call": self.call_id, "dest": d["id"]}, 0)}
         known |= {d["id"] for d in external if d["kind"] == "url" and _host_id(d["value"]) in known}
         self._dest_known = bool(external) and all(d["id"] in known for d in external)
+        by_file = {d["id"] for d in external if d["by_trusted"]
+                   and self.store.scalar(_Q_NAMED_BY_SECRETS_FILE, {"call": self.call_id, "dest": d["id"]}, 0)}
+        by_file |= {d["id"] for d in external if d["kind"] == "url" and _host_id(d["value"]) in by_file}
+        self._dest_in_secrets_file = bool(external) and all(d["id"] in by_file for d in external)
         uploaded = self.store.run(_Q_UPLOADED_SENSITIVE, {"call": self.call_id})
         committed: list[dict[str, Any]] = []
         if call.sink_kind == "git":
@@ -654,6 +661,13 @@ class _Eval:
         # lists https://host/collect?src=x must not get a POST to it waved through.
         followed = (bool(self.store.scalar(_Q_FOLLOWED_LINK, {"call": self.call_id}, 0))
                     and (call.tool == "WebFetch" or bool(call.extra.get("plain_get"))))
+        if followed and self.cfg is not None:
+            # ... and every URL the call contacts has to be one of the listed links, as written.
+            listed = {r["id"] for r in self.store.run(
+                "MATCH (c:ToolCall {id: $call})-[:CARRIES]->(k:Chunk {kind: 'url'}) RETURN k.id AS id", {"call": self.call_id})}
+            urls = [str(u) for u in (call.extra.get("get_urls") or [])]
+            key = self.cfg.key()
+            followed = bool(urls) and all(fingerprint(u, key) in listed for u in urls)
         if injected and payload and not followed:
             d = injected[0]
             path, query, params = self.run_path("TT003", dest=d["id"])
@@ -710,8 +724,8 @@ class _Eval:
         for row in self.store.run(_Q_SENSITIVE_ELSEWHERE, {"call": self.call_id}):
             if row["same_object"]:
                 continue
-            if server and str(row["source"] or "").startswith(f"mcp:{server}/"):
-                continue        # read from this workspace, written to this workspace
+            if server and str(row["source"] or "").startswith(f"mcp:{server}/") and not row["has_object"]:
+                continue        # found in this workspace by a search or a list, written to this workspace
             return True
         return False
 
@@ -823,12 +837,38 @@ class _Eval:
                 env_auth = set((self.call.extra.get("env_auth") if self.call else None) or [])
                 auth_only = (bool(uploaded) and not carried
                              and all(u.get("kind") == "env" and u["name"] in env_auth for u in uploaded))
-                if auth_only and (all_safe or user_named or self._dest_known):
+                # ... provided the credential belongs there: the secrets file names the host next to it, or
+                # the variable is named after it (GITHUB_TOKEN for api.github.com). An AWS key in the
+                # Authorization header of a paste site is not authentication.
+                hosts = [d["value"] if d["kind"] == "host" else (_host_id(d["value"]) or ":").split(":", 1)[1]
+                         for d in self.targets(S.SENDS_TO) if d["via"] != "suffix" and d["kind"] in ("host", "url")]
+                repos = [d["value"] for d in self.targets(S.SENDS_TO) if d["kind"] == "repo"]
+                belongs = self._dest_in_secrets_file or all(_stem_match(u["name"], hosts + repos) for u in uploaded)
+                if auth_only and belongs and (all_safe or user_named or self._dest_known):
                     return self.finding("TT006", action="allow", severity="info",
                                         title=f"{_cap(what)} authenticates a request to {dest_name}",
                                         explanation=(f"{_cap(what)} is used as a credential (-u or an authorization header) for "
                                                      f"{dest_name}, which you or the project's own files named."),
                                         path=path, query=query, params=params)
+                if auth_only and user_named:
+                    # A credential for a destination the user named, with nothing that ties the two together:
+                    # that is a question for the user, not a refusal.
+                    return self.finding("TT001", action="ask", severity=severity,
+                                        title=f"{_cap(what)} would be sent to {dest_name}",
+                                        explanation=(explanation + f" It is used as a credential for a destination you named, "
+                                                     f"but nothing in the project ties it to {dest_name}. Approve it if that "
+                                                     "is the service it belongs to."),
+                                        path=path, query=query, params=params)
+                if user_named and sources_named:
+                    pasted = bool(carried) and all(c.get("origin") == "user" for c in carried) and not uploaded
+                    own = bool(uploaded) and not carried and all(
+                        u.get("kind") == "env" and _stem_match(u["name"], hosts) for u in uploaded)
+                    if not (pasted or own):
+                        # A mention is not an order: "the credentials are in .env" does not ask for .env to be posted.
+                        return self.finding("TT001", action="ask", severity=severity,
+                                            title=f"{_cap(what)} would be sent to {dest_name}",
+                                            explanation=explanation + " You named this destination and this data yourself, so you can approve it.",
+                                            path=path, query=query, params=params)
                 if user_named and sources_named:
                     # Nothing goes anywhere the user did not name, and nothing the user did not name goes.
                     return self.finding("TT006", action="allow", severity="info",
@@ -934,14 +974,32 @@ class _Eval:
         out: list[Finding] = []
         for w in self.store.run(_Q_PROTECTED_WRITES, {"call": self.call_id}):
             if self._is_guard_file(w["path"]):
-                continue  # TT010 speaks for these
+                kind = self._settings_change(w["path"])
+                if kind in ("guard", "permissions"):
+                    continue  # TT010 speaks for the first; the second only adds narrow permission rules
+                # Any other change of a settings file (a helper command, an environment variable, the
+                # permission mode) persists like an instruction file does: judge it here.
+                path, query, params = self.run_path("TT005.context", dest=w["id"])
+                if self.ctx.get("last_untrusted"):
+                    path = [self.step(S.CONTENT, self.ctx["last_untrusted"], rel="in the same session", role="untrusted"), *path]
+                copied = bool(self.store.scalar(_Q_COPIED_FROM, {"call": self.call_id}, None) is not None) and bool(
+                    self.run_path("TT005.copy", dest=w["id"])[0])
+                f = self.finding(
+                    "TT005", action="deny" if (copied or self._injected_refs()) else "ask", severity="high",
+                    title=f"{w['name']} would be changed in a session that holds untrusted content",
+                    explanation=(f"{w['name']} configures the agent for every later session, and this change is more than a "
+                                 "permission rule. This session has read untrusted content. Check that the change is what you asked for."),
+                    path=path, query=query, params=params)
+                if f:
+                    out.append(f)
+                continue
             path, query, params = self.run_path("TT005.copy", dest=w["id"])
             if path:
                 # Repeating documentation is how a workflow file gets written. Repeating text that
                 # reads like instructions to an agent, or that names this file, is how an injection persists.
                 top = float(self.store.scalar(_Q_COPIED_FROM, {"call": self.call_id}, 0.0) or 0.0)
                 naming = int(self.store.scalar(_Q_NAMED_BY_UNTRUSTED, {"call": self.call_id, "dest": w["id"]}, 0) or 0)
-                if top < LIKELY_INJECTION and not naming:
+                if top < LIKELY_INJECTION and not naming and not self._injected_refs():
                     path = []
             if path:
                 f = self.finding(
@@ -962,7 +1020,7 @@ class _Eval:
                 if not quiet:
                     top = float(self.store.scalar(_Q_INJECTION_LIKE, {"call": self.call_id}, 0.0) or 0.0)
                     naming = int(self.store.scalar(_Q_NAMED_BY_UNTRUSTED, {"call": self.call_id, "dest": w["id"]}, 0) or 0)
-                    quiet = top < LIKELY_INJECTION and not naming
+                    quiet = top < LIKELY_INJECTION and not naming and not self._injected_refs()
                 f = self.finding(
                     "TT005", action="allow" if quiet else "ask",
                     severity="info" if quiet else "high",
@@ -1067,6 +1125,62 @@ class _Eval:
         home = self.cfg.home.as_posix().rstrip("/")
         return path == home or path.startswith(home + "/") or bool(_SETTINGS_FILE.search(path))
 
+    def _injected_refs(self) -> list[dict[str, Any]]:
+        """Hosts and links in the written text that only untrusted content named."""
+        return [d for d in self.targets(S.REFERENCES)
+                if d["kind"] in ("host", "url") and not d["local"] and d["by_untrusted"]
+                and not d["by_trusted"] and not d["trusted"] and not d["by_user"]]
+
+    def _settings_change(self, path: str) -> str:
+        """What a write does to a settings file: "guard", "permissions" or "other".
+
+        The edit is applied to the file as it is on disk and both versions are parsed. "guard": the
+        hook settings differ, or either version does not parse (a file that does not parse registers
+        no hook). "permissions": only narrow rules were added to permissions.allow / ask / deny.
+        """
+        call = self.call
+        if call is None or not _SETTINGS_FILE.search(path) or call.tool not in ("Edit", "MultiEdit", "Write"):
+            return "guard"
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                before_text = fh.read()
+        except OSError:
+            before_text = None
+        if call.tool == "Write":
+            after_text = call.arg_text or ""
+        else:
+            if before_text is None:
+                return "guard"
+            after_text = before_text
+            for old, new, every in call.extra.get("edits") or []:
+                if not old or old not in after_text:
+                    return "guard"
+                after_text = after_text.replace(old, new) if every else after_text.replace(old, new, 1)
+        try:
+            before = json.loads(before_text) if before_text is not None else {}
+            after = json.loads(after_text)
+        except ValueError:
+            return "guard"
+        if not isinstance(before, dict) or not isinstance(after, dict):
+            return "guard"
+        if any(before.get(k) != after.get(k) for k in ("hooks", "disableAllHooks")):
+            return "guard"
+        rest_b = {k: v for k, v in before.items() if k != "permissions"}
+        rest_a = {k: v for k, v in after.items() if k != "permissions"}
+        pb, pa = before.get("permissions") or {}, after.get("permissions") or {}
+        if rest_b != rest_a or not isinstance(pb, dict) or not isinstance(pa, dict):
+            return "other"
+        if {k: v for k, v in pb.items() if k not in ("allow", "ask", "deny")} != {k: v for k, v in pa.items() if k not in ("allow", "ask", "deny")}:
+            return "other"
+        if [r for r in pb.get("deny") or [] if r not in (pa.get("deny") or [])]:
+            return "other"          # a deny rule was removed
+        added = [r for r in pa.get("allow") or [] if r not in (pb.get("allow") or [])]
+        narrow = re.compile(r"^[A-Za-z_]+\((?![*:)])[^()]*[A-Za-z0-9][^()]*\)$")
+        risky = re.compile(r"^Bash\((?:curl|wget|sh|bash|zsh|python\d*|node|eval|nc|ssh|scp|rm|sudo|env|git push)\b")
+        if any(not isinstance(r, str) or not narrow.match(r) or risky.match(r) for r in added):
+            return "other"
+        return "permissions"
+
     def _touches_guard(self, path: str) -> bool:
         """Whether a write to a guard file can change the guard.
 
@@ -1077,17 +1191,7 @@ class _Eval:
         call = self.call
         if call is None or not _SETTINGS_FILE.search(path) or call.tool not in ("Edit", "MultiEdit", "Write"):
             return True
-        if call.tool == "Write":    # a whole-file replacement: compare the hook settings before and after
-            try:
-                with open(path, encoding="utf-8", errors="replace") as fh:
-                    before = json.load(fh)
-                after = json.loads(call.arg_text or "")
-            except (OSError, ValueError):
-                return True
-            if not isinstance(before, dict) or not isinstance(after, dict):
-                return True
-            return any(before.get(k) != after.get(k) for k in ("hooks", "disableAllHooks"))
-        return bool(_GUARD_WORDS.search(call.arg_text or "") or _GUARD_WORDS.search(str(call.extra.get("old_text") or "")))
+        return self._settings_change(path) == "guard"
 
     def tamper(self) -> list[Finding]:
         call = self.call
@@ -1118,6 +1222,21 @@ class _Eval:
 
 
 _SPECIFICITY = {"repo": 0, "email": 1, "mcp": 2, "url": 3, "host": 4}
+_GENERIC_VAR = frozenset("api key keys token tokens secret secrets access auth password passwd pwd id client private public "
+                         "test prod live dev staging service app user account bearer oauth url host".split())
+_VAR_ALIASES = {"gh": "github", "npm": "npmjs", "aws": "amazonaws", "gcp": "googleapis", "pg": "paygate"}
+
+
+def _stem_match(var: str, places: list[str]) -> bool:
+    """Does a variable's name say it belongs to one of these hosts or repositories?
+
+    GITHUB_TOKEN and api.github.com share "github"; PYPI_TOKEN and upload.pypi.org share "pypi".
+    AWS_SECRET_ACCESS_KEY and paste.example share nothing.
+    """
+    stems = [t for t in re.split(r"[^a-z0-9]+", var.lower()) if len(t) >= 2 and t not in _GENERIC_VAR]
+    stems += [_VAR_ALIASES[t] for t in stems if t in _VAR_ALIASES]
+    labels = [lab for place in places for lab in re.split(r"[^a-z0-9]+", place.lower()) if len(lab) >= 3]
+    return any(len(s) >= 3 and (s in lab or lab in s) for s in stems for lab in labels)
 
 
 def _dest_name(dest: dict[str, Any] | None) -> str:

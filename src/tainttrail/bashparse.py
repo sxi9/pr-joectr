@@ -13,6 +13,7 @@ to understand a command must never make it look safe.
 
 from __future__ import annotations
 
+
 import configparser
 import os
 import posixpath
@@ -39,6 +40,10 @@ class BashAnalysis:
     env_reads: list[str] = field(default_factory=list)    # environment variables the command expands
     env_uploads: list[str] = field(default_factory=list)  # ... inside a command that sends data out
     env_auth: list[str] = field(default_factory=list)     # ... and only where a credential belongs (-u, Authorization:)
+    env_data: list[str] = field(default_factory=list)     # ... variables that some part of the line uses as data
+    net_cmds: int = 0                                     # commands that reach the network
+    plain_cmds: int = 0                                   # ... and are a bare curl/wget download
+    plain_get: bool = False
     env_dump: bool = False                                # prints the whole environment
     env_uploaded: bool = False                            # ... into a command that sends data out
     executes_download: bool = False                       # runs something it fetches in the same command
@@ -210,6 +215,7 @@ class _Ctx:
         self.vars: dict[str, str] = {}
         self.locals: set[str] = set()                    # loop variables: set in the command, value unknown
         self.subs: list[tuple[str, BashAnalysis]] = []   # (kind, analysis) for each substitution
+        self.env_data: list[str] = []                    # variables expanded in assignments and here-strings
         self.heredocs: list[str] = []
 
     @property
@@ -458,6 +464,8 @@ class _Cmd:
     staged: list[str] = field(default_factory=list)
     env_reads: list[str] = field(default_factory=list)
     env_auth: list[str] = field(default_factory=list)
+    env_data: list[str] = field(default_factory=list)
+    plain: bool = False
     env_dump: bool = False
     network: bool = False          # sends something to another machine
     sink_kind: str = ""
@@ -543,7 +551,24 @@ _CURL_VALUE = {"-d", "--data", "--data-raw", "--data-binary", "--data-urlencode"
                "--config", "--url", "-x", "--proxy", "--cacert", "--cert", "--key", "-w", "--write-out",
                "--connect-timeout", "-m", "--max-time", "--retry", "--retry-delay", "--resolve", "--connect-to", "-E",
                "--oauth2-bearer", "--limit-rate", "-r", "--range", "-z", "-C", "--output-dir", "-D", "--dump-header",
-               "--interface", "--unix-socket", "--aws-sigv4", "--proto", "--max-redirs", "--pinnedpubkey", "-Q"}
+               "--interface", "--unix-socket", "--aws-sigv4", "--proto", "--max-redirs", "--pinnedpubkey", "-Q",
+               "--url-query", "--trace", "--trace-ascii", "--proxy-header", "--proxy-user"}
+# A user agent that is one: "curl/8.5.0", "Mozilla/5.0 (X11; Linux x86_64) ...". Anything else in that
+# option is text of the caller's choosing, and a request can carry data there as well as in a body.
+_USER_AGENT = re.compile(r"[A-Za-z][\w.+-]{0,40}/\d[\w.]{0,20}(?: |$)")
+
+
+# options that change where the response goes or how patiently it is fetched, and nothing else.
+_CURL_PLAIN = {"-s", "--silent", "-S", "--show-error", "-L", "--location", "-f", "--fail", "--fail-with-body", "-o",
+               "--output", "-O", "--remote-name", "-J", "--remote-header-name", "--create-dirs", "--compressed", "-m",
+               "--max-time", "--connect-timeout", "--retry", "--retry-delay", "-#", "--progress-bar", "-4", "-6",
+               "-I", "--head", "-k", "--insecure", "--http1.1", "--http2", "--output-dir", "-C", "-z", "--max-redirs"}
+_WGET_PLAIN = {"-q", "--quiet", "-O", "--output-document", "-P", "--directory-prefix", "-c", "--continue", "-N",
+               "-t", "-T", "-n", "-v", "--no-verbose", "--show-progress", "--tries", "--timeout"}
+
+
+_CREDENTIAL_HEADER = re.compile(
+    r"(?i)(?:(?:proxy-)?authorization|cookie|x-[\w-]{0,40}?(?:key|token|auth|secret)[\w-]{0,40}|api-?key)\s{0,3}:")
 
 
 def _curl(c: _Cmd, args: list[str]) -> None:
@@ -578,6 +603,14 @@ def _curl(c: _Cmd, args: list[str]) -> None:
     for value in _vals(opts, "-H", "--header", "-b", "--cookie"):
         if value.startswith("@"):
             _add(c.uploads, value[1:])
+    if any(len(v) >= 24 for v in _vals(opts, "--url-query", "--proxy-header")) or _vals(opts, "--proxy-user") or any(
+            len(v) >= 24 and not _USER_AGENT.match(v) for v in _vals(opts, "-A", "--user-agent")):
+        c.payload = True
+    # -v and --trace print the request as it was sent: a credential in a header is then in the output.
+    if any(k in opts for k in ("-v", "--verbose", "--trace", "--trace-ascii")) and (
+            _vals(opts, "-u", "--user", "--oauth2-bearer", "-b", "--cookie", "--proxy-user")
+            or any(_CREDENTIAL_HEADER.match(h.lstrip()) for h in _vals(opts, "-H", "--header"))):
+        c.prints_secret = True
     for value in _vals(opts, "-K", "--config"):
         _add(c.reads, value)
         c.opaque.append("curl takes its arguments from a config file")
@@ -595,6 +628,7 @@ def _curl(c: _Cmd, args: list[str]) -> None:
     discards = any(v == "/dev/null" for v in _vals(opts, "-o", "--output"))
     c.prints_remote = bool(urls) and not outs and not discards
     c.passes_through = False
+    c.plain = bool(urls) and all(k in _CURL_PLAIN for k in opts) and not c.uploads and not c.takes_stdin_as_data
     if not urls and not c.opaque:
         c.opaque.append("curl has no readable URL")
 
@@ -612,7 +646,8 @@ def _wget(c: _Cmd, args: list[str]) -> None:
         c.payload = True
         _add(c.uploads, value)
     if _vals(opts, "--post-data", "--body-data", "--user", "--password") or any(
-            len(h) >= 40 for h in _vals(opts, "--header")):
+            len(h) >= 40 for h in _vals(opts, "--header")) or any(
+            len(v) >= 24 and not _USER_AGENT.match(v) for v in _vals(opts, "-U", "--user-agent")):
         c.payload = True
     for value in _vals(opts, "-i", "--input-file"):
         _add(c.reads, value)
@@ -631,6 +666,7 @@ def _wget(c: _Cmd, args: list[str]) -> None:
             for url in urls:
                 _add(c.derived, (path, url))
     c.passes_through = False
+    c.plain = bool(urls) and all(k in _WGET_PLAIN for k in opts) and not c.uploads
     if not urls and not c.opaque:
         c.opaque.append("wget has no readable URL")
 
@@ -1099,9 +1135,12 @@ def _interpreter(c: _Cmd, args: list[str], ctx: _Ctx) -> None:
             break
         if a == "-m" and i + 1 < len(args):
             module = args[i + 1]
-            bind = next((args[j + 1] for j, x in enumerate(args[:-1]) if x in ("--bind", "-b")), "")
+            # The server takes the last --bind it is given: count it as loopback only when all of them are.
+            binds = [args[j + 1] for j, x in enumerate(args[:-1]) if x in ("--bind", "-b")]
+            binds += [x.split("=", 1)[1] for x in args if x.startswith("--bind=")]
+            loopback = bool(binds) and all(b in ("127.0.0.1", "localhost", "::1") for b in binds)
             # Bound to loopback, a preview server puts nothing on the network.
-            if module in ("http.server", "SimpleHTTPServer") and bind not in ("127.0.0.1", "localhost", "::1"):
+            if module in ("http.server", "SimpleHTTPServer") and not loopback:
                 c.network, c.sink_kind, c.payload = True, "shell-net", True
                 c.opaque.append("serves the current directory over HTTP")
             script = "-m"
@@ -1457,6 +1496,7 @@ def _auth_only_vars(raw_args: list[str], ctx: _Ctx) -> list[str]:
             continue
         data.extend(names(a))
         i += 1
+    ctx.env_data.extend(data)
     return [n for n in dict.fromkeys(auth) if n not in data]
 
 
@@ -1484,7 +1524,7 @@ def _simple(words: list[str], ctx: _Ctx) -> _Cmd | None:
             if args and args[-1].isdigit() and len(args[-1]) == 1:
                 args.pop()   # the "2" of "2>"
             if w in ("<<<",):
-                pass
+                ctx.env_data.extend(m.group(1) or m.group(2) for m in _VAR.finditer(target))   # a here-string is data
             elif "<" in w and ">" not in w:
                 if target and not target.startswith("\x00") and not (w.endswith("&") and target.isdigit()):
                     _add(c.reads, _expand(target, ctx, c))
@@ -1510,6 +1550,7 @@ def _simple(words: list[str], ctx: _Ctx) -> _Cmd | None:
         head = args[0]
         m = _ASSIGN.match(head)
         if m and not head.startswith("\x00"):
+            ctx.env_data.extend(v.group(1) or v.group(2) for v in _VAR.finditer(m.group(2)))   # K=$SECRET copies it
             value = _expand(m.group(2), ctx, c)
             if not _SUB.search(value) and "$" not in value:
                 ctx.vars[m.group(1)] = value
@@ -1591,10 +1632,12 @@ def _is_known(item) -> bool:
 
 def _merge(out: BashAnalysis, inner: BashAnalysis) -> None:
     for name in ("reads", "writes", "uploads", "deletes", "fetches", "destinations", "derived", "env_reads",
-                 "env_uploads", "env_auth", "executed", "staged", "sink_kinds", "opaque_reasons", "programs"):
+                 "env_uploads", "env_auth", "env_data", "executed", "staged", "sink_kinds", "opaque_reasons", "programs"):
         target = getattr(out, name)
         for item in getattr(inner, name):
             _add(target, item)
+    out.net_cmds += inner.net_cmds
+    out.plain_cmds += inner.plain_cmds
     for name in ("env_dump", "env_uploaded", "executes_download", "encodes", "is_sink", "carries_payload",
                  "untrusted_output", "sensitive_output", "opaque"):
         setattr(out, name, getattr(out, name) or getattr(inner, name))
@@ -1646,7 +1689,12 @@ def _pipeline(cmds: list[_Cmd], ctx: _Ctx, out: BashAnalysis) -> None:
             for reason in c.opaque:
                 _add(out.opaque_reasons, reason)
 
+        for name in c.env_reads:
+            if name not in c.env_auth:
+                _add(out.env_data, name)       # read by this command somewhere a credential does not belong
         if c.network:
+            out.net_cmds += 1
+            out.plain_cmds += 1 if c.plain else 0
             out.is_sink = True
             _add(out.sink_kinds, c.sink_kind or "shell-net")
             incoming = bool(flow_files or flow_urls or flow_env or arg_files or arg_env or flow_literal) or piped
@@ -1764,6 +1812,8 @@ def _analyze(command: str, cwd: str | None, depth: int, variables: dict[str, str
     # substitutions that no command consumed (a bare "$(...)" or an assignment) still ran
     for kind, inner in ctx.subs:
         _merge(out, inner)
+    for name in ctx.env_data:
+        _add(out.env_data, name)
     if out.opaque:
         out.is_sink = True
         _add(out.sink_kinds, "opaque")
@@ -1809,4 +1859,7 @@ def analyze_bash(command: str, cwd: str | None = None) -> BashAnalysis:
             _add(out.sink_kinds, "opaque")
             out.carries_payload = True
     out.summary = " ".join(command.split())[:200]
+    # Authentication only: no other command, assignment or here-string of the line touches the variable.
+    out.env_auth = [n for n in out.env_auth if n not in out.env_data]
+    out.plain_get = out.net_cmds > 0 and out.net_cmds == out.plain_cmds and not out.opaque
     return out

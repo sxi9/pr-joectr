@@ -11,6 +11,7 @@ Nothing here touches the graph or decides anything.
 
 from __future__ import annotations
 
+
 import json
 import re
 from typing import Any, Iterable
@@ -99,6 +100,19 @@ def parent_domains(host: str) -> list[str]:
 
 # MCP servers that run on this machine and keep what they are given.
 _LOCAL_MCP = frozenset({"filesystem", "git", "memory", "sqlite", "time", "sequential-thinking", "desktop-commander"})
+# servers whose read tools return files of this machine, named by a path argument. The memory
+# server returns what earlier sessions stored, sqlite returns rows, desktop-commander returns command output.
+_LOCAL_FILE_MCP = frozenset({"filesystem", "git"})
+_ROLE_LABELS = frozenset("docs doc www api developer developers dev help support blog status app console dashboard portal "
+                         "learn guide guides get install download downloads cdn static assets files registry pkg "
+                         "packages auth login accounts staging beta web".split())
+
+
+def _loopback(host: str) -> bool:
+    host = host.strip().lower().strip("[]")
+    return host in ("localhost", "::1") or host.endswith(".localhost") or bool(re.fullmatch(r"127(?:\.\d{1,3}){3}", host))
+
+
 # Arguments that identify an object rather than carry free text.
 _ID_LIKE = frozenset({"owner", "repo", "repository", "branch", "ref", "sha", "base", "head", "state", "method", "sort",
                       "direction", "path", "id", "number", "issue_number", "pull_number", "page", "per_page", "labels",
@@ -234,6 +248,11 @@ def analyze_call(tool_name: str, tool_input: dict, cfg: Config, *, cwd: str, lab
         call.arg_text = "\n".join(str(p) for p in pieces if isinstance(p, str))[:limit]
         olds = [tool_input.get("old_string")] + [e.get("old_string") for e in _as_list(tool_input.get("edits")) if isinstance(e, dict)]
         call.extra["old_text"] = "\n".join(str(p) for p in olds if isinstance(p, str))[:limit]
+        # the edits as pairs, so a rule can apply them to the file and compare before and after
+        pairs = [(tool_input.get("old_string"), tool_input.get("new_string"), bool(tool_input.get("replace_all")))]
+        pairs += [(e.get("old_string"), e.get("new_string"), bool(e.get("replace_all")))
+                  for e in _as_list(tool_input.get("edits")) if isinstance(e, dict)]
+        call.extra["edits"] = [(o, n, r) for o, n, r in pairs if isinstance(o, str) and isinstance(n, str)]
         call.summary = f"{tool} {ref.name if ref else ''}".strip()
     elif tool in SEARCH_TOOLS:
         root = str(tool_input.get("path") or cwd)
@@ -248,6 +267,7 @@ def analyze_call(tool_name: str, tool_input: dict, cfg: Config, *, cwd: str, lab
         b.http(url)
         call.is_sink, call.sink_kind = True, "http"
         call.extra["carries_payload"] = _url_room(url)
+        call.extra["get_urls"] = [url]
         call.arg_text = url
         call.summary = "WebFetch " + (normalize_url(url) or url).split("://", 1)[-1]
     elif tool == "WebSearch":
@@ -356,7 +376,10 @@ def _analyze_bash(call: CallAnalysis, b: _Builder, command: str, cfg: Config, cw
     call.extra["carries_payload"] = ba.carries_payload
     call.extra["env_auth"] = list(ba.env_auth)
     # A request that is nothing but a GET of a URL: no body, no upload, no variable, no pipe into it.
-    call.extra["plain_get"] = not (ba.uploads or ba.env_uploads or ba.env_uploaded or ba.opaque or _NOT_A_GET.search(command))
+    # Every network command of the line has to be a bare curl or wget download for that.
+    call.extra["plain_get"] = bool(ba.plain_get and not (ba.uploads or ba.env_uploads or ba.env_uploaded or ba.opaque
+                                                         or _NOT_A_GET.search(command)))
+    call.extra["get_urls"] = list(ba.fetches)       # the URLs as they are written in the command
     if ba.opaque:
         call.extra["opaque_reasons"] = list(ba.opaque_reasons)
     call.arg_text = command[: cfg.max_content_bytes]
@@ -407,7 +430,18 @@ def _analyze_mcp(call: CallAnalysis, b: _Builder, server: str, tool: str, tool_i
             if looks_local:
                 b.add(S.WRITES if labels.local_write else S.READS, file_entity(value, cwd))
 
-    for key, value in leaves:
+    # The object a call works on is an argument of the call, or of its one wrapper object: not a field
+    # somewhere inside the content it carries. A write that names several objects is not "a write to
+    # the object that was read", whichever of them it mentions.
+    object_leaves = [(k, v) for k, v in tool_input.items() if isinstance(v, str)]
+    object_leaves += [(k, v) for outer in tool_input.values() if isinstance(outer, dict)
+                      for k, v in outer.items() if isinstance(v, str)]
+    ids = {v.strip() for k, v in object_leaves
+           if k.lower() in _OBJECT_KEYS and 2 <= len(v.strip()) <= 80 and not re.search(r"\s", v.strip())}
+    deep = {v.strip() for k, v in leaves if k.lower() in _OBJECT_KEYS and 2 <= len(v.strip()) <= 80}
+    if labels.external_sink and (len(ids) != 1 or deep - ids):
+        object_leaves = []
+    for key, value in object_leaves:
         v = value.strip()
         if key.lower() in _OBJECT_KEYS and 2 <= len(v) <= 80 and not re.search(r"\s", v):
             b.add(S.REFERENCES if labels.external_sink else S.READS, EntityRef("mcp", f"{server}/obj:{v}"), object=True)
@@ -591,7 +625,7 @@ def analyze_result(tool_name: str, tool_input: dict, tool_response: Any, call: C
         key = call.extra.get("mcp_key") or ""
         fetched = [act.entity for act in call.actions if act.rel == S.FETCHES and act.entity.kind == "url"]
         a.source = fetched[0] if fetched else EntityRef("mcp", f"{server}/{tool} {key}".strip()[:200])
-        if (match_server(server, catalog=load_catalog()) or {}).get("id") in _LOCAL_MCP:
+        if (match_server(server, catalog=load_catalog()) or {}).get("id") in _LOCAL_FILE_MCP:
             for ref in [e for e in call.entities(S.READS) if e.kind == "file"]:
                 if cfg.is_untrusted_path(ref.value):
                     untrusted("path:untrusted")
@@ -629,7 +663,8 @@ def analyze_result(tool_name: str, tool_input: dict, tool_response: Any, call: C
         fetched = [safe_entity(u, key) for u in (url_entity(u) for u in ba.fetches) if u is not None]
         # A response from this machine is not third-party text. (A local service can relay stored
         # third-party text; `paths.untrusted` and the injection score still apply to what it returns.)
-        all_local = bool(fetched) and all(cfg.is_local_host(host_of(u.value) or "") for u in fetched)
+        # Loopback only: a wiki on a private address is as much third-party text as one on the internet.
+        all_local = bool(fetched) and all(_loopback(host_of(u.value) or "") for u in fetched)
         if ba.untrusted_output and not all_local:
             untrusted("source:network" if fetched else "source:third-party")
         # A file that is sourced (`. ./.env`) is not printed, and a variable that is sent elsewhere
@@ -643,7 +678,10 @@ def analyze_result(tool_name: str, tool_input: dict, tool_response: Any, call: C
             if cfg.is_sensitive_path(ref.value) and ref.id not in sourced:
                 sensitive("path:sensitive")
         prints = ba.env_dump or any(prog in ("echo", "printf", "printenv") for prog in ba.programs)
-        if ba.env_dump or (prints and any(_SECRETISH.search(name) for name in ba.env_reads)):
+        # A secret-named variable that anything but a network command read may be in the output
+        # (python -c 'print(os.environ[...])' prints it as surely as echo does).
+        elsewhere = any(_SECRETISH.search(n) for n in ba.env_reads if n not in ba.env_uploads)
+        if ba.env_dump or elsewhere or (prints and any(_SECRETISH.search(name) for name in ba.env_reads)):
             sensitive("environment")
         if ba.sensitive_output:
             sensitive("credential-command")
@@ -716,9 +754,13 @@ def analyze_prompt(prompt: str, cfg: Config, *, cwd: str) -> ContentAnalysis:
         also(EntityRef("env", m.group(0)))
     # naming docs.vendor.example names the vendor: its other hosts are not strangers
     for ref in [m for m in a.mentions if m.kind == "host"]:
+        if ref.value.split(".", 1)[0] not in _ROLE_LABELS:
+            continue        # acme.wikihost.example names a tenant, not the suffix it sits on
         for parent in parent_domains(ref.value):
             also(EntityRef("host", parent))
     # a bucket the user typed is the host the upload goes to
     for m in re.finditer(r"\bs3://([a-z0-9][a-z0-9.-]{1,62})", prompt):
-        also(EntityRef("host", f"{m.group(1)}.s3.amazonaws.com"))
+        bucket = m.group(1).rstrip(".-")       # "... to s3://acme-site. Use the profile ..."
+        if bucket:
+            also(EntityRef("host", f"{bucket}.s3.amazonaws.com"))
     return _safe_content(a, cfg)

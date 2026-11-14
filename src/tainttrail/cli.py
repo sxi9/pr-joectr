@@ -296,7 +296,7 @@ def cmd_demo(args: argparse.Namespace, cfg: Config) -> int:
                 heading = {"attack": "Attacks the guard must stop", "variant": "Attack variants, aimed at the edges of the rules",
                            "benign": "Ordinary work it must leave alone",
                            "ordinary": "Ordinary sessions, a reviewer's corpus for false alarms",
-                           "known_gaps": "Harder cases"}[last]
+                           "known_gaps": "Harder cases", "open": "Known gaps: attacks that are not stopped yet"}[last]
                 _out(report.paint(heading, "bold", color=color))
             _out(f"  {sc['id'].split('-', 1)[0]:5s} {sc['title']}")
         _out()
@@ -398,7 +398,7 @@ def _demo_all(args: argparse.Namespace, color: bool) -> int:
                          for sc, r in rows], indent=1))
         return 0 if all(r.ok for _, r in rows) else 1
     headings = {"attack": "Attacks", "variant": "Attack variants", "benign": "Ordinary work",
-                "ordinary": "Ordinary sessions", "known_gaps": "Harder cases"}
+                "ordinary": "Ordinary sessions", "known_gaps": "Harder cases", "open": "Known gaps: attacks that are not stopped yet"}
     # The two large groups are summarised; a row is printed only when it is not the expected kind.
     folded = () if getattr(args, "full", False) else ("variant", "ordinary")
 
@@ -432,6 +432,8 @@ def _demo_all(args: argparse.Namespace, color: bool) -> int:
             outcome = report.paint("denied ", "bright_red", "bold", color=color) + rules
         elif r.asked_at:
             outcome = report.paint("asked  ", "bright_yellow", "bold", color=color) + rules
+        elif group == "open":
+            outcome = report.paint("not stopped", "bright_yellow", color=color)
         else:
             outcome = report.paint("untouched", "green", color=color)
         flag = "" if r.ok or args.no_guard else report.paint("  (not as expected)", "bright_red", color=color)
@@ -453,6 +455,8 @@ def _demo_all(args: argparse.Namespace, color: bool) -> int:
     _out(f"ordinary work left untouched         {sum(map(untouched, benign))} of {len(benign)}")
     _out(f"ordinary sessions left untouched     {sum(map(untouched, ordinary))} of {len(ordinary)}")
     _out(f"harder cases put to the user         {sum(map(stopped, gaps))} of {len(gaps)}")
+    if of("open"):
+        _out(f"known gaps, not stopped yet          {sum(1 for r in of('open') if not stopped(r))}")
     _out(f"canary secrets that left             {sum(len(r.leaked) for _, r in rows)}")
     per_event = statistics.median(r.elapsed_ms / max(1, 2 * sum(1 for s in r.steps if s.kind == 'tool') + 2) for _, r in rows)
     _out(report.paint(f"{len(rows)} scenarios replayed through the Claude Code hook adapter, {per_event:.0f} ms per hook event in process",

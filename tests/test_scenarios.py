@@ -17,6 +17,7 @@ BENIGN = [s for s in SCENARIOS if s["group"] == "benign"]
 GAPS = [s for s in SCENARIOS if s["group"] == "known_gaps"]
 VARIANTS = [s for s in SCENARIOS if s["group"] == "variant"]
 ORDINARY = [s for s in SCENARIOS if s["group"] == "ordinary"]
+OPEN = [s for s in SCENARIOS if s["group"] == "open"]
 # The one ordinary session the guard still asks about (a deploy summary posted to Slack after a
 # documentation page and a read of .env). Kept visible in the data and here, not tuned away.
 STILL_ASKED = {"p51-long-mixed-deploy-and-notify"}
@@ -29,7 +30,7 @@ def _key(monkeypatch):
 
 def test_the_suite_has_the_expected_shape():
     assert len(ATTACKS) >= 15 and len(BENIGN) >= 10 and len(GAPS) >= 3
-    assert len(VARIANTS) == 11 and len(ORDINARY) == 64
+    assert len(VARIANTS) == 64 and len(ORDINARY) == 64 and len(OPEN) == 3
     ids = [s["id"] for s in SCENARIOS]
     assert len(ids) == len(set(ids))
     for s in SCENARIOS:
@@ -49,7 +50,7 @@ def test_scenarios_use_only_reserved_hosts_and_canaries():
                 "nodejs.org"}
     for host in hosts:
         reserved = host.endswith((".example", ".test", ".invalid", ".example.com", ".example.org")) or host in (
-            "example.com", "example.org")
+            "example.com", "example.org") or bool(re.fullmatch(r"(?:10|192\.168|172\.(?:1[6-9]|2\d|3[01]))(?:\.\d{1,3}){2,3}", host))
         assert reserved or host in everyday or "." not in host, f"{host} is neither reserved nor an everyday host"
     assert "AKIAIOSFODNN7EXAMPLE" in text, "the documented example key is the canary"
     assert not re.search(r"\bAKIA(?!IOSFODNN7EXAMPLE)[0-9A-Z]{16}\b", text)
@@ -78,6 +79,17 @@ def test_attacks_at_the_edges_of_the_precision_fixes_are_still_stopped(scenario,
     result = replay(scenario, tmp_path / "project")
     assert result.ok, [(s.index, s.tool, s.expect, s.action, s.rules) for s in result.steps if not s.ok]
     assert result.blocked_at is not None or result.asked_at, "the attack met no resistance"
+
+
+@pytest.mark.parametrize("scenario", OPEN, ids=[s["id"] for s in OPEN])
+def test_known_gaps_are_still_open(scenario, tmp_path):
+    """Attacks the guard does not stop yet, kept in the data so that the list stays true.
+
+    When one of these fails, the gap is closed: move the scenario to the variants.
+    """
+    result = replay(scenario, tmp_path / "project")
+    assert result.blocked_at is None and not result.asked_at, "this gap is closed now: move the scenario to the variants"
+    assert result.leaked == [], "no canary secret is involved in these"
 
 
 @pytest.mark.parametrize("scenario", ORDINARY, ids=[s["id"] for s in ORDINARY])
