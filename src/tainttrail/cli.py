@@ -124,6 +124,9 @@ def cmd_status(args: argparse.Namespace, cfg: Config) -> int:
              "of a secret against an export")
     hooks = ", ".join(registered) if registered else report.paint("not registered: run `tainttrail init`", "yellow", color=color)
     _out(f"hooks        {hooks}")
+    if any(install.is_outdated(install.settings_path(cfg, scope)) for scope in registered):
+        _out("             " + report.paint("written by an older version: run `tainttrail init` again (the old command starts "
+                                             "Python with the project folder on its module path)", "yellow", color=color))
     if not info.get("nodes"):
         _out("graph        nothing recorded yet")
         return 0
@@ -519,6 +522,10 @@ def cmd_doctor(args: argparse.Namespace, cfg: Config) -> int:
     line(True, "tainttrail", f"{__version__} at {Path(__file__).parent}")
     registered = [scope for scope in ("project", "local", "user") if install.is_installed(install.settings_path(cfg, scope))]
     line(bool(registered) or None, "hooks", ", ".join(registered) if registered else "not registered for this project (`tainttrail init`)")
+    old = [scope for scope in registered if install.is_outdated(install.settings_path(cfg, scope))]
+    if old:
+        line(False, "hook command", f"written by an older version ({', '.join(old)}): it starts Python with the project folder "
+                                    "on its module path. Run `tainttrail init` again")
     if cfg.config_error:
         line(False, "config", cfg.config_error)
     if not cfg.db_path.exists():   # a check must not create a graph, and with it a "project"
@@ -550,6 +557,7 @@ def cmd_doctor(args: argparse.Namespace, cfg: Config) -> int:
             timings.append((time.perf_counter() - started) * 1000 / max(1, calls * 2 + 2))
         per_event = statistics.median(timings)
         # ... and as the agent runs it: a process of its own for every event, in that scratch project.
+        import shlex
         import subprocess
 
         payload = json.dumps({"session_id": "doctor", "cwd": str(result.root), "hook_event_name": "PreToolUse",
@@ -557,7 +565,7 @@ def cmd_doctor(args: argparse.Namespace, cfg: Config) -> int:
         spent = []
         for _ in range(args.rounds):
             started = time.perf_counter()
-            subprocess.run([sys.executable, "-m", "tainttrail", "hook", "claude-code"], input=payload, text=True,
+            subprocess.run(shlex.split(install.hook_command()), input=payload, text=True,
                            capture_output=True, cwd=result.root, timeout=60, check=False)
             spent.append((time.perf_counter() - started) * 1000)
         whole = statistics.median(spent)

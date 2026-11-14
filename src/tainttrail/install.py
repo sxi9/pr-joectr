@@ -77,23 +77,42 @@ def settings_path(cfg: Config, scope: str = "project") -> Path:
     return cfg.root / ".claude" / "settings.json"
 
 
+# What `python -c` runs where `-P` does not exist (Python 3.10) or the interpreter is not this one:
+# drop the entry that stands for the working directory, then start the package as `-m` would.
+BOOTSTRAP = ('import sys; sys.path[:] = [p for p in sys.path if p]; import runpy; '
+             'runpy.run_module("tainttrail", run_name="__main__")')
+
+
 def hook_command(python: str | None = None) -> str:
-    return f"{shlex.quote(python or sys.executable)} {MARKER} claude-code"
+    """The command line a settings file gets.
+
+    A hook runs in the project directory, and ``python -m tainttrail`` puts that directory first
+    on the module path: a ``json.py`` there would be imported by every hook, which is a way to
+    switch the guard off from a file an agent can be talked into writing. ``-P`` (Python 3.11)
+    leaves the entry out; for an older or another interpreter a one-line start-up does the same.
+    """
+    if python is None and sys.version_info >= (3, 11):
+        return f"{shlex.quote(sys.executable)} -P {MARKER} claude-code"
+    return f"{shlex.quote(python or sys.executable)} -c {shlex.quote(BOOTSTRAP)} hook claude-code"
 
 
-# What the installer writes, and nothing looser: `<python> -m tainttrail hook claude-code` at the end
-# of the command. A wrapper or an audit script that merely mentions "tainttrail hook" is someone
-# else's handler and is left alone.
-_OURS = re.compile(r"(?:^|\s)-m\s+tainttrail\s+hook(?:\s+claude-code)?\s*$")
+# What the installer writes, and nothing looser: `<python> [-P] -m tainttrail hook claude-code`, or
+# the start-up line above followed by `hook claude-code`, at the end of the command. A wrapper or an
+# audit script that merely mentions "tainttrail hook" is someone else's handler and is left alone.
+_OURS = re.compile(r"(?:(?:^|\s)-m\s+tainttrail|run_module\(\"tainttrail\", run_name=\"__main__\"\)'?)\s+hook(?:\s+claude-code)?\s*$")
+# ... and of those, the ones that keep the project directory off the module path.
+_SAFE_START = re.compile(r"(?:^|\s)-P\s+-m\s+tainttrail\s|run_module\(\"tainttrail\"")
 
 
-def _is_ours(handler: Any) -> bool:
-    if not isinstance(handler, dict):
-        return False
+def _text_of(handler: dict[str, Any]) -> str:
     args = handler.get("args")
     text = str(handler.get("command") or "") + " " + " ".join(str(a) for a in args if isinstance(a, str)) \
         if isinstance(args, list) else str(handler.get("command") or "")
-    return bool(_OURS.search(text.strip()))
+    return text.strip()
+
+
+def _is_ours(handler: Any) -> bool:
+    return isinstance(handler, dict) and bool(_OURS.search(_text_of(handler)))
 
 
 def _load(path: Path) -> dict[str, Any]:
@@ -140,6 +159,26 @@ def is_installed(path: Path) -> bool:
     if not isinstance(groups, list):
         return False
     return any(_is_ours(h) for g in groups if _handlers(g) is not None and _sees_every_tool(g) for h in _handlers(g) or [])
+
+
+def is_outdated(path: Path) -> bool:
+    """Whether a settings file holds a handler of ours that an older version wrote.
+
+    Such a command starts Python with the project directory on its module path. Running
+    ``tainttrail init`` again rewrites it.
+    """
+    try:
+        hooks = _load(path).get("hooks")
+    except (ValueError, OSError):
+        return False
+    if not isinstance(hooks, dict):
+        return False
+    for groups in hooks.values():
+        for group in groups if isinstance(groups, list) else []:
+            for handler in _handlers(group) or []:
+                if _is_ours(handler) and not _SAFE_START.search(_text_of(handler)):
+                    return True
+    return False
 
 
 def register_hooks(data: dict[str, Any], command: str, *, fail_closed: bool = False) -> bool:

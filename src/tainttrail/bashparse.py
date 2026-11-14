@@ -20,7 +20,7 @@ import posixpath
 import re
 import shlex
 from dataclasses import dataclass, field
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 MAX_DEPTH = 4
 # A command longer than this is not parsed: it is treated as one that could do anything. Parsing
@@ -148,7 +148,10 @@ def _host(url: str) -> str | None:
         host = urlsplit(url).hostname
     except ValueError:
         return None
-    return host.lower().rstrip(".") if host else None
+    if not host:
+        return None
+    # the client decodes percent-escapes in a host name before it resolves it
+    return (unquote(host) if "%" in host else host).lower().rstrip(".")
 
 
 def _url_has_room(url: str) -> bool:

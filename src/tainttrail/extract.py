@@ -92,14 +92,16 @@ def host_of(url_or_host: str) -> str | None:
     if not text:
         return None
     if "://" not in text:
-        text = "//" + text
+        # A bare IPv6 address is a host, not "2001" on port "db8::bad".
+        text = "//" + (f"[{text}]" if text.count(":") >= 2 and re.fullmatch(r"[0-9A-Fa-f:.]+", text) else text)
     try:
         host = urlsplit(text).hostname
     except ValueError:
         return None
     if not host:
         return None
-    host = host.lower().rstrip(".")
+    # Clients decode percent-escapes in a host name: attacker%2eexample is attacker.example.
+    host = unquote(host).lower().rstrip(".") if "%" in host else host.lower().rstrip(".")
     return host if re.fullmatch(r"[a-z0-9._:-]+", host) else None
 
 
@@ -113,7 +115,9 @@ def normalize_url(url: str) -> str | None:
     if not parts.scheme or not host:
         return None
     scheme = parts.scheme.lower()
-    host = host.lower().rstrip(".")
+    host = (unquote(host) if "%" in host else host).lower().rstrip(".")
+    if not re.fullmatch(r"[a-z0-9._:-]+", host):
+        return None
     default = {"http": 80, "https": 443, "ws": 80, "wss": 443, "ftp": 21, "ssh": 22}.get(scheme)
     netloc = f"[{host}]" if ":" in host else host
     if port and port != default:

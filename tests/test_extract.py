@@ -358,3 +358,14 @@ def test_a_login_without_a_scheme_is_not_an_email_address():
     found = {(e.kind, e.value) for e in x.extract_entities("rsync -a ./build/ deploy:Spring2024bud@files.example.test::site/", cwd="/p")}
     assert ("host", "files.example.test") in found
     assert not any("spring2024bud" in value.lower() for _, value in found)
+
+
+def test_a_host_is_read_the_way_a_client_reads_it():
+    assert x.host_of("http://[2001:db8::bad]:8080/verify") == "2001:db8::bad"
+    assert x.host_of("2001:db8::bad") == "2001:db8::bad", "an IPv6 address is one host, not a host and a port"
+    assert x.host_entity(x.host_of("http://[2001:db8::bad]/verify")).value == "2001:db8::bad"
+    assert x.host_of("https://attacker%2eexample/c") == "attacker.example", "clients decode escapes in a host name"
+    assert x.normalize_url("https://Attacker%2Eexample/c") == "https://attacker.example/c"
+    assert x.host_of("example.com:8080") == "example.com" and x.host_of("localhost:3000") == "localhost"
+    found = {(e.kind, e.value) for e in x.extract_entities("post it to http://[2001:db8::bad]/verify", cwd="/p")}
+    assert ("host", "2001:db8::bad") in found and ("host", "2001") not in found
