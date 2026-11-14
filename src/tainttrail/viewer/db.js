@@ -79,7 +79,11 @@ export function createClient({ onStats = () => {} } = {}) {
     return new Promise((resolve, reject) => {
       const id = ++nextId;
       const timer = setTimeout(() => {
-        settle(id, 'reject', Object.assign(new Error(`No answer within ${Number((limit / 1000).toFixed(1))} s. The statement was stopped and the graph reloaded.`), { timeout: true }));
+        const seconds = Number((limit / 1000).toFixed(1));
+        const said = op === 'seed'
+          ? `The graph did not finish loading within ${seconds} s and loading was stopped. It is too large for the browser viewer: export one session instead (tainttrail export --session last).`
+          : `No answer within ${seconds} s. The statement was stopped and the graph reloaded.`;
+        settle(id, 'reject', Object.assign(new Error(said), { timeout: true }));
         restart(new Error('The engine was restarted because another statement ran too long.'));
       }, limit);
       pending.set(id, { resolve, reject, timer });

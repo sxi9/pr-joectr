@@ -67,7 +67,10 @@ function named(statement) {
 // and a label. FINISH ends a statement without returning anything; the engine reports no
 // counters for such a statement, so what it changed could not be noticed afterwards.
 const CLAUSE = /(^|[^.$:\w])(CREATE|MERGE|SET|DELETE|DETACH|REMOVE|DROP|FOREACH|INSERT|LOAD|FINISH)(?!\w)/gi;
-const AS_BEFORE = /(?:^|[^.$:\w])AS\s+$/i; // RETURN count(*) AS load: the word is a name the statement gives
+// RETURN count(*) AS load: the word is a name the statement gives. Only when AS follows the end
+// of an expression that cannot be mistaken, a bracket, a quote or a digit: the engine also takes
+// AS as a name (UNWIND [1] AS AS CREATE ...), and after that name comes a clause.
+const AS_BEFORE = /[)\]}'"0-9]\s*AS\s+$/i;
 const NAME_AFTER = /^\s*[),.=:\]}]/; // {set: 1}, size(set), set.x: no clause continues like this
 
 /** The first clause-starting write word in a text, in upper case, or null. */

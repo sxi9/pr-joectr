@@ -150,7 +150,7 @@ function pathChips(path) {
 }
 
 /** One result value as DOM. Graph values become chips; everything else is text. */
-export function valueNode(value) {
+function valueNode(value) {
   if (value === null || value === undefined) return h('span', { class: 'gv-null' }, 'null');
   if (typeof value === 'boolean') return h('span', { class: 'gv-bool' }, String(value));
   if (typeof value === 'number') return h('span', { class: 'gv-num' }, String(value));

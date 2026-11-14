@@ -116,6 +116,56 @@ def _render(event_name: str, decision: Decision, *, announce: bool) -> dict[str,
     return None
 
 
+RECORDING_EVENTS = ("SessionStart", "UserPromptSubmit", "PostToolUse", "PostToolUseFailure")
+RECORDING_LOCK_MS = 8_000
+PENDING_DIRNAME = "pending"
+MAX_PENDING_FILES = 200
+MAX_PENDING_BYTES = 2_000_000
+
+
+def _queue(cfg: Config, payload: dict[str, Any]) -> None:
+    """Keep an event the guard could not record because the graph was busy.
+
+    Twenty tool results that arrive at once queue up behind one lock. A result that is dropped
+    is content the rules never see: the page that named the attacker's host, for one.
+    """
+    try:
+        text = json.dumps(payload)
+        directory = cfg.home / PENDING_DIRNAME
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if len(text) > MAX_PENDING_BYTES or len(list(directory.iterdir())) >= MAX_PENDING_FILES:
+            _log(cfg, {"event": payload.get("hook_event_name"), "error": "an event was dropped: the queue is full or the event too large"})
+            return
+        fd = os.open(directory / f"{int(time.time() * 1000):015d}-{os.getpid()}.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+    except OSError:
+        pass
+
+
+def _pending(cfg: Config) -> list[tuple[Any, HookEvent]]:
+    """Queued events, oldest first, with the files that hold them."""
+    directory = cfg.home / PENDING_DIRNAME
+    try:
+        paths = sorted(p for p in directory.iterdir() if p.suffix == ".json")
+    except OSError:
+        return []
+    out = []
+    for path in paths[:MAX_PENDING_FILES]:
+        try:
+            event = to_event(json.loads(path.read_text(encoding="utf-8")))
+        except (OSError, ValueError):
+            event = None
+        if event is None:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            continue
+        out.append((path, event))
+    return out
+
+
 def _busy(exc: BaseException) -> bool:
     from ..store import StoreLocked
 
@@ -143,8 +193,18 @@ def handle(payload: dict[str, Any], cfg: Config | None = None) -> dict[str, Any]
         return None
     cfg = cfg or load_config(os.environ.get("CLAUDE_PROJECT_DIR") or event.cwd)
     started = time.perf_counter()
-    decision = Guard(cfg).handle(event)
     name = str(payload.get("hook_event_name"))
+    if name in RECORDING_EVENTS:
+        # A hook that only records can wait for the graph almost as long as the harness lets it
+        # run; a PreToolUse hook holds up a tool call and gives up sooner.
+        cfg.lock_timeout_ms = max(cfg.lock_timeout_ms, RECORDING_LOCK_MS)
+    queued = _pending(cfg)
+    decision = Guard(cfg).handle(event, earlier=[old for _, old in queued])
+    for path, _ in queued:
+        try:
+            path.unlink()
+        except OSError:
+            pass
     if decision.action in ("ask", "deny"):
         _log(cfg, {"event": name, "session": event.session_id, "tool": event.tool_name, "action": decision.action,
                    "rules": [f.rule for f in decision.findings if f.action in ("ask", "deny")],
@@ -175,6 +235,17 @@ def main(stdin: TextIO | None = None, stdout: TextIO | None = None) -> int:
     except Exception as exc:   # noqa: BLE001 - the guard must not take the agent down with it
         _log(cfg, {"event": event_name, "error": f"{type(exc).__name__}: {exc}",
                    "trace": traceback.format_exc(limit=6)})
+        if _busy(exc) and cfg is not None and event_name in RECORDING_EVENTS:
+            _queue(cfg, payload)   # recorded by the next hook that gets the graph, not dropped
+            return 0
+        if cfg is not None and cfg.fail_closed and event_name == "PreToolUse":
+            stdout.write(json.dumps({"hookSpecificOutput": {
+                "hookEventName": "PreToolUse", "permissionDecision": "deny",
+                "permissionDecisionReason": ("TaintTrail could not check this call "
+                                             + ("in time: its graph was busy" if _busy(exc) else "because of an internal error")
+                                             + ", and this project is set to fail closed. See .tainttrail/guard.log."),
+            }}) + "\n")
+            return 0
         if _busy(exc) and cfg is not None and cfg.mode != "monitor" and event_name == "PreToolUse":
             # Not a failure of the guard: other hooks held the graph for the whole wait (a burst of
             # parallel tool calls). A call that could not be checked in time is put to the user.
@@ -187,13 +258,7 @@ def main(stdin: TextIO | None = None, stdout: TextIO | None = None) -> int:
                 "systemMessage": "TaintTrail could not check a call in time (the graph was busy) and is asking you instead.",
             }) + "\n")
             return 0
-        if cfg is not None and cfg.fail_closed and event_name == "PreToolUse":
-            stdout.write(json.dumps({"hookSpecificOutput": {
-                "hookEventName": "PreToolUse", "permissionDecision": "deny",
-                "permissionDecisionReason": ("TaintTrail could not check this call because of an internal error, "
-                                             "and this project is set to fail closed. See .tainttrail/guard.log."),
-            }}) + "\n")
-        elif event_name in ("PreToolUse", "SessionStart"):
+        if event_name in ("PreToolUse", "SessionStart"):
             # Failing open must not be silent: the user is told that this call went unchecked.
             what = "this tool call" if event_name == "PreToolUse" else "the start of this session"
             stdout.write(json.dumps({"systemMessage": (

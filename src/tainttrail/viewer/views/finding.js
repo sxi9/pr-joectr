@@ -208,7 +208,8 @@ function queryParts(ctx, finding, steps, list) {
       status.dataset.otherNodes = String(others.length);
       const ran = `Ran in ${fmtMs(envelope.elapsed_ms)} on Relate WASM`;
       const counts = `${plural(envelope.rows.length, 'row')}, ${plural(graph.nodes.length, 'node')} and ${plural(graph.rels.length, 'relationship')}`;
-      const where = others.length === 1 ? `another ${KIND_WORD[steps[others[0]].label] ?? 'node'} at step ${others[0] + 1}` : `other nodes at ${plural(others.length, 'step')}`;
+      const kind = others.length === 1 && Object.hasOwn(KIND_WORD, steps[others[0]].label) ? KIND_WORD[steps[others[0]].label] : 'node';
+      const where = others.length === 1 ? `another ${kind} at step ${others[0] + 1}` : `other nodes at ${plural(others.length, 'step')}`;
       status.textContent = envelope.rows.length === 0
         ? `${ran} and returned no rows: this export does not hold the whole path.`
         : all ? `${ran}: ${counts}. All ${steps.length} nodes of the diagram${storedEdges ? ` and its ${plural(storedEdges, 'relationship')}` : ''} are in the result.`

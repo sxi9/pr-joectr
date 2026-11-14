@@ -89,8 +89,8 @@ const STATIC_TYPES = {
   '.json': 'application/json; charset=utf-8', '.wasm': 'application/wasm', '.md': 'text/markdown; charset=utf-8', '.txt': 'text/plain; charset=utf-8',
 };
 
-/** A file server with no opinions: no CSP, no cache headers. What a static host does. */
-function startStatic(dir) {
+/** A file server with no opinions: no CSP, no cache headers. What a static host does. `types` overrides a MIME type. */
+function startStatic(dir, types = {}) {
   return new Promise((resolve) => {
     const server = http.createServer((req, res) => {
       const rel = decodeURIComponent(new URL(req.url, 'http://x').pathname).replace(/^\/+/, '') || 'index.html';
@@ -100,7 +100,7 @@ function startStatic(dir) {
         res.end('not found');
         return;
       }
-      res.writeHead(200, { 'Content-Type': STATIC_TYPES[path.extname(file)] || 'application/octet-stream' });
+      res.writeHead(200, { 'Content-Type': types[path.extname(file)] || STATIC_TYPES[path.extname(file)] || 'application/octet-stream' });
       fs.createReadStream(file).pipe(res);
     });
     server.listen(0, '127.0.0.1', () => {
@@ -382,6 +382,9 @@ const GUARD_HOSTILE = [
   ['a write in a conditional', 'WHEN true THEN { CREATE (n:Oops) RETURN 1 AS x } ELSE { RETURN 2 AS x }'],
   ['a name that is a keyword, then the clause', 'MATCH (n:Session) WITH n AS SET SET SET.zzz = 1 RETURN 1 AS x'],
   ['a quoted name, then the clause', 'WITH 1 AS `x` CREATE (n:Oops) RETURN 1 AS d'],
+  ['a name spelled AS, then the clause', 'UNWIND [1] AS AS CREATE (n:Oops)'],
+  ['the same, with FINISH hidden the same way', 'UNWIND [1] AS AS CREATE (n:Oops) WITH 1 AS AS FINISH'],
+  ['a variable spelled AS', 'MATCH (AS:Session) WITH AS SET AS.zzz = 1'],
   ['a quoted name glued to the clause', 'MATCH (n:Session) WHERE n.id = n.`id`SET n.zzz = 1'],
   ['a string glued to the clause', "MATCH (n:Session) WHERE n.id <> 'a'SET n.zzz = 1"],
   ['no space before the clause', 'MATCH (n:Session {agent_kind: "claude-code"})SET n.zzz = 1'],
@@ -403,6 +406,7 @@ const GUARD_HARMLESS = [
   ['a map key', 'RETURN {set: 1, delete: 2, create: 3}.set AS n', 1],
   ['a name the statement gives', 'MATCH (s:Session) RETURN count(s) AS load', SAMPLE.meta.sessions.length],
   ['a name used again', 'WITH [1, 2, 3] AS set RETURN size(set) AS n', 3],
+  ['two such names', "WITH 'x' AS load, 2 AS drop RETURN 1 AS n", 1],
   ['a name at the very end', 'MATCH (s:Session) RETURN count(s) AS drop ORDER BY drop;', SAMPLE.meta.sessions.length],
   ['a property, a parameter-like name and a label', 'MATCH (n:Session) WHERE n.set IS NULL AND NOT n:DELETE RETURN count(n) AS n', SAMPLE.meta.sessions.length],
   ['a keyword inside a longer word', 'MATCH (dataset:Session) RETURN count(dataset) AS n', SAMPLE.meta.sessions.length],
@@ -660,8 +664,11 @@ const ATTACHED = {
   ] }],
 };
 
-/** Replay a scenario (an id, or a scenario object) through the hook adapter and export its graph to a file. */
-function recordedExport(scenario, name) {
+/**
+ * Replay a scenario (an id, or a scenario object) through the hook adapter and export its graph
+ * to a file. `mode` "monitor" records without stopping anything.
+ */
+function recordedExport(scenario, name, mode = 'guard') {
   const out = path.join(WORK, `${name}.json`);
   const done = spawnSync(PYTHON, ['-c', [
     'import json, sys',
@@ -675,12 +682,12 @@ function recordedExport(scenario, name) {
     'from tainttrail.store import open_store',
     'ref, root = sys.argv[1], Path(sys.argv[2])',
     'scenario = json.loads(ref) if ref.lstrip().startswith("{") else scenarios.load_scenario(ref)',
-    'scenarios.replay(scenario, root)',
+    'scenarios.replay(scenario, root, guard=sys.argv[4] != "monitor")',
     'with open_store(load_config(root), read_only=True) as store:',
     '    export = export_graph(store, project=root.name, root=root)',
     'Path(sys.argv[3]).write_text(json.dumps(export), encoding="utf-8")',
     'print("OK")',
-  ].join('\n'), typeof scenario === 'string' ? scenario : JSON.stringify(scenario), path.join(WORK, `${name}-project`), out], { encoding: 'utf8' });
+  ].join('\n'), typeof scenario === 'string' ? scenario : JSON.stringify(scenario), path.join(WORK, `${name}-project`), out, mode], { encoding: 'utf8' });
   if (!done.stdout.startsWith('OK')) {
     console.log(`  SKIP  ${name}: ${(done.stdout + done.stderr).trim().split('\n').pop()}`);
     return null;
@@ -717,6 +724,35 @@ async function partD(browser) {
     check('the secret values of the attached file are nowhere on the page', !/AKIAIOSFODNN7EXAMPLE|canary-0000000000000000/.test(await page.content()));
     await shot(page, 'attached-files-timeline');
     checkClean(seen, 'attached files');
+    await context.close();
+    server.stop();
+  }
+
+  // Monitor mode records and stops nothing. The viewer must not read "nothing was held" as "nothing happened".
+  const monitored = recordedExport(process.env.SCENARIO || 'a02-webpage-env-curl-post', 'monitor', 'monitor');
+  if (monitored) {
+    const graph = JSON.parse(fs.readFileSync(monitored, 'utf8'));
+    const unenforced = findingNodes(graph).filter((f) => f.props.action === 'allow' && ['ask', 'deny'].includes(f.props.intended));
+    const server = await startViewer(['--file', monitored]);
+    const context = await browser.newContext({ viewport: DESKTOP, deviceScaleFactor: 2, colorScheme: 'light' });
+    const page = await context.newPage();
+    const seen = watch(page, server.url);
+    await page.goto(server.url);
+    await ready(page);
+    await settled(page, 'overview');
+    const lede = await page.textContent('.lede');
+    check('monitor mode: the replay recorded findings that were not enforced', unenforced.length >= 1 && sum(graph.meta.sessions, 'denied') === 0);
+    check('monitor mode: the overview says that calls ran although a rule called for a hold',
+      /No call was held, but/.test(lede) && lede.includes(`${unenforced.length} finding`) && /not enforced/.test(lede) && !/nothing completed|no rule called/.test(lede), lede);
+    check('monitor mode: the findings tile does not say that a call was held',
+      /not enforced/.test(await page.$$eval('.tile', (els) => els.find((el) => /Findings/i.test(el.querySelector('.tile-label').textContent)).querySelector('.tile-sub').textContent)));
+    check('monitor mode: the session and the destination it sent to read "would be denied"',
+      /would be denied/i.test(await page.textContent('.sessions-table tbody')) && /would be denied/i.test(await page.textContent('.dest-table tbody')));
+    await shot(page, 'monitor-mode-overview');
+    await go(page, '#/session', 'session');
+    check('monitor mode: the timeline says so too', /not enforced/.test(await page.textContent('.summary-line')) &&
+      (await page.$$eval('.tl-decision .verdict-would', (els) => els.length)) >= 1 && (await page.$$eval('.tl-row.tl-deny', (els) => els.length)) === 0);
+    checkClean(seen, 'monitor mode');
     await context.close();
     server.stop();
   }
@@ -898,6 +934,8 @@ async function partC(browser) {
   };
   check('a file that is not JSON is refused with a clear message', /not-json\.json is not valid JSON/.test(await refusedFile(page, write('not-json.json', '{"meta": '), 'not valid JSON')));
   check('a JSON file that is not an export is refused', /expected the format "tainttrail-export\/1"/.test(await refusedFile(page, write('other.json', { hello: 'world' }), 'not a TaintTrail export')));
+  check('a Relate store is refused with the command that opens it', /is a Relate store/.test(await refusedFile(page, write('incident.rl', 'RLDB\u0000\u0001'), 'Relate store')) &&
+    /tainttrail ui --file/.test(await page.textContent('.alert[role="alert"]')));
   check('the start screen stays up after a refused file', (await page.evaluate(() => document.body.dataset.state)) === 'empty' && (await page.$('#dropzone')) !== null);
   await shot(page, 'start-2-refused-file');
 
@@ -949,6 +987,14 @@ async function partC(browser) {
   const keySaid = await refusedFile(page, write('same-key.json', sameKey), 'share the id');
   check('two nodes with one key are refused before the open graph is touched', /two Session nodes share the id "same"/.test(keySaid) &&
     (await page.evaluate(() => document.body.dataset.state)) === 'ready' && (await page.textContent('#status-graph')).startsWith('1 node'), keySaid.slice(0, 120));
+  await page.evaluate(() => { document.querySelector('.alert-open button')?.click(); });
+  // This one passes the viewer's own checks and is refused by the engine, after the store was emptied for it.
+  const twoLabels = { meta: { format: 'tainttrail-export/1' }, nodes: [{ id: 'a', labels: ['Session', 'Finding'], props: { id: 'a' } }, { id: 'b', labels: ['Finding', 'Session'], props: { id: 'a' } }], rels: [] };
+  const engineSaid = await refusedFile(page, write('two-labels.json', twoLabels), 'uniqueness');
+  await go(page, '#/console', 'console');
+  await runConsole(page, 'MATCH (s:Session) RETURN s.count AS n');
+  check('when the engine refuses an export half way, the graph that was open is put back', /still shown/.test(engineSaid) &&
+    (await page.textContent('#status-graph')).startsWith('1 node') && /^12345678901234567\d{3}$/.test((await page.textContent('#console-output tbody td')).trim()), engineSaid.slice(0, 140));
   await page.evaluate(() => { document.querySelector('.alert-open button')?.click(); });
 
   await openFile(page, write('wrong-types.json', wrongTypes()));
@@ -1012,6 +1058,31 @@ async function partC(browser) {
   checkClean(seen, 'static copy');
   await context.close();
   server.stop();
+
+  // Where the scripts cannot load, the page must say so instead of showing "starting" for ever.
+  const stuck = async (url) => {
+    const ctx = await browser.newContext({ viewport: DESKTOP });
+    const p = await ctx.newPage();
+    await p.goto(url);
+    await p.waitForFunction(() => document.body.dataset.state !== 'loading', null, { timeout: 15_000 }).catch(() => {});
+    const said = await p.evaluate(() => ({ state: document.body.dataset.state, text: document.getElementById('boot')?.textContent.replace(/\s+/g, ' ') ?? '',
+      spinner: document.querySelector('.boot-spinner')?.hidden, engine: document.getElementById('status-engine').textContent }));
+    await ctx.close();
+    return said;
+  };
+  fs.writeFileSync(path.join(site, 'graph.json'), JSON.stringify(SAMPLE));
+  const fromDisk = await stuck(`file://${site}/index.html`);
+  check('opened from a file:// address, the page says that it needs a web server', fromDisk.state === 'error' && /file:\/\/ address/.test(fromDisk.text) &&
+    /python -m http\.server/.test(fromDisk.text) && fromDisk.spinner === true && /not running/.test(fromDisk.engine), JSON.stringify(fromDisk));
+  const plain = await startStatic(site, { '.js': 'text/plain' });
+  const wrongType = await stuck(plain.url);
+  plain.stop();
+  check('served with a wrong MIME type for .js, the page says that its scripts did not load', wrongType.state === 'error' && /JavaScript MIME type/.test(wrongType.text), JSON.stringify(wrongType));
+  fs.rmSync(path.join(site, 'views', 'map.js'));
+  const partial = await startStatic(site);
+  const missing = await stuck(partial.url);
+  partial.stop();
+  check('with one of its files missing, the page says so too', missing.state === 'error' && /every file of the viewer must be there/.test(missing.text), JSON.stringify(missing));
 }
 
 async function main() {

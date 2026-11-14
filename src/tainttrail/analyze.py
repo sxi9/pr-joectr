@@ -267,7 +267,12 @@ def analyze_call(tool_name: str, tool_input: dict, cfg: Config, *, cwd: str, lab
         call.summary = tool
 
     if call.arg_text:
-        b.references(extract_entities(call.arg_text, cwd=cwd, limit=cfg.max_entities))
+        text = call.arg_text
+        if tool == "Bash":
+            # "$PWD/.env" is not the file ./PWD/.env. The shell analysis resolves what it can; here the
+            # variable or substitution goes, together with the path glued to it.
+            text = _SHELL_VALUE.sub(lambda m: " " * len(m.group(0)), text)
+        b.references(extract_entities(text, cwd=cwd, limit=cfg.max_entities))
     call.actions = b.build()
     call.destinations = list(b.destinations.values())
     call.summary = redact(call.summary, 200) if call.summary else tool_name
@@ -427,6 +432,7 @@ def _analyze_mcp(call: CallAnalysis, b: _Builder, server: str, tool: str, tool_i
     call.summary = f"{server}.{tool} {call.extra['mcp_key']}".strip()
 
 
+_SHELL_VALUE = re.compile(r"""\$(?:\{[^}\n]{0,80}\}|\([^)\n]{0,200}\)|[A-Za-z_][A-Za-z0-9_]{0,60})["']?[^\s"';|&<>]{0,300}""")
 _OWN_COMMAND = re.compile(r"(?:^|[\s;&|(/])(?:tainttrail|python[\d.]{0,6}\s{1,4}-m\s{1,4}tainttrail)(?:\s|$)")
 # Arguments that name the remote object a call reads or writes (a page, an issue, a channel).
 _OBJECT_KEYS = frozenset({"id", "page_id", "pageid", "issueid", "issue_id", "channel_id", "channel", "document_id",

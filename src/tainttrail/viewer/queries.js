@@ -11,6 +11,10 @@
 export const GRAPH_NODES = 'MATCH (n) RETURN count(n) AS nodes';
 export const GRAPH_RELS = 'MATCH ()-[r]->() RETURN count(r) AS rels';
 
+// A finding whose rule called for a hold (intended) that was not enforced (action is allow):
+// the project was in monitor mode, or the rule was overridden. The call ran.
+const unenforced = (f) => `${f}.action = 'allow' AND ${f}.intended IN ['ask', 'deny']`;
+
 export const TOTALS = `
 MATCH (n)
 RETURN sum(CASE WHEN n:Session THEN 1 ELSE 0 END) AS sessions,
@@ -18,6 +22,8 @@ RETURN sum(CASE WHEN n:Session THEN 1 ELSE 0 END) AS sessions,
        sum(CASE WHEN n:ToolCall AND n.decision = 'ask' THEN 1 ELSE 0 END) AS asked,
        sum(CASE WHEN n:ToolCall AND n.decision = 'deny' THEN 1 ELSE 0 END) AS denied,
        sum(CASE WHEN n:Finding THEN 1 ELSE 0 END) AS findings,
+       sum(CASE WHEN n:Finding AND n.action IN ['ask', 'deny'] THEN 1 ELSE 0 END) AS holding,
+       sum(CASE WHEN n:Finding AND ${unenforced('n')} THEN 1 ELSE 0 END) AS unenforced,
        sum(CASE WHEN n:Content AND n.untrusted = true THEN 1 ELSE 0 END) AS untrusted,
        sum(CASE WHEN n:Content AND n.sensitive = true THEN 1 ELSE 0 END) AS sensitive`.trim();
 
@@ -28,12 +34,14 @@ WITH s, count(c) AS calls,
      sum(CASE WHEN c.decision = 'deny' THEN 1 ELSE 0 END) AS denied,
      sum(CASE WHEN c.decision = 'ask' THEN 1 ELSE 0 END) AS asked
 OPTIONAL MATCH (f:Finding {session_id: s.id})
-WITH s, calls, denied, asked, count(f) AS findings
+WITH s, calls, denied, asked, count(f) AS findings,
+     sum(CASE WHEN f.action = 'allow' AND f.intended = 'deny' THEN 1 ELSE 0 END) AS would_deny,
+     sum(CASE WHEN f.action = 'allow' AND f.intended = 'ask' THEN 1 ELSE 0 END) AS would_ask
 OPTIONAL MATCH (s)-[:RECEIVED]->(p:Content {origin: 'user'})
-WITH s, calls, denied, asked, findings, p ORDER BY p.seq
-WITH s, calls, denied, asked, findings, collect(p.excerpt)[0] AS first_prompt
+WITH s, calls, denied, asked, findings, would_deny, would_ask, p ORDER BY p.seq
+WITH s, calls, denied, asked, findings, would_deny, would_ask, collect(p.excerpt)[0] AS first_prompt
 RETURN s.id AS id, s.started_at AS started_at, s.agent_kind AS agent, s.mode AS mode, s.cwd AS cwd,
-       calls, asked, denied, findings, first_prompt
+       calls, asked, denied, findings, would_deny, would_ask, first_prompt
 ORDER BY started_at DESC, id DESC`.trim();
 
 export const SESSION_IDS = `
@@ -53,19 +61,23 @@ ORDER BY CASE WHEN f.action = 'deny' THEN 0 WHEN f.action = 'ask' THEN 1
               WHEN coalesce(f.intended, f.action) IN ['ask', 'deny'] THEN 2 ELSE 3 END,
          ts DESC, id DESC`.trim();
 
-// Where calls sent data, and who had named each place: the user, trusted content, or only
-// content a third party could have written.
+// Where calls sent data, and who had named each place: the user, other content that is not
+// untrusted (a file of the project, say), or only content a third party could have written.
 export const DESTINATIONS = `
 MATCH (c:ToolCall)-[:SENDS_TO]->(d:Entity)
 WHERE NOT coalesce(d.local = true, false)
 WITH d, count(c) AS calls,
      sum(CASE WHEN c.decision = 'deny' THEN 1 ELSE 0 END) AS denied,
      sum(CASE WHEN c.decision = 'ask' THEN 1 ELSE 0 END) AS asked,
-     sum(CASE WHEN c.carries_payload = true THEN 1 ELSE 0 END) AS with_data
+     sum(CASE WHEN c.carries_payload = true THEN 1 ELSE 0 END) AS with_data,
+     sum(COUNT { MATCH (f:Finding)-[:FLAGS]->(c) WHERE f.action = 'allow' AND f.intended = 'deny' }) AS would_deny,
+     sum(COUNT { MATCH (f:Finding)-[:FLAGS]->(c) WHERE f.action = 'allow' AND f.intended = 'ask' }) AS would_ask
 RETURN d.id AS id, d.kind AS kind, d.value AS value, coalesce(d.trusted = true, false) AS trusted, calls, denied, asked, with_data,
+       would_deny, would_ask,
        EXISTS { MATCH (p:Content {origin: 'user'})-[:MENTIONS]->(d) } AS by_user,
+       EXISTS { MATCH (t:Content)-[:MENTIONS]->(d) WHERE t.origin <> 'user' AND NOT coalesce(t.untrusted = true, false) } AS by_trusted,
        EXISTS { MATCH (u:Content {untrusted: true})-[:MENTIONS]->(d) } AS by_untrusted
-ORDER BY denied DESC, asked DESC, calls DESC, id
+ORDER BY denied DESC, asked DESC, would_deny DESC, would_ask DESC, calls DESC, id
 LIMIT 8`.trim();
 
 // The console statement behind each row of that table.
@@ -250,8 +262,10 @@ ORDER BY size(calls_sending_there) DESC, destination`,
   },
   {
     title: 'Held calls and the chain back to untrusted content',
-    about: 'For every call that was asked about or denied: the shortest evidence path from untrusted content of the same session.',
+    about: 'For the five most recent calls that were asked about or denied: the shortest evidence path from untrusted content of the same session.',
+    // A shortest-path search runs once per pair of ends, so the calls are limited first.
     statement: `MATCH (c:ToolCall) WHERE c.decision IN ['ask', 'deny']
+WITH c ORDER BY c.ts DESC, c.id LIMIT 5
 MATCH (u:Content {untrusted: true}) WHERE u.session_id = c.session_id AND u.seq < c.seq
 MATCH p = SHORTEST 1 (u)-[:MENTIONS|SENDS_TO|CARRIES|HAS_CHUNK|READS|WRITES|UPLOADS|FETCHES|FROM|TAINTED_BY]-{1,6}(c)
 RETURN c.num AS call, c.decision AS decision, length(p) AS hops, p

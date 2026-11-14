@@ -137,16 +137,20 @@ export async function sessionView(ctx, route) {
     .sort((a, b) => a.seq - b.seq);
   const denied = calls.filter((c) => c.decision === 'deny').length;
   const asked = calls.filter((c) => c.decision === 'ask').length;
+  const unenforced = findings.filter((f) => f.action === 'allow' && (f.intended === 'deny' || f.intended === 'ask')).length;
   const picker = h('select', { id: 'session-picker', 'aria-label': 'Session', on: { change: (e) => ctx.navigate(sessionHref(e.target.value)) } },
     ids.map((r) => h('option', { value: r.id, selected: r.id === sid }, `${fmtTime(r.started_at) || 'unknown time'}  ${shortId(r.id)}`)));
 
   return h('div', { class: 'view view-session' },
     pageHead({
       eyebrow: h('a', { href: '#/' }, 'Overview'), title: 'Session timeline',
-      lede: [h('code', { class: 'wrap-anywhere' }, session.id), ` \u00b7 ${session.agent ?? 'agent'} \u00b7 ${session.mode ?? 'guard'} mode \u00b7 started ${fmtTime(session.started_at)}`, session.cwd ? [' \u00b7 ', h('code', null, session.cwd)] : null],
+      // An older graph does not say which mode a session ran in; then nothing is claimed about it.
+      lede: [h('code', { class: 'wrap-anywhere' }, session.id), ` \u00b7 ${session.agent ?? 'agent'}${session.mode ? ` \u00b7 ${session.mode} mode` : ''}${fmtTime(session.started_at) ? ` \u00b7 started ${fmtTime(session.started_at)}` : ''}`,
+        session.cwd ? [' \u00b7 ', h('code', null, session.cwd)] : null],
       actions: ids.length > 1 ? picker : null,
     }),
-    h('p', { class: 'summary-line' }, `${plural(calls.length, 'tool call')}, ${fmtInt(denied)} denied, ${fmtInt(asked)} asked, ${plural(findings.length, 'finding')}.`),
+    h('p', { class: 'summary-line' }, `${plural(calls.length, 'tool call')}, ${fmtInt(denied)} denied, ${fmtInt(asked)} asked, ${plural(findings.length, 'finding')}.`,
+      unenforced ? ` ${plural(unenforced, 'finding')} called for a hold that was not enforced (monitor mode, or a rule that was overridden).` : null),
     card({ title: 'Timeline', note: 'in the order things happened', cls: 'timeline-card' },
       h('div', { class: 'tl-head', 'aria-hidden': 'true' }, h('span', null, '#'), h('span', null, 'Tool call'), h('span', null, 'Brought into context'), h('span', null, 'Decision')),
       events.length ? h('ol', { class: 'timeline' }, events.map((e) => e.node)) : emptyState('Nothing was recorded in this session.')),

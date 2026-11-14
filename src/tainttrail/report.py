@@ -239,7 +239,7 @@ def status(store: Store) -> dict[str, Any]:
 
 
 def render_path(steps: Iterable[PathStep], *, color: bool = False, decision: str | None = None,
-                indent: str = "  ") -> str:
+                indent: str = "  ", target: str | None = None) -> str:
     """An attack path, one node per line, with the edge between each pair.
 
     The arrow points the way the stored edge points, so the diagram reads as evidence:
@@ -258,7 +258,8 @@ def render_path(steps: Iterable[PathStep], *, color: bool = False, decision: str
         tag = paint(role.ljust(role_width), *ROLE_STYLE.get(role, ()), color=color)
         title = step.title[5:] if role == "call" and step.title.startswith("call ") else step.title
         line = f"{indent}{tag}  {title}"
-        if step.label == S.TOOL_CALL and decision in ("deny", "ask"):
+        # The verdict belongs to the call the finding flags, not to an earlier call on the same path.
+        if step.label == S.TOOL_CALL and decision in ("deny", "ask") and (target is None or step.node_id == target):
             line += "   " + paint(ACTION_WORD[decision], *ACTION_STYLE[decision], color=color)
         lines.append(line)
         if step.rel is None:
@@ -292,7 +293,8 @@ def render_finding(f: dict[str, Any], *, color: bool = False, width: int = 96, s
     out = [head, paint(f["title"], "bold", color=color), ""]
     out += textwrap.wrap(f["explanation"], width=width) or [""]
     out += ["", paint("Path", "bold", color=color),
-            render_path(f.get("path") or [], color=color, decision=intended if intended in ("ask", "deny") else None)]
+            render_path(f.get("path") or [], color=color, decision=intended if intended in ("ask", "deny") else None,
+                        target=f.get("target_id") if f.get("target_label") == S.TOOL_CALL else None)]
     if show_query and f.get("query"):
         out += ["", paint("Cypher that found it", "bold", color=color)]
         out += ["  " + line for line in f["query"].strip().splitlines()]

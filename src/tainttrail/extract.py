@@ -462,6 +462,7 @@ _REDACT_ONLY: tuple[tuple[str, "re.Pattern[str]"], ...] = (
     ("secret", re.compile(r"(?i)[\"'](?:pass|key|passphrase|pwd)[\"']\s*:\s*[\"']([^\"']{4,})[\"']")),
 )
 _LONG_TOKEN = re.compile(r"[A-Za-z0-9+=_-]{20,}")
+_LONG_HEX = re.compile(r"[0-9A-Fa-f]{32,}")
 _BLOB = re.compile(r"[A-Za-z0-9+/]{32,}={0,2}")
 
 
@@ -471,6 +472,8 @@ def _random_looking(token: str) -> bool:
     ``air_quality_station_measurements_2023`` is an identifier: its parts are words and numbers.
     ``canary_dbpass_7Qz4Lm9Xr2Tb`` is not: one part mixes letters and digits.
     """
+    if _LONG_HEX.fullmatch(token):
+        return True     # hex of ASCII text has low entropy and is still an encoding of something
     if not (any(ch.isalpha() for ch in token) and any(ch.isdigit() for ch in token)):
         return False
     if shannon_entropy(token) < 3.5:

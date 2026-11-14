@@ -521,6 +521,31 @@ def test_static_copy_refuses_to_scatter_files_over_other_work(tmp_path):
     assert (empty / "index.html").is_file()
 
 
+def test_static_copy_does_not_write_through_links_left_in_an_earlier_copy(tmp_path):
+    """An earlier copy is replaced in place. If someone has put links into it since, the new
+    files must not land where the links point."""
+    target = tmp_path / "site"
+    serve.write_static_copy('{"n": 1}', target)
+    victim = tmp_path / "victim.txt"
+    victim.write_text("do not touch")
+    for name in ("graph.json", "app.js", serve.MARKER_NAME, ".nojekyll"):
+        (target / name).unlink()
+        (target / name).symlink_to(victim)
+    serve.write_static_copy('{"n": 2}', target)
+    assert victim.read_text() == "do not touch"
+    assert json.loads((target / "graph.json").read_text()) == {"n": 2}
+    assert not any((target / name).is_symlink() for name in ("graph.json", "app.js", serve.MARKER_NAME, ".nojekyll"))
+    assert (target / "app.js").read_bytes() == (VIEWER / "app.js").read_bytes()
+
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    shutil.rmtree(target / "views")
+    (target / "views").symlink_to(elsewhere, target_is_directory=True)
+    with pytest.raises(serve.UiError, match="leads outside"):
+        serve.write_static_copy('{"n": 3}', target)
+    assert list(elsewhere.iterdir()) == [], "nothing was written through the linked directory"
+
+
 # -- the command ----------------------------------------------------------------------------------------
 
 
@@ -548,6 +573,7 @@ def test_export_dir_writes_the_project_graph(cfg: Config, tmp_path, capsys):
     assert serve.cmd_ui(_args("--export-dir", str(target)), cfg) == 0
     out = capsys.readouterr().out
     assert "wrote" in out and str(target) in out
+    assert "recorded graph" in out and "only where those may be seen" in out, "a copy of real sessions comes with a word of care"
     export = json.loads((target / "graph.json").read_text())
     assert export["meta"]["format"] == FORMAT and export["meta"]["project"] == cfg.root.name
     assert export["meta"]["session"] is None, "the whole graph by default"
@@ -727,6 +753,30 @@ def test_file_option_shows_an_export_file_as_it_is(cfg: Config, tmp_path, capsys
     assert box["code"] == 0 and f"Showing {archive}." in capsys.readouterr().out
 
 
+def test_file_option_opens_what_retention_archives(cfg: Config, tmp_path):
+    """The real thing: sessions moved out of the live graph by tainttrail.retention, opened one by one."""
+    retention = pytest.importorskip("tainttrail.retention")
+    with Store(cfg.db_path) as store:
+        for i in range(5):
+            attack_session(store, cfg, session=f"session-{i}", ts=1_800_000_000_000 + i * 3_600_000)
+        with store.transaction():
+            archived = retention.prune(store, cfg, budget=1)
+        left = {row["id"] for row in store.run("MATCH (s:Session) RETURN s.id AS id")}
+    assert archived, "nothing was archived: the budget of one node should have moved the oldest sessions out"
+    files = retention.archived(cfg)
+    assert len(files) == len(archived) and all(f.suffix == ".json" for f in files)
+    for i, record in enumerate(archived):
+        assert record["id"] not in left
+        target = tmp_path / f"site{i}"
+        assert serve.cmd_ui(_args("--file", record["file"], "--export-dir", str(target)), cfg) == 0
+        export = json.loads((target / "graph.json").read_text())
+        assert export["meta"]["format"] == FORMAT and export["meta"]["session"] == record["id"]
+        assert {n["id"] for n in export["nodes"] if "Session" in n["labels"]} == {record["id"]}
+        assert any(n["props"].get("rule") == "TT001" for n in export["nodes"]), "the finding went into the archive with its session"
+        ids = {n["id"] for n in export["nodes"]}
+        assert all(r["start"] in ids and r["end"] in ids for r in export["rels"])
+
+
 def test_file_option_accepts_what_the_viewer_accepts_and_says_why_not(cfg: Config, tmp_path, capsys, monkeypatch):
     good = {"meta": {"format": FORMAT}, "nodes": [], "rels": []}
     cases = {
@@ -883,8 +933,10 @@ def test_text_from_the_graph_cannot_repaint_the_terminal(cfg: Config, tmp_path, 
 def test_the_suggested_command_survives_a_directory_name_with_spaces(cfg: Config, tmp_path, capsys):
     target = tmp_path / "my site (draft)"
     assert serve.cmd_ui(_args("--sample", "--export-dir", str(target)), cfg) == 0
-    line = next(l for l in capsys.readouterr().out.splitlines() if "http.server" in l)
+    out = capsys.readouterr().out
+    line = next(l for l in out.splitlines() if "http.server" in l)
     assert shlex.split(line)[-2:] == ["--directory", str(target)]
+    assert "recorded graph" not in out, "the sample is synthetic: nothing to be careful with"
 
 
 @pytest.mark.parametrize("controller,opened", [
@@ -913,18 +965,43 @@ def test_a_text_mode_browser_is_not_started(cfg: Config, monkeypatch, capfd, con
         assert box["url"] in captured.out, "the URL is still printed"
 
 
-@pytest.mark.skipif(not hasattr(signal, "SIGHUP"), reason="no SIGHUP on this platform")
-@pytest.mark.parametrize("signame", ["SIGHUP", "SIGINT"])
-def test_a_closed_terminal_or_ctrl_c_also_removes_the_export(tmp_path, signame):
+def _serve_as_a_process(tmp_path, signals: dict[str, object]):
+    """Start `python -m tainttrail.serve --sample` with the given signal dispositions; returns (process, port).
+
+    The dispositions are set in the child before Python starts: a test run that was itself
+    started with SIGINT or SIGHUP ignored (a background job, nohup) would hand that on.
+    """
+    def dispositions() -> None:
+        for name, how in signals.items():
+            signal.signal(getattr(signal, name), how)
+
     env = {**os.environ, "TMPDIR": str(tmp_path / "tmp")}
     (tmp_path / "tmp").mkdir()
     proc = subprocess.Popen([sys.executable, "-m", "tainttrail.serve", "--sample", "--no-open"], cwd=tmp_path, env=env,
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, preexec_fn=dispositions)
+    line = proc.stdout.readline()
+    url = re.search(r"http://127\.0\.0\.1:(\d+)/", line)
+    assert url, f"no URL on the first line: {line!r}"
+    proc.stdout.readline()                             # "Showing ...": the server is about to serve
+    assert [p.name for p in (tmp_path / "tmp").iterdir() if p.name.startswith("tainttrail-ui-")]
+    return proc, int(url.group(1))
+
+
+def _graph_is_served(port: int) -> bool:
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
     try:
-        line = proc.stdout.readline()
-        assert re.search(r"http://127\.0\.0\.1:(\d+)/", line), f"no URL on the first line: {line!r}"
-        proc.stdout.readline()                         # "Showing ...": the server is about to serve
-        assert [p.name for p in (tmp_path / "tmp").iterdir() if p.name.startswith("tainttrail-ui-")]
+        conn.request("GET", "/graph.json")
+        return conn.getresponse().status == 200
+    finally:
+        conn.close()
+
+
+@pytest.mark.skipif(not hasattr(signal, "SIGHUP"), reason="no SIGHUP on this platform")
+@pytest.mark.parametrize("signame", ["SIGHUP", "SIGINT"])
+def test_a_closed_terminal_or_ctrl_c_also_removes_the_export(tmp_path, signame):
+    proc, port = _serve_as_a_process(tmp_path, {"SIGHUP": signal.SIG_DFL, "SIGINT": signal.SIG_DFL})
+    try:
+        assert _graph_is_served(port)
         proc.send_signal(getattr(signal, signame))
         assert proc.wait(15) == 0
         assert "Traceback" not in proc.stderr.read()
@@ -934,6 +1011,25 @@ def test_a_closed_terminal_or_ctrl_c_also_removes_the_export(tmp_path, signame):
         proc.stdout.close()
         proc.stderr.close()
     assert list((tmp_path / "tmp").iterdir()) == [], "the temporary export directory was removed"
+
+
+@pytest.mark.skipif(not hasattr(signal, "SIGHUP"), reason="no SIGHUP on this platform")
+def test_a_server_started_under_nohup_outlives_its_terminal(tmp_path):
+    """Whoever starts the viewer with SIGHUP ignored wants it to stay up; SIGTERM still stops it cleanly."""
+    proc, port = _serve_as_a_process(tmp_path, {"SIGHUP": signal.SIG_IGN})
+    try:
+        proc.send_signal(signal.SIGHUP)
+        with pytest.raises(subprocess.TimeoutExpired):
+            proc.wait(1.5)
+        assert _graph_is_served(port), "still serving after the hangup"
+        proc.send_signal(signal.SIGTERM)
+        assert proc.wait(15) == 0
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.stdout.close()
+        proc.stderr.close()
+    assert list((tmp_path / "tmp").iterdir()) == []
 
 
 def test_static_copy_cannot_be_written_into_the_installed_viewer(tmp_path):
@@ -1140,13 +1236,13 @@ WRITES = [
     "PROFILE CREATE (n:Oops)", "EXPLAIN CREATE (n:Oops)", "USE neo4j CREATE (n:Oops)",
     "LOAD CSV FROM 'file:///etc/passwd' AS row RETURN row", "load csv from 'https://attacker.example/x' as row return row",
     "MATCH (n:Session) WITH n AS SET SET SET.zzz = 1 RETURN 1 AS x", "MATCH (n:Session {id: 'x'})SET n.zzz = 1",
-    "MATCH (n:Session) SET n.zzz = 1", "MATCH (n:Session)\x0bSET n.zzz = 1", "MATCH (n:Session)\tSET\tn.zzz = 1",
-    "MATCH (n:Session) SET n.zzz = 1", "MATCH (n:Chunk) DETACH/* */DELETE n", "MATCH (n:Chunk) DETACH\nDELETE\nn",
+    "MATCH (n:Session)\u00a0SET n.zzz = 1", "MATCH (n:Session)\x0bSET n.zzz = 1", "MATCH (n:Session)\tSET\tn.zzz = 1",
+    "MATCH (n:Session)\u2028SET n.zzz = 1", "MATCH (n:Chunk) DETACH/* */DELETE n", "MATCH (n:Chunk) DETACH\nDELETE\nn",
     "MATCH (n:Session) // SET in a comment\nSET n.zzz = 1", "MATCH (n:Session) // c\r\nSET n.zzz = 1",
     "/* a /* b */ CREATE (n:Oops) /* c */ RETURN 1 AS x", "RETURN 1 AS x /* unterminated CREATE (n:Oops)",
     # A string that ends in a backslash and a line break shifts what a careless tokenizer takes for text.
     "WITH 'x\\\n' AS a CREATE (n:Oops) RETURN 'done' AS d", "WITH 'x\\\r' AS a CREATE (n:Oops) RETURN 'done' AS d",
-    "WITH 'x\\ ' AS a CREATE (n:Oops) RETURN 'done' AS d", "WITH 'x\\ ' AS a CREATE (n:Oops) RETURN 'done' AS d",
+    "WITH 'x\\\u2028' AS a CREATE (n:Oops) RETURN 'done' AS d", "WITH 'x\\\u2029' AS a CREATE (n:Oops) RETURN 'done' AS d",
     'WITH "x\\\n" AS a MATCH (n:Chunk) DETACH DELETE n RETURN "done" AS d',
     "WITH 'x\\\n' AS a MATCH (n:Session) SET n.zzz = 1 FINISH //'", "WITH 'it\\'s' AS a CREATE (n:Oops) RETURN 'x' AS d",
     "WITH 'a\\\\' AS a CREATE (n:Oops) RETURN 'x' AS d", "WITH `a``b` AS x CREATE (n:Oops) RETURN `x` AS d",
@@ -1154,6 +1250,11 @@ WRITES = [
     "WITH 'a' AS `x\n` CREATE (n:Oops) RETURN 1 AS d", "WITH 1 AS `x` CREATE (n:Oops) RETURN 1 AS d",
     "WITH 1 AS `x`CREATE (n:Oops)", "MATCH (n:Session) WHERE n.id = n.`id`SET n.zzz = 1", "MATCH (n:Session) WHERE n.id <> 'a'SET n.zzz = 1",
     "MATCH (`n`:Chunk) DETACH DELETE `n`", "UNWIND [1] AS `x` MERGE (:Oops {id: `x`})",
+    # The engine takes AS as a name too. After "AS AS" comes a clause, and a statement can hide FINISH the same way.
+    "UNWIND [1] AS AS CREATE (n:Oops)", "UNWIND [1] AS AS CREATE (n:Oops) WITH 1 AS AS FINISH",
+    "MATCH (AS:Session) WITH AS SET AS.zzz = 1", "MATCH (as:Session) WITH as SET as.zzz = 1",
+    "MATCH (n:Session) WITH n AS AS SET AS.zzz = 1", "CALL db.labels() YIELD label AS AS CREATE (:Oops)",
+    "MATCH (AS:Chunk) WITH AS, 1 AS x WITH x, AS DETACH DELETE AS", "MATCH (FINISH:Chunk) DETACH DELETE FINISH FINISH",
     "CALL db.createLabel('Zed')", "CALL db.`createLabel`('Zed')", "CALL db . createLabel('Zed')", "CALL `db`.`createLabel`('Zed')",
     "CALL db.createProperty('zed')", "CALL db.createRelationshipType('ZED')", "CALL tx.setMetaData({a: 1})",
     "RETURN randomUUID() AS id", "RETURN randomUUID () AS id", "RETURN `randomUUID`() AS id", "RETURN RANDOMUUID() AS id",
@@ -1163,6 +1264,7 @@ READS = [
     "RETURN {set: 1, delete: 2, create: 3, merge: 4, remove: 5, load: 6, drop: 7}.set AS n",
     "MATCH (s:Session) RETURN count(s) AS load", "WITH [1, 2, 3] AS set RETURN size(set) AS n",
     "MATCH (s:Session) RETURN count(s) AS drop ORDER BY drop;", "WITH {a: 1} AS merge RETURN merge.a AS n",
+    "WITH 'x' AS load, 2 AS drop RETURN 1 AS n", "MATCH (s:Session) WITH count(s) AS set RETURN [x IN [set] | x][0] AS n",
     "MATCH (n:Session) WHERE n.set IS NULL AND n.delete IS NULL RETURN count(n) AS n", "RETURN $set AS n, $create AS m",
     "MATCH (n:CREATE) RETURN count(n) AS n", "MATCH (n:Session)-[:SET|DELETE]->(m) RETURN count(m) AS n",
     "MATCH (dataset:Session) RETURN count(dataset) AS n", "MATCH (n) WHERE n.offset = 1 OR n.created_at > 0 RETURN n.reset, n.settings",
@@ -1214,9 +1316,11 @@ def _write_attempts() -> list[str]:
         "", "WITH 1 AS one ", "WITH 'x\\\n' AS s ", "WITH \"x\\\n\" AS s ", "WITH 'x\\\r\n' AS s ", "WITH 'a\\\\' AS s ", "WITH 'a\\'b' AS s ",
         "WITH '' AS s ", "WITH '\\\\\\\n' AS s ", "WITH `a``b` AS s ", "WITH 1 AS `a\\` ", "/* ' */ WITH 1 AS s ", "// '\nWITH 1 AS s ",
         "WITH '/*' AS s ", "WITH '//' AS s ", "WITH \"'\" AS s ", "WITH '\"' AS s ", "WITH '`' AS s ", "WITH 1 AS s /* \\\n */ ",
-        "WITH 'x\\\n' AS a, 'y\\\n' AS b ", "WITH '\\u0027' AS s ", "WITH 1 AS s ", "WITH 1 AS s ", "WITH 1 AS SET ",
+        "WITH 'x\\\n' AS a, 'y\\\n' AS b ", "WITH '\\u0027' AS s ", "WITH 1 AS s\u00a0", "WITH 1 AS s\u2028", "WITH 1 AS SET ",
+        "UNWIND [1] AS AS ", "WITH 1 AS x, 2 AS AS ", "WITH (1) AS AS WITH AS ", "WITH 'a' AS AS ", "WITH 1 AS `AS` ",
     ]
-    suffixes = ["", " RETURN 1 AS x", " FINISH", " RETURN 'x' AS x //'", " RETURN \"y\" AS y /* ' */", " FINISH //'", "\n// '\n", " RETURN '\\\n' AS z"]
+    suffixes = ["", " RETURN 1 AS x", " FINISH", " RETURN 'x' AS x //'", " RETURN \"y\" AS y /* ' */", " FINISH //'", "\n// '\n", " RETURN '\\\n' AS z",
+                " WITH 1 AS AS FINISH", " WITH 1 AS finish FINISH"]
     out = []
     for i, clause in enumerate(clauses):
         for j, prefix in enumerate(prefixes):
@@ -1269,6 +1373,93 @@ def test_reads_that_the_guard_lets_through_do_run_on_the_engine(sample, tmp_path
             store.run(statement)       # read_only: a write would raise here
         assert store.one("WITH [1, 2, 3] AS set RETURN size(set) AS n")["n"] == 3
         assert store.one("RETURN {set: 1, delete: 2}.set AS n")["n"] == 1
+
+
+def _viewer_queries() -> dict[str, str]:
+    """Every statement in viewer/queries.js, by name (the console examples by title)."""
+    script = (
+        f"import * as q from {json.dumps((VIEWER / 'queries.js').as_uri())};\n"
+        "const out = {};\n"
+        "for (const [name, value] of Object.entries(q)) {\n"
+        "  if (typeof value === 'string') out[name] = value;\n"
+        "  else if (Array.isArray(value)) value.forEach((e, i) => { out[`${name}[${i}] ${e.title}`] = e.statement; });\n"
+        "}\n"
+        "console.log(JSON.stringify(out));\n"
+    )
+    done = subprocess.run([NODE, "--input-type=module", "-e", script], capture_output=True, text=True, timeout=60)
+    assert done.returncode == 0, done.stderr
+    return json.loads(done.stdout)
+
+
+@needs_node
+def test_the_guard_runs_every_stored_rule_query_and_every_query_of_the_viewer():
+    """The Run button executes the query a rule stored on its finding, and "Open in console" hands
+    over the viewer's own statements. The guard must let all of them run, and none may hold a
+    write word in a string or comment, which would make the viewer reload the graph after it."""
+    from tainttrail import paths, rules
+
+    statements = _viewer_queries()
+    assert len(statements) >= 20 and any(name.startswith("EXAMPLES[") for name in statements)
+    statements.update({f"rules.CYPHER[{key}]": text.strip() for key, text in rules.CYPHER.items()})
+    statements.update({f"paths.{name}": getattr(paths, name).strip() for name in ("PATH_QUERY", "LEGS_QUERY", "WITNESS_QUERY")})
+    verdicts = _guard(list(statements.values()))
+    refused = {name: v["refusal"] for name, v in zip(statements, verdicts) if v["refusal"]}
+    assert refused == {}, "the viewer would refuse to run one of the project's own read queries"
+    reloading = [name for name, v in zip(statements, verdicts) if v["hidden"]]
+    assert reloading == [], "these queries mention a write word in a string or comment"
+
+
+@needs_node
+def test_every_query_of_the_viewer_runs_on_the_engine(sample, tmp_path):
+    """The browser runs these on the WebAssembly build; the native build parses the same Cypher."""
+    queries = _viewer_queries()
+    assert {"TOTALS", "SESSIONS", "FINDINGS", "DESTINATIONS", "SESSION_CALLS", "SESSION_RECEIVED", "FINDING", "MAP_TOOLS",
+            "MAP_PATH_TOTALS"} <= set(queries)
+    target = tmp_path / "sample.rl"
+    write_rl(sample, target)
+    session = sample["meta"]["sessions"][0]["id"]
+    finding = next(n["id"] for n in sample["nodes"] if "Finding" in n["labels"])
+    with Store(target, read_only=True) as store:
+        for name, statement in queries.items():
+            params = {key: value for key, value in (("sid", session), ("id", finding), ("dest", "host:attacker.example"))
+                      if f"${key}" in statement}
+            try:
+                store.run(statement, params)
+            except Exception as exc:   # noqa: BLE001 - name the statement that failed
+                pytest.fail(f"{name} does not run: {exc}")
+        totals = store.one(queries["TOTALS"])
+        sessions = sample["meta"]["sessions"]
+        assert (totals["sessions"], totals["calls"], totals["denied"], totals["asked"]) == (
+            len(sessions), sum(s["calls"] for s in sessions), sum(s["denied"] for s in sessions), sum(s["asked"] for s in sessions))
+        assert totals["holding"] == 2 and totals["unenforced"] == 0, "the sample was recorded in guard mode"
+        received = store.run(queries["SESSION_RECEIVED"], {"sid": session})
+        assert received and {"origin", "source", "bytes", "mentions"} <= set(received[0])
+
+
+@needs_node
+def test_the_overview_queries_tell_a_hold_from_a_hold_that_was_not_enforced(cfg: Config, tmp_path):
+    """In monitor mode nothing is held. The numbers the overview shows must say that the calls
+    ran, not that nothing happened: "no call was held" next to a TT001 finding is a false comfort."""
+    queries = _viewer_queries()
+    cfg.mode = "monitor"
+    with Store(cfg.db_path) as store:
+        attack_session(store, cfg)
+        export = export_graph(store, project="p", root=cfg.root)
+    findings = [n["props"] for n in export["nodes"] if "Finding" in n["labels"]]
+    assert {(f["rule"], f["action"], f["intended"]) for f in findings} >= {("TT001", "allow", "deny")}
+    target = tmp_path / "monitor.rl"
+    write_rl(export, target)
+    with Store(target, read_only=True) as store:
+        totals = store.one(queries["TOTALS"])
+        assert (totals["denied"], totals["asked"], totals["holding"]) == (0, 0, 0)
+        assert totals["unenforced"] == sum(1 for f in findings if f["action"] == "allow" and f["intended"] in ("ask", "deny")) >= 1
+        row = store.one(queries["SESSIONS"])
+        assert (row["denied"], row["asked"]) == (0, 0) and row["would_deny"] >= 1
+        destinations = {d["id"]: d for d in store.run(queries["DESTINATIONS"])}
+        evil = destinations["host:attacker.example"]
+        assert (evil["denied"], evil["would_deny"], evil["by_untrusted"], evil["by_user"], evil["by_trusted"]) == (0, 1, True, False, False)
+        docs = destinations["host:docs.example.test"]
+        assert (docs["would_deny"], docs["would_ask"], docs["by_user"]) == (0, 0, True)
 
 
 def test_the_viewer_uses_no_regex_lookbehind():

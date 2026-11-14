@@ -241,7 +241,6 @@ h2 { font-size: 14.5px; line-height: 1.35; font-weight: 650; }
 h3 { font-size: 13px; font-weight: 650; }
 .lede { margin-top: 4px; color: var(--text-2); max-width: 78ch; overflow-wrap: anywhere; }
 .muted { color: var(--text-3); }
-.subtle { color: var(--text-2); }
 .nowrap { white-space: nowrap; }
 .wrap-anywhere { overflow-wrap: anywhere; }
 .num { text-align: right; font-variant-numeric: tabular-nums; }

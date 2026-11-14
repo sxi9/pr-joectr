@@ -4,7 +4,7 @@
 // Relate (in worker.js), every view asks the engine with Cypher and renders what comes back.
 
 import { createClient } from './db.js';
-import { h, clear, fmtInt, fmtMs, fmtTime, plural } from './dom.js';
+import { h, clear, fmtInt, fmtMs, plural } from './dom.js';
 import { refusal, hiddenWrite, changedGraph } from './cypher.js';
 import { GRAPH_NODES, GRAPH_RELS } from './queries.js';
 import { queryLog, emptyState } from './ui.js';
@@ -13,6 +13,9 @@ import { sessionView } from './views/session.js';
 import { findingView, findingsView } from './views/finding.js';
 import { mapView } from './views/map.js';
 import { consoleView } from './views/console.js';
+
+// theme.js watches for this: without it, the page says that the app's scripts did not load.
+document.documentElement.dataset.app = 'started';
 
 const FORMAT = 'tainttrail-export/1';
 const MAX_FILE_BYTES = 64 * 1024 * 1024;
@@ -100,6 +103,10 @@ async function loadExport(doc, source) {
 
 async function openFile(file) {
   try {
+    if (/\.rl$/i.test(file.name)) {
+      // The browser build of Relate cannot open a store file; only the native one can.
+      throw new Error(`${file.name} is a Relate store, which a browser cannot open. Run "tainttrail ui --file ${file.name}" where the file is, or write an export with "tainttrail export --out graph.json".`);
+    }
     if (file.size > MAX_FILE_BYTES) throw new Error(`${file.name} is ${Math.round(file.size / 1024 / 1024)} MB; the viewer opens exports up to 64 MB.`);
     let doc;
     try {

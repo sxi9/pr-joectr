@@ -87,7 +87,7 @@ MATCH p = (u:Content {untrusted: true})-[:MENTIONS]->(d:Entity {id: $dest})
           <-[:HAS_CHUNK]-(s:Content {sensitive: true})
 WHERE u.session_id = c.session_id AND u.seq < c.seq
 RETURN p
-ORDER BY CASE k.kind WHEN 'secret' THEN 0 WHEN 'token' THEN 1 ELSE 2 END, u.seq
+ORDER BY CASE k.kind WHEN 'secret' THEN 0 WHEN 'token' THEN 1 ELSE 2 END, u.seq, k.id
 LIMIT 1""",
     # untrusted content -> destination <- call -> uploaded sensitive file
     "TT001.upload.injected": """
@@ -102,7 +102,7 @@ LIMIT 1""",
 MATCH p = (d:Entity {id: $dest})<-[:SENDS_TO]-(c:ToolCall {id: $call})-[:CARRIES]->(k:Chunk)
           <-[:HAS_CHUNK]-(s:Content {sensitive: true})
 RETURN p
-ORDER BY CASE k.kind WHEN 'secret' THEN 0 WHEN 'token' THEN 1 ELSE 2 END
+ORDER BY CASE k.kind WHEN 'secret' THEN 0 WHEN 'token' THEN 1 ELSE 2 END, k.id
 LIMIT 1""",
     # destination <- call -> uploaded sensitive file
     "egress.upload": """
@@ -113,7 +113,7 @@ LIMIT 1""",
     "egress.carry.nodest": """
 MATCH p = (c:ToolCall {id: $call})-[:CARRIES]->(k:Chunk)<-[:HAS_CHUNK]-(s:Content {sensitive: true})
 RETURN p
-ORDER BY CASE k.kind WHEN 'secret' THEN 0 WHEN 'token' THEN 1 ELSE 2 END
+ORDER BY CASE k.kind WHEN 'secret' THEN 0 WHEN 'token' THEN 1 ELSE 2 END, k.id
 LIMIT 1""",
     "egress.upload.nodest": """
 MATCH p = (c:ToolCall {id: $call})-[:UPLOADS]->(f:Entity {sensitive: true})
@@ -196,15 +196,17 @@ LIMIT 1""",
 MATCH (c:ToolCall {id: $call})-[:SENDS_TO]->(q:Entity {kind: 'repo'})
 MATCH (r:ToolCall {session_id: c.session_id})-[:READS]->(p:Entity {kind: 'repo'})
 WHERE r.seq < c.seq AND p.id <> q.id
-MATCH (r)-[:RETURNED]->(s:Content {sensitive: true})
-MATCH (u:Content {session_id: c.session_id, untrusted: true})
-WHERE u.seq < r.seq
+  AND EXISTS { MATCH (r)-[:RETURNED]->(:Content {sensitive: true}) }
   AND NOT EXISTS {
     MATCH (t:Content {origin: 'user'})-[:MENTIONS]->(p)
     WHERE t.session_id = c.session_id AND t.seq < c.seq
   }
+WITH c, q, r, p ORDER BY r.seq DESC LIMIT 1
+MATCH (r)-[:RETURNED]->(s:Content {sensitive: true})
+MATCH (u:Content {session_id: c.session_id, untrusted: true})
+WHERE u.seq < r.seq
 RETURN u, r, p, s, c, q
-ORDER BY u.seq DESC, r.seq DESC
+ORDER BY u.seq DESC
 LIMIT 1""",
     # a copy of a sensitive file, written or staged in this session, behind a push
     "egress.commit": """
@@ -231,16 +233,15 @@ MATCH p = SHORTEST 1 (u:Content {untrusted: true, session_id: $session})-[:""" +
 RETURN p""",
 }
 
-_Q_CONTEXT = """
-MATCH (c:ToolCall {id: $call})
-OPTIONAL MATCH (u:Content {session_id: c.session_id, untrusted: true}) WHERE u.seq < c.seq
-WITH c, u ORDER BY u.seq DESC
-WITH c, collect(u.id) AS us
-OPTIONAL MATCH (x:Content {session_id: c.session_id, sensitive: true}) WHERE x.seq < c.seq
-WITH c, us, x ORDER BY x.seq DESC
-RETURN c.session_id AS sid, c.seq AS seq, c.ts AS ts, c.tool AS tool,
-       us[0] AS last_untrusted, size(us) AS n_untrusted,
-       collect(x.id)[0] AS last_sensitive, count(x) AS n_sensitive
+# The call, and the two corners of its session each on its own: the latest untrusted content and
+# the latest sensitive content before it, with how many there are. Carrying one set across the
+# match of the other made this grow with their product.
+_Q_CONTEXT = "MATCH (c:ToolCall {id: $call}) RETURN c.session_id AS sid, c.seq AS seq, c.ts AS ts, c.tool AS tool"
+_Q_CORNER = """
+MATCH (x:Content {session_id: $sid})
+WHERE x.seq < $seq AND coalesce(x[$flag], false)
+WITH x ORDER BY x.seq DESC
+RETURN collect(x.id)[0] AS last, count(x) AS n
 """
 
 # Where a call sends, fetches or executes, and who named each place earlier in the session.
@@ -477,6 +478,11 @@ class _Eval:
         self.call_id = call_id
         self.call = call
         self.ctx = store.one(_Q_CONTEXT, {"call": call_id}) or {}
+        if self.ctx:
+            for flag in ("untrusted", "sensitive"):
+                corner = store.one(_Q_CORNER, {"sid": self.ctx["sid"], "seq": self.ctx["seq"], "flag": flag}) or {}
+                self.ctx[f"last_{flag}"] = corner.get("last")
+                self.ctx[f"n_{flag}"] = corner.get("n") or 0
         self._described: dict[tuple[str, str], tuple[dict[str, Any], dict[str, Any]]] = {}
         self._dest_known = False    # set by egress(): every destination is safe or named by the project's secrets file
 

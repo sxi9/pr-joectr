@@ -160,8 +160,6 @@ def _host_is_loopback(host_header: str | None) -> bool:
 class ViewerHandler(BaseHTTPRequestHandler):
     """GET and HEAD for the viewer's files and the one exported graph. Nothing else."""
 
-    server_version = "tainttrail-ui"
-    sys_version = ""
     timeout = 30  # seconds a connection may stay silent before its thread lets go of it
     # Set per server by make_server().
     viewer_dir: Path = VIEWER_DIR
@@ -226,6 +224,10 @@ class ViewerHandler(BaseHTTPRequestHandler):
         except (OSError, ValueError):
             pass
         self.close_connection = True
+
+    def version_string(self) -> str:
+        """The Server header: a name, and not which Python on which system is behind it."""
+        return "tainttrail-ui"
 
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002 - base class signature
         if self.verbose:
@@ -300,12 +302,22 @@ def write_static_copy(graph_json: str, target: Path, *, viewer_dir: Path = VIEWE
     if "index.html" not in files:
         raise UiError(f"the viewer files are missing from {viewer_dir}; reinstall tainttrail")
     target.mkdir(parents=True, exist_ok=True)
-    for rel in files:
+    root = target.resolve()
+
+    def place(rel: str) -> Path:
+        """Where a file of the copy goes. An earlier copy may hold links by now; nothing is written through one."""
         dest = target / rel
         dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(Path(viewer_dir) / rel, dest)
-    (target / GRAPH_NAME).write_text(graph_json, encoding="utf-8")
-    (target / MARKER_NAME).write_text(
+        if not dest.parent.resolve().is_relative_to(root):
+            raise UiError(f"{dest.parent} leads outside {target}; remove it or choose another directory")
+        if dest.is_symlink():
+            dest.unlink()
+        return dest
+
+    for rel in files:
+        shutil.copyfile(Path(viewer_dir) / rel, place(rel))
+    place(GRAPH_NAME).write_text(graph_json, encoding="utf-8")
+    place(MARKER_NAME).write_text(
         f"Static copy of the TaintTrail viewer {__version__}, written by `tainttrail ui --export-dir`.\n"
         "Serve this directory over http or https; it does not work from file://.\n"
         "The server must send a JavaScript MIME type for .js files and should send\n"
@@ -313,7 +325,7 @@ def write_static_copy(graph_json: str, target: Path, *, viewer_dir: Path = VIEWE
         encoding="utf-8",
     )
     # GitHub Pages runs Jekyll unless this file exists; Jekyll is not needed here.
-    (target / ".nojekyll").write_text("", encoding="utf-8")
+    place(".nojekyll").write_text("", encoding="utf-8")
     return sorted([*files, GRAPH_NAME, MARKER_NAME])
 
 
@@ -413,6 +425,11 @@ def _store_text(path: Path, *, session: str | None, project: str, root: Path | N
         return json.dumps(_finite(export), sort_keys=True, allow_nan=False)
 
 
+def _is_store(path: str | os.PathLike[str]) -> bool:
+    """Whether ``--file`` names a Relate store (a ``.rl`` file, or a directory store) rather than an export."""
+    return Path(path).suffix.lower() == ".rl" or Path(path).is_dir()
+
+
 def graph_text(cfg: Config, *, session: str | None = None, sample: bool = False,
                file: str | os.PathLike[str] | None = None) -> str:
     """The JSON text of what the viewer shows.
@@ -428,7 +445,7 @@ def graph_text(cfg: Config, *, session: str | None = None, sample: bool = False,
             raise UiError(f"the bundled sample graph is missing ({exc}); reinstall tainttrail") from exc
     if file is not None:
         path = Path(file)
-        if path.suffix.lower() != ".rl" and not path.is_dir():
+        if not _is_store(path):
             return _export_file_text(path)
         # An evidence file from `tainttrail export --format rl`: its paths were rewritten when it was made.
         return _store_text(path, session=session, project=path.stem, root=None, timeout_ms=cfg.lock_timeout_ms,
@@ -483,11 +500,10 @@ def cmd_ui(args: argparse.Namespace, cfg: Config, *,
     sample = bool(getattr(args, "sample", False))
     session = getattr(args, "session", None)
     file = getattr(args, "file", None)
-    is_store_file = bool(file) and (Path(file).suffix.lower() == ".rl" or Path(file).is_dir())
     if sample and (session or file):
         print(f"tainttrail ui: --sample and {'--file' if file else '--session'} cannot be combined", file=sys.stderr)
         return 2
-    if file and session and not is_store_file:
+    if file and session and not _is_store(file):
         print("tainttrail ui: --session and --file cannot be combined for an export file: it is shown whole",
               file=sys.stderr)
         return 2
@@ -508,6 +524,9 @@ def cmd_ui(args: argparse.Namespace, cfg: Config, *,
             print(f"tainttrail ui: could not write the static copy: {exc}", file=sys.stderr)
             return 1
         print(f"wrote {len(written)} files to {export_dir}")
+        if not sample:
+            print(f"{GRAPH_NAME} in it is the recorded graph: commands, file names and excerpts of what the agent "
+                  "read. Put the copy only where those may be seen.")
         print("Serve that directory with any static web server, for example:")
         print(f"  python -m http.server --bind {LOOPBACK} --directory {shlex.quote(str(export_dir))}")
         return 0

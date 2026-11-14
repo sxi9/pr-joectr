@@ -76,6 +76,10 @@ class Recorder:
             {"id": event.session_id, "agent_kind": event.agent_kind, "cwd": event.cwd,
              "ts": event.ts, "mode": self.cfg.mode},
         )
+        # The project's git remotes as they are when the guard first sees the session, whichever
+        # event that is (hooks can be installed while a session is open). Never again after that:
+        # a remote added later, during the session, gets no such trust.
+        self._trust_git_remotes(event)
         return True
 
     def session_start(self, event: HookEvent) -> list[str]:
@@ -85,10 +89,9 @@ class Recorder:
         harness loads by itself and that an earlier session wrote under the influence
         of untrusted content.
         """
-        # The harness fires this event again on resume, /clear and compaction. Remotes are trusted
-        # once, when the session begins: one added later, during the session, gets no such trust.
-        if self.ensure_session(event):
-            self._trust_git_remotes(event)
+        # The harness fires this event again on resume, /clear and compaction; the session, and the
+        # trust in its git remotes, are created once.
+        self.ensure_session(event)
         return self._inherit_memory(event)
 
     def inherited_memory(self, session_id: str) -> list[dict[str, Any]]:

@@ -11,11 +11,19 @@ function tile(label, value, sub, mark = null) {
     h('div', { class: 'tile-sub', title: sub }, sub));
 }
 
-function sessionVerdict(row) {
+/**
+ * What happened to calls, strictest first. A rule that called for a hold that was not enforced
+ * (monitor mode, or an override) reads "would be denied": the call ran, and that must show.
+ */
+function outcome(row, nothing) {
   if (row.denied > 0) return verdict('deny');
   if (row.asked > 0) return verdict('ask');
-  return h('span', { class: 'verdict verdict-allow' }, icon('allow'), 'nothing held');
+  if (row.would_deny > 0) return verdict('allow', 'deny');
+  if (row.would_ask > 0) return verdict('allow', 'ask');
+  return nothing;
 }
+
+const sessionVerdict = (row) => outcome(row, h('span', { class: 'verdict verdict-allow' }, icon('allow'), 'nothing held'));
 
 const MAX_SESSION_ROWS = 200;
 
@@ -44,9 +52,11 @@ function sessionsTable(rows, totals) {
       h('td', { class: 'col-wide' })))));
 }
 
+/** Who named a destination, most reassuring first. "Only" is said only when nobody else did. */
 function namedBy(row) {
   if (row.by_user) return roleTag('user');
   if (row.trusted) return h('span', { class: 'role' }, icon('allow'), 'Trusted list');
+  if (row.by_trusted) return h('span', { class: 'role', title: 'Content that is not untrusted mentions it, for example a file of the project' }, icon('content'), 'Trusted content');
   if (row.by_untrusted) return roleTag('untrusted', 'Untrusted content only');
   return h('span', { class: 'muted' }, 'nobody: it appears only in the call');
 }
@@ -63,7 +73,7 @@ function destinationsTable(rows) {
       h('td', null, namedBy(row)),
       h('td', { class: 'num' }, fmtInt(row.calls)),
       h('td', { class: 'col-wide nowrap' }, row.with_data ? 'data' : h('span', { class: 'muted' }, 'a plain request')),
-      h('td', null, row.denied ? verdict('deny') : row.asked ? verdict('ask') : verdict('allow')))))));
+      h('td', null, outcome(row, verdict('allow'))))))));
 }
 
 export function findingItem(f) {
@@ -86,12 +96,18 @@ export async function overviewView(ctx) {
   const destinations = (await ctx.q('Where calls sent data, and who named each place', DESTINATIONS)).rows;
 
   const held = totals.asked + totals.denied;
+  // Findings whose rule called for a hold that was not enforced: monitor mode, or an override.
+  const unenforced = totals.unenforced;
+  const notEnforced = `${plural(unenforced, 'finding')} called for a hold that was not enforced (monitor mode, or a rule that was overridden): ${unenforced === 1 ? 'that call' : 'those calls'} ran.`;
+  const recorded = `${plural(totals.sessions, 'session')} recorded.`;
   const lede = totals.sessions === 0
     ? 'This export holds no recorded session.'
     : held === 0
-      ? `${plural(totals.sessions, 'session')} recorded. No call was held: nothing completed a path from untrusted content to data leaving the machine.`
-      : `${plural(totals.sessions, 'session')} recorded. The guard held ${plural(held, 'call')}: ${fmtInt(totals.denied)} denied, ${fmtInt(totals.asked)} asked.`;
-  const blocking = findings.filter((f) => f.action !== 'allow' || f.intended !== 'allow').length;
+      ? (unenforced ? `${recorded} No call was held, but ${notEnforced}` : `${recorded} No call was held, and no rule called for one to be.`)
+      : `${recorded} The guard held ${plural(held, 'call')}: ${fmtInt(totals.denied)} denied, ${fmtInt(totals.asked)} asked.${unenforced ? ` ${notEnforced}` : ''}`;
+  const noted = totals.findings - totals.holding - unenforced;
+  const findingsSub = [totals.holding || !unenforced ? `${fmtInt(totals.holding)} held a call` : null,
+    unenforced ? `${fmtInt(unenforced)} not enforced` : null, `${fmtInt(noted)} noted`].filter(Boolean).join(', ');
 
   const page = h('div', { class: 'view view-overview' },
     pageHead({ eyebrow: ctx.state.meta?.session ? `One session of ${ctx.state.meta.project || 'a project'}` : 'All sessions', title: 'Overview', lede }),
@@ -100,7 +116,7 @@ export async function overviewView(ctx) {
       tile('Tool calls', totals.calls, `${plural(totals.untrusted, 'untrusted input')}, ${plural(totals.sensitive, 'sensitive read')}`),
       tile('Asked', totals.asked, 'held for your approval', h('span', { class: 'mark mark-ask' }, icon('ask'))),
       tile('Denied', totals.denied, 'blocked before running', h('span', { class: 'mark mark-deny' }, icon('deny'))),
-      tile('Findings', totals.findings, `${fmtInt(blocking)} held a call, ${fmtInt(totals.findings - blocking)} noted`)));
+      tile('Findings', totals.findings, findingsSub)));
 
   const sessionsCard = card({ title: 'Sessions', note: sessions.length > MAX_SESSION_ROWS ? `the newest ${MAX_SESSION_ROWS} of ${fmtInt(sessions.length)}` : 'newest first' },
     sessions.length ? sessionsTable(sessions, totals)

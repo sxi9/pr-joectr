@@ -199,3 +199,27 @@ def test_everything_the_guard_writes_about_a_session_is_owner_only(project, monk
     assert stat.S_IMODE(home.stat().st_mode) == 0o700
     for name in ("graph.rl", "key", "guard.log"):
         assert stat.S_IMODE((home / name).stat().st_mode) == 0o600, name
+
+
+# -- the packaged attacks: nothing they carry may end up in the graph -----------------------------
+
+from tainttrail import scenarios as _scenarios  # noqa: E402
+
+_ATTACKS = [s for s in _scenarios.list_scenarios() if s["group"] in ("attack", "variant", "known_gaps")]
+_CANARIES = ("AKIAIOSFODNN7EXAMPLE", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", "canary-4c1d9e7a2b6f4083a5d1")
+
+
+@pytest.mark.parametrize("scenario", _ATTACKS, ids=[s["id"] for s in _ATTACKS])
+def test_no_attack_leaves_a_secret_value_in_its_graph(scenario, tmp_path, monkeypatch):
+    """Plain, lower-cased (a host name), hex or base64: the graph of an incident is not a copy of the secret."""
+    import base64
+    import binascii
+
+    monkeypatch.setenv("TAINTTRAIL_KEY", "scenario-test-key-not-a-secret")
+    result = _scenarios.replay(scenario, tmp_path / "project")
+    with open_store(load_config(result.root), read_only=True) as store:
+        text = json.dumps(export_graph(store, chunks="all", keep_paths=True), ensure_ascii=False)
+    for canary in _CANARIES:
+        forms = (canary, canary.lower(), binascii.hexlify(canary.encode()).decode(),
+                 base64.b64encode(canary.encode()).decode().rstrip("=")[:24])
+        assert not [form for form in forms if form in text], canary
