@@ -301,7 +301,7 @@ def node_title(node: dict[str, Any], extra: dict[str, Any] | None = None) -> str
     if S.CONTENT in labels:
         return content_title(p, extra.get("src_kind"), extra.get("src_value"), extra.get("src_name"), extra.get("tool"))
     if S.TOOL_CALL in labels:
-        return f"call #{p.get('seq', '?')}  {p.get('summary') or p.get('tool') or ''}".rstrip()
+        return f"call #{p.get('num') or p.get('seq') or '?'}  {p.get('summary') or p.get('tool') or ''}".rstrip()
     if S.ENTITY in labels:
         kind, value = p.get("kind"), str(p.get("value") or "")
         if kind == "file":
@@ -716,6 +716,24 @@ def _named_by_user(d: dict[str, Any], dests: list[dict[str, Any]]) -> bool:
         host = _host_id(d["value"])
         return any(x["id"] == host and x["by_user"] for x in dests)
     return False
+
+
+def path_line(steps: list[PathStep]) -> str:
+    """A path on one line: ``web page x -> attacker.example <- call #7 ...``.
+
+    The arrow follows the stored edge; a step joined by shared session context rather
+    than an edge is shown with ``~``.
+    """
+    parts: list[str] = []
+    for step in steps:
+        parts.append(step.title)
+        if step.rel is None:
+            continue
+        if step.rel.isupper():
+            parts.append("->" if step.forward else "<-")
+        else:
+            parts.append("~")
+    return " ".join(parts)
 
 
 def reverse_path(steps: list[PathStep]) -> list[PathStep]:

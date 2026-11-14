@@ -229,6 +229,12 @@ class Recorder:
         with self.store.transaction():
             seq = self.next_seq(event.session_id)
             cid = existing or f"{event.session_id}:{seq}"
+            # ``seq`` orders everything in the session; ``num`` counts tool calls only and
+            # is what people see ("call #3").
+            num = int(self.store.scalar(
+                "MATCH (s:Session {id: $id}) SET s.calls = coalesce(s.calls, 0) + 1 RETURN s.calls",
+                {"id": event.session_id},
+            ))
             tool_id = self.ensure_tool(event.agent_kind, event.tool_name, analysis.labels)
             self.store.write(
                 """
@@ -245,7 +251,7 @@ class Recorder:
                 SET s.last_call = c.id
                 """,
                 {"sid": event.session_id, "id": cid, "tool_id": tool_id, "props": {
-                    "session_id": event.session_id, "seq": seq, "ts": event.ts,
+                    "session_id": event.session_id, "seq": seq, "num": num, "ts": event.ts,
                     "tool": event.tool_name, "agent": event.agent or "main",
                     "summary": analysis.summary[:400], "status": "pending", "decision": "allow",
                     "is_sink": bool(analysis.is_sink), "sink_kind": analysis.sink_kind,
