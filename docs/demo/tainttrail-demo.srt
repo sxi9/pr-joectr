@@ -1,0 +1,43 @@
+1
+00:00:00,000 --> 00:00:04,960
+A web page, an issue or a README can tell a coding agent what to do. This is a guard for that.
+
+2
+00:00:05,000 --> 00:00:14,960
+Prompt filters look at one message. The attack is a path across several tool calls.
+
+3
+00:00:15,000 --> 00:00:32,960
+A page tells the agent to post .env to an attacker. Without the guard three secrets leave. With it, the upload is denied before it runs.
+
+4
+00:00:33,000 --> 00:00:48,960
+Not scripted: Claude Code read a vendored file with a hidden instruction and tried the upload. The hook denied it, and the model told the user.
+
+5
+00:00:49,000 --> 00:01:05,960
+Every hook event is written to an embedded Relate graph, one file per project. A rule is a Cypher path query: untrusted content names a host, a call sends to it and uploads a secret.
+
+6
+00:01:06,000 --> 00:01:10,960
+The viewer loads the same graph into Relate's WebAssembly build. No server, no account, nothing leaves the machine.
+
+7
+00:01:11,000 --> 00:01:16,960
+The blocked call as a path: the untrusted file, the host it named, the call, the secret it would upload.
+
+8
+00:01:17,000 --> 00:01:23,960
+The query that blocked the call is stored on the finding. Run again here, in the page, it returns the same path.
+
+9
+00:01:24,000 --> 00:01:36,960
+The same graph also maps what an agent is configured with: here 4 MCP servers and 161 tools. The fix is the smallest permission change that breaks every open path, rehearsed in a Relate transaction and rolled back.
+
+10
+00:01:37,000 --> 00:01:46,960
+17 attacks modelled on public incidents and 11 variants are stopped. 73 of 74 ordinary sessions run without a single question, and no canary secret leaves.
+
+11
+00:01:47,000 --> 00:01:52,960
+The store, the scenarios and every command in this video are in the repository.

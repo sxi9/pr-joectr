@@ -1,5 +1,9 @@
 # Demo video shot list (under two minutes)
 
+A captioned video without narration is already in the repository: `docs/demo/tainttrail-demo.mp4`,
+built from the real commands by `node tools/demo-video/build.cjs`. This list is for recording the
+same scenes by hand with a voice-over.
+
 The hackathon caps the video at two minutes. This list runs about 1:50 at a normal speaking
 pace. Every command below works from a fresh clone with no account or key, except shot 3,
 which needs Claude Code. Record at 1280x720 or larger with a large terminal font.
@@ -18,8 +22,8 @@ export TAINTTRAIL_DB=examples/claude-code-session/graph.rl   # for shots 4 and 5
 | 3 | 0:38-0:58 | A real Claude Code session in a project after `tainttrail init`, or `tainttrail log` on the recorded store | "Here it is inside a real Claude Code session. The hook denies the call, and the model tells the user what happened instead of trying another route." |
 | 4 | 0:58-1:18 | `tainttrail explain` | "Every hook event is a node in an embedded Relate graph, one file per project. The rule is a Cypher path query: untrusted content names a host, the call sends to it, and uploads a sensitive file. The path is the explanation." |
 | 5 | 1:18-1:36 | `tainttrail ui`, open the finding, press Run | "The same graph opens in the browser on Relate's WebAssembly build, offline. The query that blocked the call runs again in the page." |
-| 6 | 1:36-1:48 | `tainttrail scan`, then `tainttrail paths` and `tainttrail fix` | "Before anything runs, the same graph maps the agent's tools and finds the combinations that can leak, with the smallest permission change that breaks them." |
-| 7 | 1:48-1:55 | `tainttrail demo all` | "Seventeen attacks modelled on public incidents stopped, ten ordinary workflows untouched. It is a monitor, not a sandbox. The limits are in the README." |
+| 6 | 1:36-1:48 | `tainttrail scan --path examples/agent-config/project --home examples/agent-config/home` with `TAINTTRAIL_DB` pointing at a scratch file, then `tainttrail paths` and `tainttrail fix` | "Before anything runs, the same graph maps the agent's tools and finds the combinations that can leak, with the smallest permission change that breaks them." |
+| 7 | 1:48-1:55 | `tainttrail demo all` | "Seventeen attacks modelled on public incidents and eleven variants stopped; seventy-three of seventy-four ordinary sessions untouched. It is a monitor, not a sandbox. The limits are in the README." |
 
 Notes:
 
@@ -30,5 +34,5 @@ Notes:
   a run.
 - Do not show a real secret, a real token or your home directory. The example store and the
   scenarios contain only canaries and reserved host names.
-- The labelled screenshots in `docs/screenshots` match shots 2, 3, 4 and 7 and can be
-  uploaded to the Devpost gallery as they are.
+- The labelled screenshots in `docs/screenshots` cover every shot and can be uploaded to the
+  Devpost gallery as they are.

@@ -250,7 +250,7 @@ async function planViewer(scene, base, browser) {
     const problems = [];
     page.on('pageerror', (e) => problems.push(String(e)));
     await page.goto(origin, { waitUntil: 'load' });
-    await page.waitForTimeout(2500);
+    await page.waitForSelector('body[data-state="ready"]', { timeout: 30000 });
     let n = 0;
     for (const step of scene.steps) {
       if (step.goto) {
@@ -268,7 +268,8 @@ async function planViewer(scene, base, browser) {
         await page.goto(origin + hash, { waitUntil: 'load' });
         await page.waitForTimeout(1200);
       }
-      if (step.click) { await page.locator(step.click).first().click(); await page.waitForTimeout(900); }
+      if (step.click) { await page.locator(step.click).first().click(); await page.waitForTimeout(600); }
+      if (step.waitFor) await page.waitForSelector(step.waitFor, { timeout: 30000 });
       if (step.scrollTo) {
         await page.locator(step.scrollTo).first().evaluate((el, pad) => window.scrollTo(0, el.getBoundingClientRect().top + window.scrollY - pad), step.pad == null ? 70 : step.pad);
       } else if (step.goto) {
@@ -314,6 +315,8 @@ async function main() {
     report.push(`${stamp(before).slice(3, 8)}  ${((after - before) / 1000).toFixed(1).padStart(5)} s  ${scene.kind.padEnd(8)} ${scene.chapter || scene.title || ''}  ${note}`);
   }
   const total = frames.reduce((a, f) => a + f.ms, 0);
+  const long = [...new Set(frames.map((f) => f.state.caption || ''))].filter((c) => c.length > 200);
+  if (long.length) { await browser.close(); throw new Error(`captions over 200 characters do not fit two lines: ${long.map((c) => c.slice(0, 50)).join(' | ')}`); }
   console.log(report.join('\n'));
   console.log(`total ${(total / 1000).toFixed(1)} s in ${frames.length} frames (limit ${SPEC.maxSeconds} s)`);
   if (total / 1000 > SPEC.maxSeconds) { await browser.close(); throw new Error('the plan is longer than maxSeconds'); }

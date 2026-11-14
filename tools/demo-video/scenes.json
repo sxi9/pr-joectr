@@ -11,7 +11,7 @@
   "scenes": [
     {
       "kind": "title",
-      "seconds": 6,
+      "seconds": 5,
       "kicker": "Relate by Neo4j Hackathon 2026",
       "title": "TaintTrail",
       "text": "An attack-path guard for AI coding agents. It watches the path, not the prompt.",
@@ -92,37 +92,39 @@
         {
           "goto": "finding:TT001",
           "seconds": 6,
-          "caption": "The blocked call as a path: untrusted file, the host it named, the call, the secret it would upload."
+          "caption": "The blocked call as a path: the untrusted file, the host it named, the call, the secret it would upload."
         },
         {
-          "click": "text=Run query",
-          "scrollTo": "text=The Cypher query that found this path",
+          "click": "#run-query",
+          "waitFor": "#run-status.run-ok",
+          "scrollTo": "#run-query",
+          "pad": 420,
           "seconds": 7,
-          "caption": "The query that blocked the call is stored on the finding, and runs again here, in the page."
+          "caption": "The query that blocked the call is stored on the finding. Run again here, in the page, it returns the same path."
         }
       ]
     },
     {
       "kind": "terminal",
-      "seconds": 14,
+      "seconds": 13,
       "chapter": "Before anything runs",
       "where": "tainttrail fix — after tainttrail scan mapped the sample configuration in examples/agent-config",
       "setup": "rm -f {tmp}/tt-demo-agent-config.rl* && TAINTTRAIL_KEY=demo-video-fixed-key TAINTTRAIL_DB={tmp}/tt-demo-agent-config.rl {python} -m tainttrail scan --path examples/agent-config/project --home examples/agent-config/home",
       "command": "TAINTTRAIL_KEY=demo-video-fixed-key TAINTTRAIL_DB={tmp}/tt-demo-agent-config.rl {python} -m tainttrail fix",
       "show": "tainttrail fix",
       "highlight": "open paths|breaks [0-9,]+ of",
-      "caption": "The same graph also maps what an agent is configured with: 4 MCP servers, 161 tools. The fix is the smallest permission change that breaks every open path, rehearsed in a transaction and rolled back."
+      "caption": "Before anything runs, the same graph maps the agent's tools. The fix is the smallest permission change that breaks every open path, rehearsed in a Relate transaction and rolled back."
     },
     {
       "kind": "terminal",
-      "seconds": 9,
+      "seconds": 10,
       "chapter": "Results",
-      "where": "tainttrail demo all — 30 replayable scenarios, canary secrets, reserved hosts",
+      "where": "tainttrail demo all: 105 replayed scenarios, canary secrets, reserved hosts",
       "command": "TAINTTRAIL_KEY=demo-video-fixed-key {python} -m tainttrail demo all",
       "show": "tainttrail demo all",
-      "tail": 22,
-      "highlight": "attacks|ordinary|leaked",
-      "caption": "Seventeen attacks modelled on public incidents are stopped. Ten ordinary workflows are untouched."
+      "tail": 19,
+      "highlight": "attacks stopped|attack variants|ordinary|canary secrets",
+      "caption": "17 attacks modelled on public incidents and 11 variants are stopped. 73 of 74 ordinary sessions run without a single question, and no canary secret leaves."
     },
     {
       "kind": "title",
