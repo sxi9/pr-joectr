@@ -78,7 +78,7 @@ def latest_session(store: Store) -> str | None:
 
 
 def export_graph(store: Store, *, session_id: str | None = None, chunks: str = "linked",
-                 keep_paths: bool = False, project: str = "") -> dict[str, Any]:
+                 keep_paths: bool = False, project: str = "", root: str | os.PathLike[str] | None = None) -> dict[str, Any]:
     """The whole graph, or one session with everything needed to explain it.
 
     ``chunks="linked"`` leaves out fingerprints no tool call ever carried; they are most
@@ -141,19 +141,26 @@ def export_graph(store: Store, *, session_id: str | None = None, chunks: str = "
         "nodes": nodes,
         "rels": rels,
     }
-    return export if keep_paths else _hide_home(export)
-
-
-def _hide_home(export: dict[str, Any]) -> dict[str, Any]:
-    """Write the home directory as ``~`` everywhere, ids included, so ids still match."""
-    home = Path.home().as_posix().rstrip("/")
-    if not home or home == "/":
+    if keep_paths:
         return export
-    pattern = re.compile(re.escape(home) + r"(?=/|$|[\"'\s:])")
+    if root is not None:
+        export = _rewrite_prefix(export, Path(root).as_posix().rstrip("/"), "/project")
+    return _rewrite_prefix(export, Path.home().as_posix().rstrip("/"), "~")
+
+
+def _rewrite_prefix(export: dict[str, Any], prefix: str, replacement: str) -> dict[str, Any]:
+    """Write a directory prefix as something shorter everywhere, ids included, so ids still match.
+
+    An export is meant to be handed to someone else: the project directory becomes
+    ``/project`` and the home directory ``~``, which also keeps a user name out of it.
+    """
+    if not prefix or prefix == "/":
+        return export
+    pattern = re.compile(re.escape(prefix) + r"(?=/|$|[\"'\s:,)\]}])")
 
     def walk(value: Any) -> Any:
         if isinstance(value, str):
-            return pattern.sub("~", value) if home in value else value
+            return pattern.sub(replacement, value) if prefix in value else value
         if isinstance(value, list):
             return [walk(v) for v in value]
         if isinstance(value, dict):
@@ -267,7 +274,7 @@ def add_export_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--all-chunks", action="store_true",
                         help="keep every content fingerprint, not only those a tool call carried")
     parser.add_argument("--keep-paths", action="store_true",
-                        help="keep absolute paths instead of writing the home directory as ~")
+                        help="keep absolute paths instead of writing the project as /project and the home directory as ~")
 
 
 def cmd_export(args: argparse.Namespace, cfg: Config) -> int:
@@ -287,7 +294,7 @@ def cmd_export(args: argparse.Namespace, cfg: Config) -> int:
                     print("tainttrail export: no sessions recorded yet", file=sys.stderr)
                     return 1
             export = export_graph(store, session_id=session, chunks="all" if args.all_chunks else "linked",
-                                  keep_paths=args.keep_paths, project=cfg.root.name)
+                                  keep_paths=args.keep_paths, project=cfg.root.name, root=cfg.root)
     except StoreMissing as exc:
         print(f"tainttrail export: {exc}", file=sys.stderr)
         return 1

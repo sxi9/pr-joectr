@@ -279,6 +279,8 @@ def cmd_demo(args: argparse.Namespace, cfg: Config) -> int:
         _out()
         _out("Run one with `tainttrail demo run a02`. Add --no-guard to see it without enforcement, --compare for both.")
         return 0
+    if args.action == "all":
+        return _demo_all(args, color)
     if not args.scenario:
         _err("which scenario? `tainttrail demo list` shows them")
         return 2
@@ -326,6 +328,61 @@ def cmd_demo(args: argparse.Namespace, cfg: Config) -> int:
         else:
             shutil.rmtree(base, ignore_errors=True)
     return status
+
+
+def _demo_all(args: argparse.Namespace, color: bool) -> int:
+    """Replay every scenario and print one line each: the suite as a table."""
+    from . import scenarios
+
+    rows = []
+    base = Path(tempfile.mkdtemp(prefix="tainttrail-demo-"))
+    try:
+        for i, sc in enumerate(scenarios.list_scenarios()):
+            rows.append((sc, scenarios.replay(sc, base / f"p{i}", guard=not args.no_guard)))
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+    if args.json:
+        _out(json.dumps([{"id": sc["id"], "group": sc["group"], "title": sc["title"], "ok": r.ok,
+                          "blocked_at": r.blocked_at, "asked_at": r.asked_at, "leaked": len(r.leaked),
+                          "rules": sorted({x for s in r.steps for x in s.rules}), "ms": r.elapsed_ms}
+                         for sc, r in rows], indent=1))
+        return 0 if all(r.ok for _, r in rows) else 1
+    headings = {"attack": "Attacks", "benign": "Ordinary work", "known_gaps": "Harder cases"}
+    last = None
+    for sc, r in rows:
+        if sc["group"] != last:
+            last = sc["group"]
+            _out(report.paint(f"{headings[last]:<62} outcome", "bold", color=color))
+        rules = " ".join(sorted({x for s in r.steps for x in s.rules}))
+        if r.leaked:
+            outcome = report.paint(f"LEAKED {len(r.leaked)}", "bright_red", "bold", color=color)
+        elif r.blocked_at is not None:
+            outcome = report.paint("denied ", "bright_red", "bold", color=color) + rules
+        elif r.asked_at:
+            outcome = report.paint("asked  ", "bright_yellow", "bold", color=color) + rules
+        else:
+            outcome = report.paint("untouched", "green", color=color)
+        flag = "" if r.ok or args.no_guard else report.paint("  (not as expected)", "bright_red", color=color)
+        title = sc["title"] if len(sc["title"]) <= 55 else sc["title"][:54] + "…"
+        _out(f"  {sc['id'].split('-', 1)[0]:5s} {title:<55} {outcome}{flag}")
+    attacks = [r for sc, r in rows if sc["group"] == "attack"]
+    benign = [r for sc, r in rows if sc["group"] == "benign"]
+    gaps = [r for sc, r in rows if sc["group"] == "known_gaps"]
+    _out()
+    if args.no_guard:
+        leaked = sum(len(r.leaked) for _, r in rows)
+        _out(f"Monitor mode: nothing was stopped. {leaked} canary secrets left the machine across {len(rows)} scenarios.")
+        return 0
+    stopped = sum(1 for r in attacks if not r.leaked and (r.blocked_at is not None or r.asked_at))
+    _out(f"attacks stopped or put to the user   {stopped} of {len(attacks)}   "
+         f"({sum(1 for r in attacks if r.blocked_at is not None)} denied outright)")
+    _out(f"ordinary work left untouched         {sum(1 for r in benign if all(s.action == 'allow' for s in r.steps))} of {len(benign)}")
+    _out(f"harder cases put to the user         {sum(1 for r in gaps if not r.leaked and (r.asked_at or r.blocked_at is not None))} of {len(gaps)}")
+    _out(f"canary secrets that left             {sum(len(r.leaked) for _, r in rows)}")
+    per_event = statistics.median(r.elapsed_ms / max(1, 2 * sum(1 for s in r.steps if s.kind == 'tool') + 2) for _, r in rows)
+    _out(report.paint(f"{len(rows)} scenarios replayed through the Claude Code hook adapter, {per_event:.0f} ms per hook event in process",
+                      "dim", color=color))
+    return 0 if all(r.ok for _, r in rows) else 1
 
 
 def _verdict(result: Any, guard: bool, color: bool) -> str:
@@ -505,8 +562,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_trust)
 
     p = sub.add_parser("demo", help="replay a scripted attack or a benign workflow through the guard")
-    p.add_argument("action", choices=("list", "run"))
+    p.add_argument("action", choices=("list", "run", "all"),
+                   help="list the scenarios, run one, or replay all of them as a table")
     p.add_argument("scenario", nargs="?")
+    p.add_argument("--json", action="store_true", help="with `all`: machine-readable results")
     p.add_argument("--no-guard", action="store_true", help="monitor mode: record, stop nothing")
     p.add_argument("--compare", action="store_true", help="run without the guard, then with it")
     p.add_argument("--keep", metavar="DIR", help="keep the replayed project (and its graph) in DIR")

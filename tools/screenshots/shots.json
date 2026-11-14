@@ -2,31 +2,56 @@
   "shots": [
     {
       "id": "01",
-      "name": "core-tests",
+      "name": "without-and-with-the-guard",
       "kind": "terminal",
-      "label": "Core package: graph store, schema and config tests pass",
-      "note": "The store wrapper queues parallel hook processes on one Relate .rl file; six processes writing at once lose nothing.",
-      "command": "{python} -m pytest tests/test_core.py -v --color=yes -p no:cacheprovider 2>&1 | sed -e 's#{root}/##g'",
-      "show": "pytest tests/test_core.py -v",
-      "tail": 30
+      "label": "The same scripted attack, without the guard and with it",
+      "note": "Scenario a02: a web page tells the agent to POST .env. The replay sends real Claude Code hook payloads through the adapter. Without the guard three canary secrets leave; with it the upload is denied.",
+      "command": "TAINTTRAIL_KEY=shots {python} -m tainttrail demo run a02 --compare --brief",
+      "show": "tainttrail demo run a02 --compare --brief"
     },
     {
       "id": "02",
-      "name": "session-timeline",
+      "name": "real-claude-code-session",
       "kind": "terminal",
-      "label": "Session timeline: what entered the agent's context and what was decided",
-      "note": "Scripted session (hand-built events, before the analyzers were wired in): a poisoned web page, a read of .env, then a curl to the attacker's host. The third call is denied.",
-      "command": "{python} tools/screenshots/preview_attack.py timeline",
-      "show": "tainttrail log   (preview from a scripted session)"
+      "label": "A real Claude Code session: the hook denies the upload and the model reports it",
+      "note": "Not scripted. Claude Code 2.1.325 (headless) read a vendored file with a hidden instruction, read .env, tried the command, and was denied by the PreToolUse hook. Below the timeline is what the model told the user. The recorded store is examples/claude-code-session/graph.rl.",
+      "command": "TAINTTRAIL_DB=examples/claude-code-session/graph.rl {python} -m tainttrail log && echo && echo \"Claude's reply to the user:\" && echo && fold -s -w 104 examples/claude-code-session/claude-answer.txt",
+      "show": "tainttrail log    (store: examples/claude-code-session/graph.rl)"
     },
     {
       "id": "03",
       "name": "attack-path",
       "kind": "terminal",
       "label": "The blocked call, its attack path, and the Cypher query that found it",
-      "note": "Rule TT001. The path runs from the untrusted page to the attacker's host, to the call, to a keyed fingerprint of a secret, to the contents of .env. The graph stores the fingerprint, never the secret.",
-      "command": "{python} tools/screenshots/preview_attack.py finding",
-      "show": "tainttrail explain last   (preview from a scripted session)"
+      "note": "Rule TT001 on the real session. The path runs from the untrusted file to the host it named, to the call, to the sensitive file the call would upload. The query is stored on the finding and can be re-run against the store.",
+      "command": "TAINTTRAIL_DB=examples/claude-code-session/graph.rl {python} -m tainttrail explain TT001",
+      "show": "tainttrail explain TT001    (store: examples/claude-code-session/graph.rl)"
+    },
+    {
+      "id": "04",
+      "name": "scenario-matrix",
+      "kind": "terminal",
+      "label": "All 30 scenarios: 17 attacks, 10 ordinary workflows, 3 harder cases",
+      "note": "Attack scenarios are modelled on public incident reports. Every secret is a canary and every host is reserved; replay contacts nothing.",
+      "command": "TAINTTRAIL_KEY=shots {python} -m tainttrail demo all",
+      "show": "tainttrail demo all"
+    },
+    {
+      "id": "05",
+      "name": "doctor",
+      "kind": "terminal",
+      "label": "Installation check and measured hook latency",
+      "command": "cd {tmp} && rm -rf tt-shot-doctor && mkdir tt-shot-doctor && cd tt-shot-doctor && git init -q . && TAINTTRAIL_KEY=shots {python} -m tainttrail init >/dev/null && TAINTTRAIL_KEY=shots {python} -m tainttrail doctor | sed -e 's#{root}#<repo>#g' -e 's#/tmp/[^ ]*tt-shot-doctor#<project>#g'",
+      "show": "tainttrail init && tainttrail doctor"
+    },
+    {
+      "id": "06",
+      "name": "test-suite",
+      "kind": "terminal",
+      "label": "Test suite",
+      "command": "{python} -m pytest -q -p no:cacheprovider 2>&1 | tail -8",
+      "show": "pytest -q",
+      "timeout": 400
     }
   ]
 }
