@@ -355,6 +355,10 @@ break it, each with one concern, and their findings were fixed and turned into t
 - **Secrecy.** 12 ways for a secret value or a credential-bearing URL to reach the graph,
   the log or the guard's own output. All closed; a test replays every scenario and searches
   the graph for the canaries in plain, encoded and hex form.
+- **Whether those fixes opened holes.** They had: a second reviewer showed that two of them
+  let whoever wrote a web page choose which output the guard ignored and which parts of a
+  later call it blanked, enough to get a download-and-run or a write to the guard's own
+  config past it. Both are closed, and each case is a test.
 - **The scanner.** Ways for a repository's configuration to hide a server or a path from
   the map (fields that only other clients read, rules the agent ignores, look-alike hosts),
   secrets in stored command lines, and writes through symbolic links. Fixed.
@@ -391,6 +395,13 @@ Known gaps, three of which are in the suite (`tainttrail demo all --full`):
 - **The scanner reads configuration files.** Servers that a plugin or a claude.ai connector
   provides join the map only after a recorded session used them, and an allow rule that
   runs the project's own scripts is not counted as a way out.
+- **Redaction goes by shape.** Tokens, keys, credentials in URLs and passwords in the
+  well-known options of common tools are replaced before anything is stored. A password
+  that does not look random and is typed as a plain argument or in prose is stored in the
+  call's summary as typed.
+- **The fingerprint key.** Each project gets a random key in `.tainttrail/key`. Setting
+  `TAINTTRAIL_KEY` instead is meant for tests and demos: whoever can guess that key can
+  test guesses of a secret against an exported graph.
 - **Smaller things.** `tainttrail status` cannot see hooks registered by the plugin. The
   viewer was checked in Chromium only. Everything was built and tested on Linux; the code
   has paths for macOS and Windows that have not been run.

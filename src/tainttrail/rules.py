@@ -147,8 +147,9 @@ WHERE u.session_id = c.session_id AND u.seq < c.seq
     MATCH (t:Content)-[tm:MENTIONS]->(f)
     WHERE t.session_id = c.session_id AND t.seq < c.seq AND coalesce(t.untrusted, false) = false
       AND NOT coalesce(tm.weak, false)
-      AND NOT EXISTS { MATCH (u2:Content {untrusted: true})-[:MENTIONS]->(f)
-                       WHERE u2.session_id = c.session_id AND u2.seq < t.seq }
+      AND (t.origin = 'user' OR coalesce(t.preexisting, false)
+           OR NOT EXISTS { MATCH (u2:Content {untrusted: true})-[:MENTIONS]->(f)
+                           WHERE u2.session_id = c.session_id AND u2.seq < t.seq })
   }
 RETURN p
 ORDER BY u.seq
@@ -261,8 +262,9 @@ RETURN DISTINCT d.id AS id, d.kind AS kind, d.value AS value, d.name AS name, co
   EXISTS { MATCH (t:Content)-[tm:MENTIONS]->(d)
            WHERE t.session_id = c.session_id AND t.seq < c.seq AND coalesce(t.untrusted, false) = false
              AND NOT coalesce(tm.weak, false)
-             AND NOT EXISTS { MATCH (u2:Content {untrusted: true})-[:MENTIONS]->(d)
-                              WHERE u2.session_id = c.session_id AND u2.seq < t.seq } } AS by_trusted,
+             AND (coalesce(t.preexisting, false)
+                  OR NOT EXISTS { MATCH (u2:Content {untrusted: true})-[:MENTIONS]->(d)
+                                  WHERE u2.session_id = c.session_id AND u2.seq < t.seq }) } AS by_trusted,
   EXISTS { MATCH (q:Content {origin: 'user'})-[:MENTIONS]->(d)
            WHERE q.session_id = c.session_id AND q.seq < c.seq } AS by_user
 ORDER BY id
@@ -550,6 +552,10 @@ class _Eval:
         final = self.cfg.rule_action(rule_id, action) if self.cfg is not None else action
         if final == "off":
             return None
+        # Whatever built them, a title and an explanation are one line each: a name with a line
+        # break in it must not start a paragraph of its own in what the model is told.
+        title = " ".join("".join(ch if ch.isprintable() else " " for ch in title).split())
+        explanation = " ".join("".join(ch if ch.isprintable() else " " for ch in explanation).split())
         return Finding(
             rule=rule.id, name=rule.name, severity=severity or rule.severity, action=final,
             title=title, explanation=explanation, path=path,
@@ -571,8 +577,9 @@ class _Eval:
               EXISTS { MATCH (t:Content)-[tm:MENTIONS]->(d)
                        WHERE t.session_id = c.session_id AND t.seq < c.seq AND coalesce(t.untrusted, false) = false
                          AND NOT coalesce(tm.weak, false)
-                         AND NOT EXISTS { MATCH (u2:Content {untrusted: true})-[:MENTIONS]->(d)
-                                          WHERE u2.session_id = c.session_id AND u2.seq < t.seq } } AS by_trusted,
+                         AND (coalesce(t.preexisting, false)
+                              OR NOT EXISTS { MATCH (u2:Content {untrusted: true})-[:MENTIONS]->(d)
+                                              WHERE u2.session_id = c.session_id AND u2.seq < t.seq }) } AS by_trusted,
               EXISTS { MATCH (q:Content {origin: 'user'})-[:MENTIONS]->(d)
                        WHERE q.session_id = c.session_id AND q.seq < c.seq } AS by_user
             """,
@@ -745,7 +752,7 @@ class _Eval:
         row = self.store.one(CYPHER["TT011"].strip(), {"call": self.call_id})
         if not row:
             return []
-        p_name, q_name = row["p"]["props"].get("value"), row["q"]["props"].get("value")
+        p_name, q_name = _name(row["p"]["props"].get("value")), _name(row["q"]["props"].get("value"))
         path = [
             self.step(S.CONTENT, row["u"]["id"], rel="in the same session", role="untrusted"),
             self.step(S.TOOL_CALL, row["r"]["id"], rel=S.READS, forward=True),
@@ -918,7 +925,7 @@ class _Eval:
 
     def _committed_egress(self, primary, committed, dest_name) -> Finding | None:
         """A push after a copy of a sensitive file was written or staged in this session."""
-        top = committed[0]
+        top = {**committed[0], "name": _name(committed[0]["name"])}
         path = [self.step(S.ENTITY, top["source"], rel=S.DERIVED_FROM, forward=False, role="sensitive")] if top.get("source") else []
         path += [
             self.step(S.ENTITY, top["id"], rel=S.WRITES, forward=False, role="sensitive"),
@@ -973,6 +980,7 @@ class _Eval:
             return []
         out: list[Finding] = []
         for w in self.store.run(_Q_PROTECTED_WRITES, {"call": self.call_id}):
+            w = {**w, "name": _name(w["name"])}
             if self._is_guard_file(w["path"]):
                 kind = self._settings_change(w["path"])
                 if kind in ("guard", "permissions"):
@@ -1205,7 +1213,7 @@ class _Eval:
         action = "deny" if self.untrusted_in_session else "ask"
         if targets:
             path, query, params = self.run_path("TT010", dest=targets[0].id)
-            what = f"change {targets[0].name}"
+            what = f"change {_name(targets[0].name)}"
         else:
             path, query, params = [self.step(S.TOOL_CALL, self.call_id)], "", {}
             what = "switch the guard off"
@@ -1312,7 +1320,7 @@ def _describe_payload(carried: list[dict[str, Any]], uploaded: list[dict[str, An
     if uploaded:
         names = []
         for u in uploaded:
-            name = u["name"] or u["id"]
+            name = _name(u["name"] or u["id"])
             if u.get("kind") == "env":
                 names.append("the process environment" if name == "*" else f"${name}")
             else:

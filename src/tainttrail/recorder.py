@@ -353,19 +353,31 @@ class Recorder:
         would make the graph of an incident (the one people export and share) a copy of the secret
         it stopped.
         """
+        # Only what sensitive content that is NOT untrusted holds: whoever wrote a web page or a
+        # vendored README must not get to choose which parts of a later call the guard blanks.
         rows = self.store.run(
-            "UNWIND $ids AS id MATCH (k:Chunk {id: id}) WHERE k.kind IN ['secret', 'token'] RETURN k.id AS id",
+            "UNWIND $ids AS id MATCH (k:Chunk {id: id}) WHERE k.kind IN ['secret', 'token'] "
+            "AND EXISTS { MATCH (p:Content {sensitive: true})-[:HAS_CHUNK]->(k) WHERE coalesce(p.untrusted, false) = false } "
+            "RETURN k.id AS id",
             {"ids": list(pieces)},
         )
         found = sorted({pieces[r["id"]] for r in rows if len(pieces[r["id"]]) >= 6}, key=len, reverse=True)
         if not found:
             return
         pattern = re.compile("|".join(re.escape(piece) for piece in found), re.I)
+        from .extract import _B64_RUN, _HEX_RUN, decode_variants
+
+        def encoded(m: "re.Match[str]") -> str:
+            # hex or base64 of a matched secret is one command away from the secret
+            return "«secret»" if any(pattern.search(v) for v in decode_variants(m.group(0))) else m.group(0)
 
         def clean(text: str) -> str:
-            return pattern.sub("«secret»", text)
+            text = pattern.sub("«secret»", text)
+            return _B64_RUN.sub(encoded, _HEX_RUN.sub(encoded, text))
 
         def safe(ref: EntityRef) -> EntityRef:
+            if ref.kind == "file":
+                return ref      # what a path is (a guard file, a protected file) is decided by its name
             value = clean(ref.value)
             return ref if value == ref.value else EntityRef(ref.kind, value)
 
@@ -610,7 +622,7 @@ class Recorder:
                 "untrusted": bool(a.untrusted), "sensitive": bool(a.sensitive),
                 "reasons": [str(r) for r in a.reasons], "injection_score": float(a.injection_score),
                 "injection_markers": [str(m) for m in a.injection_markers],
-                "bytes": int(a.text_bytes), "sha": a.sha,
+                "bytes": int(a.text_bytes), "sha": a.sha, "preexisting": bool(getattr(a, "preexisting", False)),
                 # Sensitive text is never excerpted; the keyed hash is all that is kept.
                 "excerpt": "" if a.sensitive else a.excerpt[:400],
             }},

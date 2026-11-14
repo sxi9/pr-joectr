@@ -330,3 +330,31 @@ def test_everything_is_fast_on_a_large_document():
     x.find_secrets("=" * 50_000 + "password=" + "x" * 50_000)
     x.injection_score("ignore " * 30_000)
     assert time.perf_counter() - start < 4.0
+
+
+@pytest.mark.parametrize("command, kept", [
+    ("mysql -u app -pWinter2024rain -h db.example.test app", "mysql -u app -p«password» -h db.example.test app"),
+    ("sshpass -p Winter2024rain ssh deploy@files.example.test", "sshpass -p «password» ssh deploy@files.example.test"),
+    ("docker login -u ci -p Winter2024rain registry.example.test", "docker login -u ci -p «password» registry.example.test"),
+    ("redis-cli -h cache.example.test -a Winter2024rain ping", "redis-cli -h cache.example.test -a «password» ping"),
+    ("zip -P Winter2024rain out.zip notes.txt", "zip -P «password» out.zip notes.txt"),
+    ("git clone https://Winter2024rain@git.example.test/acme/app.git", "git clone https://«token»@git.example.test/acme/app.git"),
+    ("rsync -a ./build/ deploy:Spring2024bud@files.example.test::site/", "rsync -a ./build/ deploy:«password»@files.example.test::site/"),
+])
+def test_a_password_in_a_well_known_option_is_redacted_whatever_it_looks_like(command, kept):
+    assert x.redact(command) == kept
+
+
+@pytest.mark.parametrize("command", [
+    "mysql -u app -p -h db.example.test", "unzip -p archive.zip file.txt", "ssh://git@github.com/owner/repo",
+    "git clone git@github.com:owner/repo.git", "scp file.txt user@host.example.test:/tmp", "mailto:john@example.com",
+    "docker pull ghcr.io/owner/img:1.2@sha256:aaaa", "pip install -e .", "zip -r out.zip dir",
+])
+def test_options_that_only_look_like_password_options_are_left_alone(command):
+    assert x.redact(command) == command
+
+
+def test_a_login_without_a_scheme_is_not_an_email_address():
+    found = {(e.kind, e.value) for e in x.extract_entities("rsync -a ./build/ deploy:Spring2024bud@files.example.test::site/", cwd="/p")}
+    assert ("host", "files.example.test") in found
+    assert not any("spring2024bud" in value.lower() for _, value in found)

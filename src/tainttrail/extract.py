@@ -136,6 +136,13 @@ def _safe_part(part: str, key: bytes) -> str:
     return part
 
 
+# user:password@host with no scheme in front (rsync, scp, a database argument, docker-compose).
+# Group 1 is the password.
+_BARE_USERINFO = re.compile(
+    r"(?<![\w./:@-])(?!(?:mailto|sip|xmpp|tel):)[A-Za-z0-9._-]{1,64}:([^\s@:/]{3,128})@"
+    r"(?=(?:[A-Za-z0-9-]{1,63}\.){1,8}[A-Za-z]{2,24}|localhost\b|\d{1,3}(?:\.\d{1,3}){3})")
+
+
 def safe_entity(ref: EntityRef, key: bytes) -> EntityRef:
     """The entity with nothing credential-like in its value.
 
@@ -157,6 +164,10 @@ def safe_entity(ref: EntityRef, key: bytes) -> EntityRef:
     elif ref.kind == "file":
         value = "/".join(seg if not (len(seg) >= 16 and find_secrets(seg)) else f"«{fingerprint(seg, key)[:10]}»"
                          for seg in value.split("/"))
+        # an rsync or scp operand, segment by segment: deploy:password@host::module/
+        value = "/".join(_BARE_USERINFO.sub(
+            lambda m: m.group(0)[:m.start(1) - m.start()] + f"«{fingerprint(m.group(1), key)[:10]}»@", seg)
+            for seg in value.split("/"))
     elif ref.kind == "email":
         local, at, domain = value.partition("@")
         value = f"{_safe_part(local, key)}{at}{domain}"
@@ -270,6 +281,8 @@ def extract_entities(text: str, *, cwd: str | None = None, limit: int = 200, max
         add(EntityRef("host", m.group(1).lower()))
     masked = _SCP_REPO.sub(lambda m: " " * len(m.group(0)), masked)
 
+    # "deploy:password@files.example.test" is a login, not the e-mail address password@files.example.test
+    masked = _BARE_USERINFO.sub(lambda m: " " * len(m.group(0)), masked)
     for m in _EMAIL.finditer(masked):
         add(EntityRef("email", m.group(1).lower()))
     masked = _EMAIL.sub(lambda m: " " * len(m.group(0)), masked)
@@ -489,6 +502,18 @@ _REDACT_ONLY: tuple[tuple[str, "re.Pattern[str]"], ...] = (
     ("secret", re.compile(
         r"(?i)[?&](?:key|api_?key|sig|signature|code|pass|password|auth|token|access_token|secret|client_secret)=([^&\s\"'`#]{4,})")),
     ("secret", re.compile(r"(?i)[\"'](?:pass|key|passphrase|pwd)[\"']\s*:\s*[\"']([^\"']{4,})[\"']")),
+    ("password", _BARE_USERINFO),
+    # Programs that take a password in a one-letter option. The value need not look random to be one.
+    ("password", re.compile(r"(?<![\w-])(?:mysql|mariadb|mysqldump|mysqladmin|mycli)\b[^\n|;&]{0,200}?\s-p([^\s\"'-][^\s\"']{2,})")),
+    ("password", re.compile(r"(?<![\w-])sshpass\s+-p\s*[\"']?([^\s\"']{3,})")),
+    ("password", re.compile(r"(?<![\w-])(?:docker|podman|helm\s+registry)\s+login\b[^\n|;&]{0,200}?\s-p[ =]*[\"']?([^\s\"']{3,})")),
+    ("password", re.compile(r"(?<![\w-])redis-cli\b[^\n|;&]{0,200}?\s-a\s+[\"']?([^\s\"']{3,})")),
+    ("password", re.compile(r"(?<![\w-])(?:zip|unzip)\b[^\n|;&]{0,200}?\s-P\s*[\"']?([^\s\"']{3,})")),
+    ("password", re.compile(r"(?<![\w-])7z[ar]?\b[^\n|;&]{0,200}?\s-p([^\s\"']{3,})")),
+    ("password", re.compile(r"(?<![\w-])openssl\b[^\n|;&]{0,300}?\s-(?:k|pass(?:in|out)?)\s+(?:pass:)?[\"']?([^\s\"']{3,})")),
+    ("password", re.compile(r"(?<![\w-])htpasswd\s+-[A-Za-z]{0,6}b[A-Za-z]{0,6}\s+\S{1,200}\s+\S{1,100}\s+[\"']?([^\s\"']{3,})")),
+    # scheme://token@host: a login with nothing after it is usually a token
+    ("token", re.compile(r"(?i)\b[a-z][a-z0-9+.-]{1,20}://(?!(?:git|hg|svn|anonymous|user|root|admin)@)([^\s/@:\"']{6,200})@")),
 )
 _LONG_TOKEN = re.compile(r"[A-Za-z0-9+=_-]{20,}")
 _LONG_HEX = re.compile(r"[0-9A-Fa-f]{32,}")

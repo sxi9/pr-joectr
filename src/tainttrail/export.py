@@ -350,6 +350,7 @@ def cmd_export(args: argparse.Namespace, cfg: Config) -> int:
             try:
                 # An export holds every command line, URL and excerpt of a session: owner only.
                 fd = os.open(args.out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                os.fchmod(fd, 0o600)      # an existing file keeps its old mode otherwise
                 with os.fdopen(fd, "w", encoding="utf-8") as fh:
                     fh.write(text)
             except OSError as exc:

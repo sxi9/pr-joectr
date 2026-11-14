@@ -132,6 +132,7 @@ class ContentAnalysis:
     source: EntityRef | None = None         # the file, URL or object it came from
     mentions: list[EntityRef] = field(default_factory=list)
     chunks: list[ChunkRef] = field(default_factory=list)
+    preexisting: bool = False               # read from a file last modified before the session began
 
 
 # -- what the guard concludes ---------------------------------------------------------------

@@ -119,6 +119,9 @@ def cmd_status(args: argparse.Namespace, cfg: Config) -> int:
     _out(f"mode         {cfg.mode}" + ("  (fail closed)" if cfg.fail_closed else ""))
     if cfg.config_error:
         _out("config       " + report.paint(cfg.config_error, "bright_red", "bold", color=color))
+    elif os.environ.get("TAINTTRAIL_KEY"):
+        _out("key          from TAINTTRAIL_KEY. That is for tests and demos: whoever can guess the key can test guesses "
+             "of a secret against an export")
     hooks = ", ".join(registered) if registered else report.paint("not registered: run `tainttrail init`", "yellow", color=color)
     _out(f"hooks        {hooks}")
     if not info.get("nodes"):

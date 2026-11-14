@@ -76,9 +76,24 @@ class Config:
 
     def is_sensitive_path(self, path: str | os.PathLike[str]) -> bool:
         p = normalize_path(path, self.root)
+        if self._is_own_secret(p):
+            return True
         if _matches_any(p, self.sensitive_path_exceptions):
             return False
         return _matches_any(p, self.sensitive_paths)
+
+    def _is_own_secret(self, p: str) -> bool:
+        """The guard's key, its graph and its archive, wherever TAINTTRAIL_HOME and TAINTTRAIL_DB put them."""
+        try:
+            if p == normalize_path(self.db_path, self.root):
+                return True
+            home = normalize_path(self.home, self.root).rstrip("/")
+        except (OSError, ValueError):
+            return False
+        if not home or not p.startswith(home + "/"):
+            return False
+        rest = p[len(home) + 1:]
+        return rest == "key" or rest.endswith(".rl") or rest.startswith("archive/")
 
     def is_protected_path(self, path: str | os.PathLike[str]) -> bool:
         return _matches_any(normalize_path(path, self.root), self.protected_paths)

@@ -178,6 +178,7 @@ def _log(cfg: Config | None, record: dict[str, Any]) -> None:
     try:
         cfg.home.mkdir(mode=0o700, parents=True, exist_ok=True)
         fd = os.open(cfg.log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        os.fchmod(fd, 0o600)              # a log an earlier version created as 0644 keeps that mode otherwise
         with os.fdopen(fd, "a", encoding="utf-8") as fh:
             fh.write(json.dumps({"ts": int(time.time() * 1000), **record}) + "\n")
     except OSError:

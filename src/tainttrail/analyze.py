@@ -689,10 +689,12 @@ def analyze_result(tool_name: str, tool_input: dict, tool_response: Any, call: C
             a.source = fetched[0]
         elif len(reads) == 1 and not fetched:
             a.source = reads[0]
-        if "tainttrail" in ba.programs or _OWN_COMMAND.search(str(tool_input.get("command") or "")):
+        if not a.untrusted and ("tainttrail" in ba.programs or _OWN_COMMAND.search(str(tool_input.get("command") or ""))):
             # What the guard itself prints (explain, log, query) repeats hosts and links from the
-            # graph. It names nothing: no mention, no fingerprint.
-            a.mentions, a.chunks = [], []
+            # graph. It names nothing. Only the mentions go, and only for output that is not
+            # untrusted: `curl page ; tainttrail status` must not un-name what the page named, and
+            # `cat .env && tainttrail status` must keep the fingerprints of .env.
+            a.mentions = []
     is_memory_file = a.source is not None and a.source.kind == "file" and is_instruction_file(a.source.value)
     if has_text and a.injection_score >= 0.5 and not a.untrusted and not is_memory_file:
         # Text addressed to the agent inside a "trusted" file or tool result is the attack

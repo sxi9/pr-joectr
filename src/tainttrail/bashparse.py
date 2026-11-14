@@ -1840,7 +1840,7 @@ def analyze_bash(command: str, cwd: str | None = None) -> BashAnalysis:
         _add(out.opaque_reasons, f"the command is {len(command):,} characters long, too long to analyse")
         for url in _URL.findall(command)[:50]:
             _add(out.destinations, ("url", url.rstrip(".,)'\"")))
-        out.summary = " ".join(command[:400].split())[:200]
+        out.summary = " ".join(command[:8192].split())[:4096]
         return out
     try:
         out = _analyze(command, cwd, 0)
@@ -1858,7 +1858,8 @@ def analyze_bash(command: str, cwd: str | None = None) -> BashAnalysis:
             out.is_sink = True
             _add(out.sink_kinds, "opaque")
             out.carries_payload = True
-    out.summary = " ".join(command.split())[:200]
+    # Long enough that the cut cannot fall inside a credential before the caller has redacted it.
+    out.summary = " ".join(command.split())[:4096]
     # Authentication only: no other command, assignment or here-string of the line touches the variable.
     out.env_auth = [n for n in out.env_auth if n not in out.env_data]
     out.plain_get = out.net_cmds > 0 and out.net_cmds == out.plain_cmds and not out.opaque

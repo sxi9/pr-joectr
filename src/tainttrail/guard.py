@@ -134,6 +134,19 @@ class Guard:
             event.tool_name, event.tool_input, event.tool_response, call, self.cfg,
             cwd=cwd, tainted_sources=rec.tainted_sources(read_files),
         )
+        if (event.tool_name in ("Read", "NotebookRead") and not content.untrusted and content.source is not None
+                and content.source.kind == "file"):
+            # A file nobody touched since before the session began cannot be repeating what the
+            # session read: what it names, the project named independently.
+            started = store.scalar("MATCH (s:Session {id: $id}) RETURN s.started_at", {"id": event.session_id})
+            wrote = store.scalar("MATCH (w:ToolCall {session_id: $sid})-[:WRITES]->(f:Entity {id: $fid}) RETURN count(w)",
+                                 {"sid": event.session_id, "fid": content.source.id}, 0)
+            try:
+                # whole milliseconds on both sides: a file written in the very millisecond the session began
+                # was still written before any tool call of it
+                content.preexisting = bool(started) and not wrote and int(os.stat(content.source.value).st_mtime * 1000) <= started
+            except OSError:
+                content.preexisting = False
         content_id = rec.record_result(event, call_id, content)
         findings = rules.evaluate_post(store, self.cfg, call_id, content_id, content)
         rec.record_findings(findings)
