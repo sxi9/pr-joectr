@@ -9,7 +9,8 @@ turns it into a ``HookEvent``, asks the guard, and prints at most one JSON objec
 
 It never prints "allow": that would skip the user's own permission prompt. Whatever
 goes wrong inside, the hook exits 0 without a decision unless the project asked to fail
-closed, because a guard that breaks the agent gets uninstalled.
+closed, because a guard that breaks the agent gets uninstalled. It does say so: a call
+that went unchecked puts a warning in front of the user (``systemMessage``).
 """
 
 from __future__ import annotations
@@ -82,6 +83,14 @@ def _clean(text: str, limit: int = MAX_REASON) -> str:
 
 def render(event_name: str, decision: Decision, *, announce: bool = True) -> dict[str, Any] | None:
     """The JSON object to print for a decision, or None for "say nothing"."""
+    out = _render(event_name, decision, announce=announce)
+    if decision.notice:
+        out = out or {}
+        out["systemMessage"] = _clean(f"{decision.notice} {out.get('systemMessage', '')}".strip(), 700)
+    return out
+
+
+def _render(event_name: str, decision: Decision, *, announce: bool) -> dict[str, Any] | None:
     if event_name == "PreToolUse":
         if decision.action not in ("ask", "deny"):
             return None
@@ -164,4 +173,10 @@ def main(stdin: TextIO | None = None, stdout: TextIO | None = None) -> int:
                 "permissionDecisionReason": ("TaintTrail could not check this call because of an internal error, "
                                              "and this project is set to fail closed. See .tainttrail/guard.log."),
             }}) + "\n")
+        elif event_name in ("PreToolUse", "SessionStart"):
+            # Failing open must not be silent: the user is told that this call went unchecked.
+            what = "this tool call" if event_name == "PreToolUse" else "the start of this session"
+            stdout.write(json.dumps({"systemMessage": (
+                f"TaintTrail could not check {what} ({type(exc).__name__}) and did not block anything. "
+                "The error is in .tainttrail/guard.log; `tainttrail doctor` checks the installation.")}) + "\n")
         return 0

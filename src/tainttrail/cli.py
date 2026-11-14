@@ -440,6 +440,11 @@ def cmd_doctor(args: argparse.Namespace, cfg: Config) -> int:
     try:
         with open_store(cfg) as store:
             nodes = store.scalar("MATCH (n) RETURN count(n)", default=0)
+            recovered = store.recovered
+        if recovered:
+            source = "the version before it" if recovered["restored"] == "previous" else "a new, empty graph"
+            line(None, "graph", f"{cfg.db_path} did not open ({recovered['error']}); it was set aside as "
+                                f"{Path(recovered['damaged']).name} and replaced by {source}")
         line(True, "graph", f"{cfg.db_path} opens for writing ({nodes} nodes)")
     except Exception as exc:   # noqa: BLE001
         line(False, "graph", f"{cfg.db_path}: {exc}")

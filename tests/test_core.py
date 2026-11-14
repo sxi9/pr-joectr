@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import glob
 import os
+import signal
+import stat
 import subprocess
 import sys
 import textwrap
@@ -11,7 +14,7 @@ import pytest
 from tainttrail import schema
 from tainttrail.config import Config, find_root, load_config, normalize_path
 from tainttrail.model import Decision, EntityRef, Finding
-from tainttrail.store import Store, StoreLocked, StoreMissing, to_plain
+from tainttrail.store import Store, StoreDamaged, StoreLocked, StoreMissing, to_plain
 
 
 # -- config -------------------------------------------------------------------------
@@ -254,3 +257,133 @@ def test_parallel_processes_queue_up_and_lose_nothing(cfg: Config, tmp_path):
     with Store(cfg.db_path) as s:
         seqs = sorted(r["seq"] for r in s.run("MATCH (c:ToolCall) RETURN c.seq AS seq"))
     assert seqs == list(range(1, workers * per_worker + 1)), "sequence numbers must be unique and gap-free"
+
+
+# -- a hook can be killed at any moment, and the graph has to survive it -----------------------
+
+_SLOW_WRITER = textwrap.dedent("""
+    import sys, time
+    from tainttrail.store import Store
+    path, pause = sys.argv[1], sys.argv[2]
+    store = Store(path).open()
+    with store.transaction():
+        store.write("UNWIND range(1, 400) AS i CREATE (:Content {id: 'k' + toString(i), excerpt: 'x', session_id: 's', seq: i})")
+    print("written", flush=True)
+    if pause == "before-close":
+        time.sleep(30)
+    store.close()
+    print("closed", flush=True)
+""")
+
+
+def _spawn_writer(tmp_path, db, pause):
+    script = tmp_path / "slow_writer.py"
+    script.write_text(_SLOW_WRITER)
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)}
+    proc = subprocess.Popen([sys.executable, str(script), str(db), pause], env=env, stdout=subprocess.PIPE, text=True)
+    assert proc.stdout.readline().strip() == "written"
+    return proc
+
+
+def _side_files(db, kind):
+    return glob.glob(f"{str(db)[:-3]}.{kind}*.rl")
+
+
+def test_a_writer_never_touches_the_live_file_until_it_has_closed_cleanly(cfg: Config, tmp_path):
+    with Store(cfg.db_path) as s:
+        s.write("CREATE (:Session {id: 's1'})")
+    before = cfg.db_path.read_bytes()
+    proc = _spawn_writer(tmp_path, cfg.db_path, "before-close")
+    assert cfg.db_path.read_bytes() == before, "the writer works on a private copy"
+    assert _side_files(cfg.db_path, "work-"), "which sits next to the store"
+    proc.send_signal(signal.SIGKILL)
+    proc.wait()
+    assert cfg.db_path.read_bytes() == before, "a killed writer publishes nothing"
+    with Store(cfg.db_path) as s:      # the next writer is not blocked by the dead one, and tidies up
+        assert s.scalar("MATCH (n:Content) RETURN count(n)") == 0
+        assert s.scalar("MATCH (n:Session) RETURN count(n)") == 1
+    assert _side_files(cfg.db_path, "work-") == []
+
+
+def test_a_writer_killed_while_closing_leaves_a_store_that_opens(cfg: Config, tmp_path):
+    """In-place writes failed this about once in thirteen kills; a rename cannot."""
+    with Store(cfg.db_path) as s:
+        s.write("UNWIND range(1, 3000) AS i CREATE (:Entity {id: 'e' + toString(i), kind: 'file', name: 'n'})")
+    seen = set()
+    for delay_ms in (0, 2, 4, 6, 9, 12, 16, 22):
+        proc = _spawn_writer(tmp_path, cfg.db_path, "none")
+        if delay_ms:
+            try:
+                proc.wait(timeout=delay_ms / 1000)
+            except subprocess.TimeoutExpired:
+                pass
+        proc.send_signal(signal.SIGKILL)
+        proc.wait()
+        with Store(cfg.db_path, read_only=True) as s:
+            count = s.scalar("MATCH (n:Content) RETURN count(n)")
+            assert s.scalar("MATCH (n:Entity) RETURN count(n)") == 3000
+        assert count in (0, 400), "the batch is there completely or not at all"
+        seen.add(count)
+        if count:
+            with Store(cfg.db_path) as s:
+                s.write("MATCH (n:Content) DETACH DELETE n")
+    assert seen <= {0, 400}
+
+
+def test_publishing_keeps_the_previous_version_and_private_permissions(cfg: Config):
+    with Store(cfg.db_path) as s:
+        s.write("CREATE (:Session {id: 's1'})")
+    with Store(cfg.db_path) as s:
+        s.write("CREATE (:Session {id: 's2'})")
+        previous = s.previous_path
+    assert stat.S_IMODE(os.stat(cfg.db_path).st_mode) == 0o600
+    assert stat.S_IMODE(os.stat(previous).st_mode) == 0o600
+    with Store(previous, read_only=True) as s:
+        assert s.scalar("MATCH (n:Session) RETURN count(n)") == 1
+    assert _side_files(cfg.db_path, "work-") == [] and _side_files(cfg.db_path, "prev-") == []
+
+
+def test_a_damaged_store_is_set_aside_and_the_previous_version_takes_over(cfg: Config):
+    with Store(cfg.db_path) as s:
+        s.write("CREATE (:Session {id: 's1'})")
+    with Store(cfg.db_path) as s:
+        s.write("CREATE (:Session {id: 's2'})")
+    cfg.db_path.write_bytes(b"this is not a Relate store " * 400)
+    with pytest.raises(StoreDamaged) as err:
+        Store(cfg.db_path, read_only=True).open()
+    assert "tainttrail doctor" in str(err.value)
+    with Store(cfg.db_path) as s:
+        assert s.recovered and s.recovered["restored"] == "previous"
+        assert [r["id"] for r in s.run("MATCH (n:Session) RETURN n.id AS id")] == ["s1"]
+        note = s.one("MATCH (m:Meta {key: 'recovered'}) RETURN m.damaged AS damaged, m.count AS count")
+        damaged = s.recovered["damaged"]
+    assert note == {"damaged": damaged, "count": 1}
+    assert Path(damaged).read_bytes().startswith(b"this is not a Relate store"), "the evidence is kept"
+    with Store(cfg.db_path, read_only=True) as s:      # and the store is whole again
+        assert s.scalar("MATCH (n:Session) RETURN count(n)") == 1
+    with Store(cfg.db_path) as s:
+        assert s.recovered is None
+
+
+def test_a_damaged_store_with_no_previous_version_starts_a_new_graph(cfg: Config):
+    with Store(cfg.db_path) as s:
+        s.write("CREATE (:Session {id: 's1'})")
+        previous = s.previous_path
+    assert not os.path.exists(previous), "one publish has nothing before it"
+    cfg.db_path.write_bytes(b"\x00" * 4096)
+    with Store(cfg.db_path) as s:
+        assert s.recovered and s.recovered["restored"] == "empty"
+        assert s.scalar("MATCH (n:Session) RETURN count(n)") == 0
+        assert s.scalar("MATCH (c:Capability) RETURN count(c)") > 0, "with its schema in place"
+
+
+def test_deleting_the_graph_also_forgets_its_previous_version(cfg: Config):
+    for sid in ("s1", "s2"):
+        with Store(cfg.db_path) as s:
+            s.write("CREATE (:Session {id: $id})", {"id": sid})
+            previous = s.previous_path
+    os.unlink(cfg.db_path)
+    with Store(cfg.db_path) as s:
+        assert s.scalar("MATCH (n:Session) RETURN count(n)") == 0
+    assert not os.path.exists(previous)
+

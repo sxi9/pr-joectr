@@ -20,3 +20,7 @@ node_modules/
 
 # Lock files next to Relate stores
 *.rl.lock
+*.prev.rl
+*.prev-*.rl
+*.work-*.rl
+*.damaged-*.rl

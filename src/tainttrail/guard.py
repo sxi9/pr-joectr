@@ -22,6 +22,17 @@ _RANK = {"allow": 0, "ask": 1, "deny": 2}
 _SEVERITY = {name: i for i, name in enumerate(S.SEVERITIES)}
 
 
+def recovery_notice(recovered: dict[str, str]) -> str:
+    """What to tell the user when the stored graph did not open and was set aside."""
+    name = os.path.basename(recovered.get("damaged", ""))
+    if recovered.get("restored") == "previous":
+        rest = "Recording continues from the version before it; the last event before the damage may be missing."
+    else:
+        rest = ("Recording continues in a new graph, so what earlier sessions recorded (tainted files, "
+                "trusted destinations) is not available to the rules until you restore it.")
+    return f"TaintTrail: the session graph did not open and was set aside as .tainttrail/{name}. {rest}"
+
+
 class Guard:
     def __init__(self, cfg: Config, store: Store | None = None) -> None:
         """With ``store`` the caller owns an open store (tests, replays); without it
@@ -33,7 +44,10 @@ class Guard:
         if self._store is not None:
             return self._handle(self._store, event)
         with open_store(self.cfg) as store:
-            return self._handle(store, event)
+            decision = self._handle(store, event)
+            if store.recovered:
+                decision.notice = recovery_notice(store.recovered)
+            return decision
 
     def _handle(self, store: Store, event: HookEvent) -> Decision:
         rec = Recorder(store, self.cfg)

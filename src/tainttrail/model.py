@@ -193,6 +193,7 @@ class Decision:
     findings: list[Finding] = field(default_factory=list)
     reason: str = ""                        # shown to the user and to the agent when blocking
     context: str = ""                       # extra text for the agent's context (warnings)
+    notice: str = ""                        # a warning for the user about the guard itself
 
     @classmethod
     def from_findings(cls, findings: list[Finding]) -> "Decision":
