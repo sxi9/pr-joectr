@@ -469,5 +469,5 @@ pytest
 ```
 
 About 2,000 tests, three to four minutes. CI runs them on Python 3.10 and 3.13, replays every
-scenario and opens the committed store ([workflow](.github/workflows/ci.yml)). `node tests/viewer_check.mjs` drives the viewer in a
-browser (needs Node and Playwright).
+scenario and opens the committed store ([workflow](.github/workflows/ci.yml)).
+`node tests/viewer_check.mjs` drives the viewer in a browser (needs Node and Playwright).
