@@ -25,6 +25,7 @@ from .model import CAPABILITY_NAMES, ToolLabels
 
 CLAUDE = "claude"
 MAX_LLM_CONFIDENCE = 0.8        # a model's label is never as sure as a catalogue entry
+MAX_TOOL_NAME = 200             # a longer "name" is text, and text from an MCP server is not sent unread
 SINK_SCOPES = ("public", "org", "private")
 
 
@@ -177,6 +178,24 @@ def run_claude(prompt: str, *, system: str | None = None, mcp_config: Mapping[st
     return result
 
 
+def ask_claude(prompt: str, *, system: str | None = None, mcp_config: Mapping[str, Any] | str | None = None,
+               allowed_tools: Iterable[str] | None = None, max_turns: int = 8, timeout: float = 180,
+               model: str | None = None, cfg: Any = None, runner: Callable[..., Any] = subprocess.run) -> str:
+    """The model's answer to one prompt as text, or ``""`` when there is none.
+
+    There is none when the ``claude`` command is not installed, when the project sets
+    ``llm = "none"`` (pass ``cfg``), and when the run fails or runs out of turns. A caller
+    that needs to say why, or wants the cost and the turns, uses ``run_claude``.
+    """
+    if cfg is not None and getattr(cfg, "llm", "auto") == "none":
+        return ""
+    if runner is subprocess.run and not claude_available():
+        return ""
+    result = run_claude(prompt, system=system, mcp_config=mcp_config, allowed_tools=allowed_tools, max_turns=max_turns,
+                        timeout=timeout, model=model, runner=runner)
+    return result.text if result.ok else ""
+
+
 # -- capability labels for tools nobody has labelled ------------------------------------------------
 
 LABEL_PROMPT = """\
@@ -231,9 +250,16 @@ class Labelling:
     note: str = ""
 
 
+def _hidden(ch: str) -> bool:
+    """Control and format characters, and the selectors that carry text nobody sees."""
+    code = ord(ch)
+    return (not ch.isprintable() or 0xFE00 <= code <= 0xFE0F or 0xE0100 <= code <= 0xE01EF or 0x180B <= code <= 0x180D
+            or code == 0x034F)
+
+
 def _printable(text: Any, limit: int) -> str:
     """One bounded line without control or invisible characters."""
-    cleaned = "".join(ch if ch.isprintable() else " " for ch in str(text))
+    cleaned = "".join(" " if _hidden(ch) else ch for ch in str(text))
     cleaned = " ".join(cleaned.split())
     return cleaned if len(cleaned) <= limit else cleaned[: limit - 1].rstrip() + "…"
 
@@ -306,7 +332,14 @@ def label_tools(tools: Iterable[Mapping[str, Any]], *, cfg: Any = None, runner: 
         name = entry["name"]
         if not name or name in entries or name in out.suspect:
             continue
+        if len(name) > MAX_TOOL_NAME or any(_hidden(ch) for ch in name):
+            # The name travels as it is, or the answer could not be matched to the tool. So a name
+            # that is a paragraph, or that carries characters nobody sees, does not travel at all.
+            out.suspect[_printable(name, MAX_TOOL_NAME)] = ["the name is too long or holds invisible characters"]
+            continue
         score, markers = injection_score(str(tool.get("description") or ""))
+        if score < 0.5:     # a name can carry the sentence the description was not allowed to
+            score, markers = injection_score(name.replace("_", " ").replace("-", " "))
         if score >= 0.5:
             out.suspect[name] = list(markers)
             continue

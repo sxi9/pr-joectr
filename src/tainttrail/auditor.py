@@ -4,10 +4,12 @@ The report has two parts that never mix.
 
 The first is deterministic. It is built from the same read-only tools the MCP server
 offers (so it withholds the same text and cleans the same names): posture, every call
-that was denied or put to the user with its path and the query that found it, the
-outbound calls that followed untrusted and sensitive content without being questioned,
-the capability map's toxic paths with the smallest fix, and a paragraph on what none of
-this proves. It is the same for the same graph, with or without a model.
+a rule called to deny or to question, with its path and the query that found it, and
+with a plain statement when the call went through all the same because the guard was
+only watching; the outbound calls that followed untrusted and sensitive content without
+any rule objecting, the capability map's toxic paths with the smallest fix, and a
+paragraph on what none of this proves. It is the same for the same graph, with or
+without a model.
 
 The second exists only with ``--agent`` and only when the ``claude`` command is there.
 A headless Claude Code run gets TaintTrail's own MCP server as its only tools and is told
@@ -19,8 +21,9 @@ model that read attacker-chosen names must not be able to make it fetch anything
 Destinations are written defanged in every part and in both forms of the report
 (Markdown and JSON), the model's text included. An agent that reads the report has it
 recorded by the guard as trusted content, and a host it could read there would stop
-being a host that only untrusted content named. The stored rule queries are the one
-exception: they are fixed text and are printed so that they run.
+being a host that only untrusted content named. Cypher is no exception: a statement is
+printed so that it runs, with a property such as ``d.id``, which reads as a host name,
+written ``d.`id```.
 """
 
 from __future__ import annotations
@@ -56,13 +59,18 @@ LIMITS = (
 # -- Markdown that cannot be turned against its reader -----------------------------------------------
 
 # What a Markdown viewer turns into a link without being asked: a scheme, a leading
-# "//" or "www.", an e-mail address. _BARE_NAME is the dot before a top-level domain as
-# a viewer that links bare names knows them (two letters, or one of a short list), and
-# the dot next to a letter outside ASCII; it is applied to a model's prose only.
+# "//" or "www.", an e-mail address. A "://" or "//" that already stands in its brackets
+# is left as it is, so that text which was defanged before is not marked twice.
+# _BARE_NAME is the dot before a top-level domain as a viewer that links bare names
+# knows them (two letters in either case, or one of a short list), and the dot next to a
+# letter outside ASCII; it is applied to prose, a model's and the graph's, never to code.
+# An underscore after the ending does not continue the name: `_evil.com_` is a host in
+# italics.
 _TLD = r"(?:[A-Za-z]{2}|biz|com|edu|gov|net|org|pro|web|xxx|aero|asia|coop|info|museum|name|shop|zip|mov)"
-_LIVE = re.compile(r"(://)|((?<![:/\w])//(?=[^\s/]))|((?<![A-Za-z0-9])[Ww]{3}\.(?=\S))|(@(?=\w))")
-_BARE_NAME = re.compile(r"(?<=[\w-])\.(?=" + _TLD + r"(?![\w-]))"
-                        r"|(?<=\w)\.(?=[^\W\d_])(?=[^\x00-\x7f])|(?<=[^\x00-\x7f])(?<=[^\W\d_])\.(?=\w)")
+_LIVE = re.compile(r"((?<!\[)://|://(?!\]))|((?<![:/\[])(?<![^\W_])//(?=[^\s/])|(?<=\[)//(?=[^\s/\]]))"
+                   r"|((?<![A-Za-z0-9])[Ww]{3}\.(?=\S))|(@(?=\w))")
+_BARE_NAME = re.compile(r"(?<=[\w-])\.(?=" + _TLD + r"(?![^\W_]|-))"
+                        r"|(?<=\w)\.(?=[^\W\d_])(?=[^\x00-\x7f])|(?<=[^\x00-\x7f])(?<=[^\W\d_])\.(?=\w)", re.IGNORECASE)
 _ESCAPABLE = frozenset("!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~")
 
 
@@ -84,9 +92,12 @@ def md_text(value: Any, limit: int = 400) -> str:
 
     ``#`` is escaped so that a name cannot start a heading, ``~`` so that it cannot open a
     block, ``$`` so that it cannot start a formula, and ``&`` so that a character
-    reference cannot bring back a character that was just removed.
+    reference cannot bring back a character that was just removed. A name that a viewer
+    could link by itself is defused like a model's prose: a title is made of names from
+    outside (a host whose ending the guard's extractor does not know, a file called
+    ``setup.sh``), and those are somebody's to register.
     """
-    text = mcp_server.defang(defuse(clean_text(value, limit))).replace("&", "&amp;")
+    text = mcp_server.defang(defuse(clean_text(value, limit), bare_names=True)).replace("&", "&amp;")
     return re.sub(r"([\\`*_\[\]<>|#~$])", r"\\\1", text)
 
 
@@ -124,31 +135,8 @@ _RULE_CHARACTERS = "|+:=- \t"
 _LANGUAGES = frozenset({"cypher", "sql", "json", "text", "txt", "sh", "bash", "console", "python", "yaml"})
 
 
-_STRING = re.compile(r"'(?:[^'\\\n]|\\.)*'|\"(?:[^\"\\\n]|\\.)*\"")
-_PROPERTY = re.compile(r"(?<![\w.'\"`/@\\-])([A-Za-z_]\w*)\.([A-Za-z_]\w*)(?![\w.`'\"(/:@-])")
-_CYPHER = re.compile(r"\b(?:MATCH|RETURN|WHERE|WITH|UNWIND|ORDER\s+BY)\b", re.IGNORECASE)
-
-
-def _code(text: str) -> str:
-    """Code a model wrote, with nothing left in it that the guard reads as a destination.
-
-    A host is defanged as everywhere else. A property in a Cypher statement that the
-    guard's extractor takes for a host name (``c.id``: ``id`` is also a country's domain)
-    is quoted instead, ``c.`id```. That means the same to Cypher, so the statement still
-    runs as printed. Which of the two a name gets is a matter of readability only:
-    neither spelling is one the extractor reads.
-    """
-    hosts = mcp_server._destinations(text)[0] if "." in text and _CYPHER.search(text) else set()
-    if hosts:
-        def quote(code: str) -> str:
-            return _PROPERTY.sub(lambda m: f"{m.group(1)}.`{m.group(2)}`" if m.group(0).lower() in hosts else m.group(0), code)
-
-        parts, at = [], 0
-        for literal in _STRING.finditer(text):      # a string is data: what is in it is defanged, not quoted
-            parts += [quote(text[at:literal.start()]), literal.group(0)]
-            at = literal.end()
-        text = "".join(parts) + quote(text[at:])
-    return mcp_server.defang(text)
+# Code a model wrote keeps its text, with nothing left in it that the guard reads as a destination.
+_code = mcp_server.defang_code
 
 
 def _span(raw: str, width: int) -> str:
@@ -395,39 +383,77 @@ def _recommended_fix(ctx: Context) -> dict[str, Any] | None:
             "broken": proposal.get("broken"), "settings": scrub.value(proposal.get("settings") or {})}
 
 
+MAX_INCIDENTS = 25
+_Q_FINDINGS = """
+MATCH (f:Finding)
+WHERE $sid IS NULL OR f.session_id = $sid
+RETURN f.id AS id, f.rule AS rule, f.action AS action, coalesce(f.intended, f.action) AS intended,
+       f.severity AS severity, f.ts AS ts
+"""
+
+
+def _findings_overview(ctx: Context, sid: str | None) -> dict[str, Any]:
+    """Which findings a report shows in full, and how many there are of each kind.
+
+    Read from the graph and not from the ``list_findings`` tool: that listing is cut to
+    what fits in one answer, newest first, and the one denial of a long-lived project
+    can be older than everything that fits.
+
+    A finding whose rule called for a denial or a question is an incident, whether it
+    was enforced or only recorded (monitor mode, a rule override). Denials come first,
+    enforced or not, then the higher severity, then the newer finding.
+    """
+    with ctx.store() as store:
+        rows = store.run(_Q_FINDINGS, {"sid": sid})
+    overview: dict[str, Any] = {"enforced": 0, "not_enforced": 0, "noted": {}, "worst": []}
+    raised = []
+    for row in rows:
+        if row["action"] in ("ask", "deny") or row["intended"] in ("ask", "deny"):
+            overview["enforced" if row["action"] in ("ask", "deny") else "not_enforced"] += 1
+            severity = S.SEVERITIES.index(row["severity"]) if row["severity"] in S.SEVERITIES else 0
+            newer = row["ts"] if isinstance(row["ts"], int) and not isinstance(row["ts"], bool) else 0
+            raised.append(("deny" not in (row["action"], row["intended"]), -severity, -newer, str(row["id"])))
+        else:
+            rule = mcp_server.shown(row["rule"], 20)
+            overview["noted"][rule] = overview["noted"].get(rule, 0) + 1
+    overview["noted"] = dict(sorted(overview["noted"].items()))
+    overview["worst"] = [ident for *_, ident in sorted(raised)[:MAX_INCIDENTS]]
+    return overview
+
+
 def collect(cfg: Config, *, session: str | None = None) -> dict[str, Any]:
     """Everything the deterministic part of the report says, as data. Raises ``ToolError`` with nothing recorded."""
     ctx = Context(cfg, isolate=False)
     status = call_tool(ctx, "status", {})
     if not status.get("recorded"):
         raise ToolError(status.get("note") or "Nothing has been recorded yet.", status.get("next") or "")
-    scope: dict[str, Any] = {}
     sid: str | None = None
     if session:
         with ctx.store() as store:
             sid = mcp_server._resolve_session(store, session)
-        scope["session"] = sid
-    listed = call_tool(ctx, "list_findings", {"limit": 200, "include_noted": True, **scope})
+    # Every finding whose rule called for a denial or a question: the ones that were enforced, and the
+    # ones that were only recorded because the guard was in monitor mode or the rule was overridden.
+    # Those calls went through, which makes them the first thing a report has to show.
+    findings = _findings_overview(ctx, sid)
     try:
         capability_map = call_tool(ctx, "toxic_paths", {"limit": 5})
     except ToolError as exc:        # the report is worth having without this section
         capability_map = {"available": False, "error": mcp_server.defang(clean_text(exc.message, 300))}
-    blocking = [f for f in listed["findings"] if not f["verdict"].startswith("noted")]
-    # Denials first, then by severity; the listing's own order (newest first) breaks ties.
-    blocking.sort(key=lambda f: (f["verdict"] != "denied",
-                                 -S.SEVERITIES.index(f["severity"]) if f["severity"] in S.SEVERITIES else 0))
-    noted: dict[str, int] = {}
-    for f in listed["findings"]:
-        if f["verdict"] == "noted":
-            noted[f["rule"]] = noted.get(f["rule"], 0) + 1
+    incidents = []
+    for ident in findings["worst"]:
+        try:
+            incidents.append(call_tool(ctx, "explain_finding", {"finding": ident}))
+        except ToolError:       # an id the guard did not write (not text, or not unique): counted, not shown
+            continue
     data: dict[str, Any] = {
-        "project": status["project"], "graph": status["graph"], "session": sid,
+        "project": status["project"], "graph": status["graph"], "session": mcp_server.shown(sid, 120) if sid else None,
         "posture": {k: status.get(k) for k in (
             "mode", "fail_closed", "config_error", "hooks_registered_in_settings", "sessions", "calls", "denied", "asked",
             "untrusted", "sensitive", "findings", "servers", "tools", "nodes")},
-        "incidents": [call_tool(ctx, "explain_finding", {"finding": f["id"]}) for f in blocking[:25]],
-        "incidents_total": len(blocking),
-        "noted": dict(sorted(noted.items())),
+        "incidents": incidents,
+        "incidents_total": findings["enforced"] + findings["not_enforced"],
+        "incidents_not_enforced": findings["not_enforced"],
+        "noted": findings["noted"],
         "unquestioned": _unquestioned(ctx, sid),
         "sessions": call_tool(ctx, "list_sessions", {"limit": 20})["sessions"],
         "timeline": call_tool(ctx, "session_timeline", {"session": sid, "limit": 200})["events"] if sid else None,
@@ -491,6 +517,9 @@ def _posture_lines(data: dict[str, Any]) -> list[str]:
 def _incident_lines(n: int, f: dict[str, Any]) -> list[str]:
     lines = [f"### {n}. {md_text(f['rule'])} {md_text(f.get('name') or '')}: {md_text(f['severity'])}, {md_text(f['verdict'])}",
              "", f"**{md_text(f.get('title') or '', 300)}**", ""]
+    if str(f.get("verdict") or "").startswith("noted only"):
+        lines += ["**This call was not stopped.** The rule called for it; the guard was in monitor mode, or the rule "
+                  "was overridden, so the finding was only recorded.", ""]
     if f.get("explanation"):
         lines += [md_text(f["explanation"], 900), ""]
     if f.get("path_line"):
@@ -511,10 +540,10 @@ def _unquestioned_lines(calls: list[dict[str, Any]]) -> list[str]:
     lines = ["## Outbound calls after untrusted and sensitive content, not questioned", ""]
     if not calls:
         return lines + ["None. Every call that could send data out after both kinds of content were in its session "
-                        "was denied or put to the user, or there was no such call.", ""]
+                        "has a finding under Incidents, or there was no such call.", ""]
     lines += [
         "These calls could send data out after their session had read both untrusted content and sensitive data, "
-        "and no rule denied or asked. That is the expected outcome when the destination is local, on the "
+        "and no rule called for a denial or a question. That is the expected outcome when the destination is local, on the "
         "allow-list or named by you and no fingerprint of sensitive data is in the call. It is also what a leak "
         "looks like that the guard cannot match, so each is worth a look.", ""]
     for call in calls:
@@ -552,8 +581,12 @@ def _map_lines(cap: dict[str, Any]) -> list[str]:
         for c in fix["changes"]:
             lines.append(f"- {md_text(c.get('action') or '')} {md_code(c.get('rule') or c.get('target') or '')}"
                          + (f" ({md_text(c.get('why') or '')})" if c.get("why") else ""))
+        settings = json.dumps(fix.get("settings") or {}, indent=2, ensure_ascii=False)
         lines += ["", "For `.claude/settings.json` (`tainttrail fix --apply --yes` writes it):", "",
-                  md_block(json.dumps(fix.get("settings") or {}, indent=2, ensure_ascii=False), "json"), ""]
+                  md_block(settings, "json"), ""]
+        if any(mark in settings for mark in ("[.]", "[/]", "[://]")):
+            lines += ["A rule above that names a host or a repository is shown defanged, like every destination in this "
+                      "report, and does not match anything as printed. Let `tainttrail fix` write the rules.", ""]
     elif cap.get("open") == 0:
         lines += ["No path is open, so there is nothing to fix.", ""]
     return lines
@@ -634,20 +667,27 @@ def render_markdown(data: dict[str, Any]) -> str:
              f"Project {md_code(data['project'], 300)}, graph {md_code(data['graph'], 300)}{scope}. "
              f"Generated {data.get('generated') or 'at an unknown time'}.", "",
              "Destinations are written defanged: `attacker[.]example` for a host, `https[://]` and `user[@]host` "
-             "in running text, `owner[/]name` for a bare repository name. Neither a person, nor a Markdown viewer, "
+             "in running text, `owner[/]name` for a bare repository name. In running text a file name that could "
+             "pass for a host name is written the same way (`notes[.]md`). Neither a person, nor a Markdown viewer, "
              "nor an agent that reads this file should take them for places to go. The text of untrusted content "
              "is not in this report.", "",
              "## Posture", "", *_posture_lines(data), "", "## Incidents", ""]
     incidents = data.get("incidents") or []
     total = data.get("incidents_total", len(incidents))
+    loose = data.get("incidents_not_enforced") or 0
     if not incidents:
-        lines += ["No call was denied or put to the user" + (" in this session." if data.get("session") else "."), ""]
+        lines += ["No call was denied or put to the user" + (" in this session" if data.get("session") else "")
+                  + ", and no rule called for it.", ""]
     else:
         calls = len({f.get("target") for f in incidents})
-        lines += [f"{_plural(total, 'finding')} denied a call or put it to the user"
-                  + (f", on {_plural(calls, 'call')}" if total == len(incidents) else "")
-                  + ". Each is shown with the path through the graph that caused it and the Cypher query that "
-                  "found the path.", ""]
+        on_calls = f", on {_plural(calls, 'call')}" if total == len(incidents) else ""
+        if loose:
+            lines += [f"{_plural(total, 'finding')}{on_calls}: {_num(total - loose)} denied a call or put it to the user, and "
+                      f"{_num(loose)} {'was' if loose == 1 else 'were'} only recorded, because the guard was in monitor mode "
+                      "or the rule was overridden. **Those calls were not stopped.**", ""]
+        else:
+            lines += [f"{_plural(total, 'finding')} denied a call or put it to the user{on_calls}.", ""]
+        lines += ["Each is shown with the path through the graph that caused it and the Cypher query that found the path.", ""]
         for n, finding in enumerate(incidents, 1):
             lines += _incident_lines(n, finding)
         if total > len(incidents):
@@ -734,7 +774,7 @@ def agent_prompt(data: dict[str, Any], *, max_turns: int) -> str:
     p = data["posture"]
     ids = ", ".join(f"{clean_text(f['id'], 200)} ({clean_text(f['rule'], 10)})" for f in (data.get("incidents") or [])[:10])
     known = (f"{_plural(p.get('sessions'), 'session')}, {_plural(p.get('calls'), 'tool call')}, {p.get('denied')} denied, "
-             f"{p.get('asked')} put to the user. Findings that denied or asked: {ids or 'none'}.")
+             f"{p.get('asked')} put to the user. Findings whose rule called for a denial or a question: {ids or 'none'}.")
     scope = (f"Limit the investigation to session {clean_text(data['session'], 120)}." if data.get("session")
              else "Cover all recorded sessions.")
     return AUDITOR_PROMPT.format(known=known, calls=max(2, max_turns - 2), scope=scope)
@@ -857,7 +897,8 @@ def cmd_audit(args: argparse.Namespace, cfg: Config, *, runner: Callable[..., An
     data["agent"] = None
     if getattr(args, "agent", False):
         max_turns = max(2, min(50, int(getattr(args, "max_turns", DEFAULT_MAX_TURNS) or DEFAULT_MAX_TURNS)))
-        timeout = max(10.0, min(3600.0, float(getattr(args, "timeout", DEFAULT_TIMEOUT) or DEFAULT_TIMEOUT)))
+        wanted = float(getattr(args, "timeout", DEFAULT_TIMEOUT) or DEFAULT_TIMEOUT)
+        timeout = max(10.0, min(3600.0, wanted)) if wanted == wanted else DEFAULT_TIMEOUT     # not a number: the default
         model = getattr(args, "model", None) or None
         print("tainttrail audit: an agent is investigating the graph; this can take a few minutes", file=sys.stderr)
         data["agent"] = investigate(cfg, data, max_turns=max_turns, model=model, timeout=timeout, runner=runner)

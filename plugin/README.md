@@ -49,7 +49,7 @@ Work as usual. When a call is blocked, Claude is told why and you see a line suc
 
 - `/tainttrail:status` for the status, the latest findings and the path behind the newest one;
 - ask "why was this blocked?" and Claude answers from the graph with `explain_finding`;
-- `tainttrail explain`, `tainttrail log` and `tainttrail ui` in a terminal show the same.
+- `tainttrail explain last`, `tainttrail log` and `tainttrail ui` in a terminal show the same.
 
 ## Use the plugin or `tainttrail init`, not both
 
@@ -81,7 +81,8 @@ plugin, so "hooks: not registered" is expected when only the plugin is in use.
   process tree. The guard treats an attempt by the agent to set it as tampering.
 - **The MCP server only reads.** It refuses writes, runs Cypher from the agent in a
   separate process with a deadline on a copy of the graph, and never returns the text of
-  untrusted content. To read that text yourself, run `tainttrail mcp
+  untrusted content or the descriptions MCP servers give their tools: on that copy the
+  text is overwritten before the statement runs. To read it yourself, run `tainttrail mcp
   --include-untrusted-text` or `tainttrail query` in a terminal.
 - **Tool names.** Inside the plugin the MCP tools are called
   `mcp__plugin_tainttrail_tainttrail__status` and so on. A permission rule for all of them
