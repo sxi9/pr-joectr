@@ -15,12 +15,16 @@ from __future__ import annotations
 
 import configparser
 import os
+import posixpath
 import re
 import shlex
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 
 MAX_DEPTH = 4
+# A command longer than this is not parsed: it is treated as one that could do anything. Parsing
+# time grows faster than the length for some shapes, and nobody types 64 KB of shell by hand.
+MAX_COMMAND_CHARS = 65_536
 
 
 @dataclass
@@ -34,6 +38,7 @@ class BashAnalysis:
     derived: list[tuple[str, str]] = field(default_factory=list)       # (target file, source file or URL)
     env_reads: list[str] = field(default_factory=list)    # environment variables the command expands
     env_uploads: list[str] = field(default_factory=list)  # ... inside a command that sends data out
+    env_auth: list[str] = field(default_factory=list)     # ... and only where a credential belongs (-u, Authorization:)
     env_dump: bool = False                                # prints the whole environment
     env_uploaded: bool = False                            # ... into a command that sends data out
     executes_download: bool = False                       # runs something it fetches in the same command
@@ -181,10 +186,18 @@ class _Ctx:
     def __init__(self, cwd: str | None, depth: int = 0) -> None:
         self.cwd = cwd
         self.depth = depth
+        self.dir: str | None = None                      # where an earlier `cd` in the command line went
         self.vars: dict[str, str] = {}
         self.locals: set[str] = set()                    # loop variables: set in the command, value unknown
         self.subs: list[tuple[str, BashAnalysis]] = []   # (kind, analysis) for each substitution
         self.heredocs: list[str] = []
+
+    @property
+    def here(self) -> str | None:
+        """The directory the current simple command runs in, as far as it is known."""
+        if self.dir is None or self.dir == _DIR_UNKNOWN:
+            return self.cwd
+        return os.path.join(self.cwd or "", os.path.expanduser(self.dir))
 
 
 def _scan(command: str, ctx: _Ctx) -> str:
@@ -274,17 +287,36 @@ def _scan(command: str, ctx: _Ctx) -> str:
     return "".join(out)
 
 
-_HEREDOC = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1[^\n]*\n(.*?)\n[ \t]*\2[ \t]*(?=\n|$)", re.S)
+_HEREDOC_OPEN = re.compile(r"<<-?[ \t]*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
 
 
 def _lift_heredocs(command: str, ctx: _Ctx) -> str:
-    def repl(m: re.Match) -> str:
-        ctx.heredocs.append(m.group(3))
-        rest = m.group(0).split("\n", 1)[0]
-        rest = re.sub(r"<<-?\s*(['\"]?)[A-Za-z_][A-Za-z0-9_]*\1", f" \x00H{len(ctx.heredocs) - 1}\x00 ", rest, count=1)
-        return rest
+    """Take here-document bodies out of the command, leaving a marker where each one was announced.
 
-    return _HEREDOC.sub(repl, command)
+    Line by line and in one pass. A single pattern that looks for each terminator from each
+    ``<<`` scans to the end of the command once per unterminated here-document.
+    """
+    if "<<" not in command:
+        return command
+    lines = command.split("\n")
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        m = _HEREDOC_OPEN.search(line)
+        if m is None or "<<<" in line[max(0, m.start() - 1):m.start() + 3]:
+            out.append(line)
+            i += 1
+            continue
+        word = m.group(2)
+        end = next((j for j in range(i + 1, len(lines)) if lines[j].strip(" \t") == word), None)
+        if end is None:          # never terminated: the shell would read to the end; leave the text alone
+            out.extend(lines[i:])
+            break
+        ctx.heredocs.append("\n".join(lines[i + 1:end]))
+        out.append(line[:m.start()] + f" \x00H{len(ctx.heredocs) - 1}\x00 " + line[m.end():])
+        i = end + 1
+    return "\n".join(out)
 
 
 def _tokens(text: str) -> list[str]:
@@ -297,17 +329,95 @@ def _tokens(text: str) -> list[str]:
 _OPERATORS = {";", "&", "&&", "||", "|", "|&", "(", ")", ";;"}
 
 
-def _split(tokens: list[str]) -> list[list[list[str]]]:
-    """Tokens -> pipelines -> simple commands (each a list of words and redirection operators)."""
-    pipelines: list[list[list[str]]] = [[[]]]
+def _sequence(tokens: list[str]) -> list[tuple[str, list[list[str]]]]:
+    """Tokens -> pipelines of simple commands, with the subshell brackets between them kept.
+
+    Items are ``("pipeline", [[word, ...], ...])``, ``("(", [])`` and ``(")", [])``.
+    """
+    out: list[tuple[str, list[list[str]]]] = []
+    current: list[list[str]] = [[]]
+
+    def flush() -> None:
+        nonlocal current
+        cmds = [cmd for cmd in current if cmd]
+        if cmds:
+            out.append(("pipeline", cmds))
+        current = [[]]
+
     for tok in tokens:
         if tok in ("|", "|&"):
-            pipelines[-1].append([])
+            current.append([])
         elif tok in _OPERATORS or (set(tok) <= set(";&|()") and tok):
-            pipelines.append([[]])
+            flush()
+            out.extend((ch, []) for ch in tok if ch in "()")
         else:
-            pipelines[-1][-1].append(tok)
-    return [[cmd for cmd in p if cmd] for p in pipelines if any(p)]
+            current[-1].append(tok)
+    flush()
+    return out
+
+
+def _split(tokens: list[str]) -> list[list[list[str]]]:
+    """Tokens -> pipelines -> simple commands (each a list of words and redirection operators)."""
+    return [cmds for kind, cmds in _sequence(tokens) if kind == "pipeline"]
+
+
+# -- cd: where the rest of the command line runs ---------------------------------------------------
+
+_DIR_UNKNOWN = "\x00unknown"
+_REDIRECT_CHARS = set("<>&|")
+
+
+def _cd_target(words: list[str]) -> str | None:
+    """Where ``cd`` or ``pushd`` goes: a path, "" when it cannot be known, None for any other command."""
+    if not words or words[0] not in ("cd", "pushd", "popd"):
+        return None
+    if words[0] == "popd":
+        return ""
+    target = None
+    for w in words[1:]:
+        if set(w) <= _REDIRECT_CHARS and ("<" in w or ">" in w):
+            break
+        if w == "--" or (len(w) == 2 and w[0] == "-" and w[1].isalpha()):
+            continue
+        target = w
+        break
+    if target is None:
+        return "~"
+    if target == "-" or any(ch in target for ch in "$`*?\x00"):
+        return ""
+    return target
+
+
+def _join_dir(current: str | None, target: str) -> str:
+    if target == "" or current == _DIR_UNKNOWN and not target.startswith(("/", "~")):
+        return _DIR_UNKNOWN
+    if current is None or target.startswith(("/", "~")):
+        return target
+    return posixpath.join(current, target)
+
+
+def _rebase(path, directory: str):
+    """A file operand as the hook's working directory sees it, after ``cd directory``."""
+    if not isinstance(path, str) or not path or "://" in path or path[0] in "/~$-@\x00":
+        return path
+    head = path.split("/", 1)[0]
+    if ":" in head:   # host:path
+        return path
+    return posixpath.normpath(posixpath.join(directory, path))
+
+
+_PATH_LISTS = ("reads", "writes", "deletes", "uploads", "executed", "staged")
+
+
+def _rebase_cmd(c: "_Cmd", directory: str) -> None:
+    for name in _PATH_LISTS:
+        setattr(c, name, [_rebase(x, directory) for x in getattr(c, name)])
+    c.derived = [(_rebase(t, directory), _rebase(src, directory)) for t, src in c.derived]
+    c.stdout_file = _rebase(c.stdout_file, directory)
+    for inner in c.nested:
+        for name in _PATH_LISTS:
+            setattr(inner, name, [_rebase(x, directory) for x in getattr(inner, name)])
+        inner.derived = [(_rebase(t, directory), _rebase(src, directory)) for t, src in inner.derived]
 
 
 # -- one simple command ---------------------------------------------------------------------------
@@ -327,6 +437,7 @@ class _Cmd:
     executed: list[str] = field(default_factory=list)
     staged: list[str] = field(default_factory=list)
     env_reads: list[str] = field(default_factory=list)
+    env_auth: list[str] = field(default_factory=list)
     env_dump: bool = False
     network: bool = False          # sends something to another machine
     sink_kind: str = ""
@@ -590,8 +701,26 @@ def _copy_remote(c: _Cmd, args: list[str]) -> None:
 
 
 def _git(c: _Cmd, args: list[str], ctx: _Ctx) -> None:
+    """A git command. With ``-C DIR`` its file operands belong to DIR."""
+    marks = {name: len(getattr(c, name)) for name in _PATH_LISTS}
+    _git_inner(c, args, ctx)
+    i, directory = 0, None
+    while i < len(args) and args[i].startswith("-"):
+        if args[i] == "-C" and i + 1 < len(args):
+            directory = args[i + 1] if directory is None else posixpath.join(directory, args[i + 1])
+            i += 1
+        elif args[i] == "-c":
+            i += 1
+        i += 1
+    if directory and not any(ch in directory for ch in "$`\x00"):
+        for name, n in marks.items():
+            items = getattr(c, name)
+            items[n:] = [_rebase(x, directory) for x in items[n:]]
+
+
+def _git_inner(c: _Cmd, args: list[str], ctx: _Ctx) -> None:
     c.passes_through = False
-    cwd = ctx.cwd
+    cwd = ctx.here
     i = 0
     while i < len(args) and args[i].startswith("-"):
         if args[i] == "-C" and i + 1 < len(args):
@@ -677,7 +806,7 @@ def _gh(c: _Cmd, args: list[str], ctx: _Ctx) -> None:
             repo = repo_from_url(spec) if "://" in spec else (spec.lower() if spec.count("/") == 2 else f"github.com/{spec.lower()}")
             _add(c.dests, ("repo", repo))
             return
-        url = git_remote_url(ctx.cwd, "origin")
+        url = git_remote_url(ctx.here, "origin")
         repo = repo_from_url(url) if url else None
         if repo:
             _add(c.dests, ("repo", repo))
@@ -803,7 +932,9 @@ def _cloud(c: _Cmd, args: list[str]) -> None:
     program = c.program
     opts, operands = _opts(args, {"--endpoint-url", "--profile", "--region", "--bucket", "--key", "--body", "--file",
                                   "--account-name", "--container-name", "--name", "-n", "-c", "--secret-id", "--query",
-                                  "--output", "-m"})
+                                  "--output", "-m", "--cache-control", "--content-type", "--content-encoding", "--acl",
+                                  "--exclude", "--include", "--storage-class", "--metadata", "--sse", "--expires",
+                                  "--grants", "--content-disposition", "--metadata-directive", "--page-size"})
     words = " ".join(operands)
     if re.search(r"\b(?:secretsmanager\s+get-secret-value|ssm\s+get-parameters?\b.*|sts\s+get-session-token|"
                  r"configure\s+(?:get|export-credentials)|secrets\s+versions\s+access|auth\s+print-access-token|"
@@ -948,7 +1079,9 @@ def _interpreter(c: _Cmd, args: list[str], ctx: _Ctx) -> None:
             break
         if a == "-m" and i + 1 < len(args):
             module = args[i + 1]
-            if module in ("http.server", "SimpleHTTPServer"):
+            bind = next((args[j + 1] for j, x in enumerate(args[:-1]) if x in ("--bind", "-b")), "")
+            # Bound to loopback, a preview server puts nothing on the network.
+            if module in ("http.server", "SimpleHTTPServer") and bind not in ("127.0.0.1", "localhost", "::1"):
                 c.network, c.sink_kind, c.payload = True, "shell-net", True
                 c.opaque.append("serves the current directory over HTTP")
             script = "-m"
@@ -1272,6 +1405,41 @@ def _dispatch(c: _Cmd, args: list[str], ctx: _Ctx) -> None:
             _add(c.executed, c.raw_program)   # ./tool or /tmp/x.sh: a file on disk is being run
 
 
+_AUTH_HEADER = re.compile(
+    r"^\s*(?:authorization|proxy-authorization|private-token|x-[\w-]*(?:key|token|auth|secret)[\w-]*|[\w-]*api-?key[\w-]*)\s*:", re.I)
+_AUTH_FLAGS = {"-u", "--user", "--oauth2-bearer", "-p", "--password", "--token"}
+
+
+def _auth_only_vars(raw_args: list[str], ctx: _Ctx) -> list[str]:
+    """Variables that appear only where a credential belongs: ``-u``, ``--oauth2-bearer``, an auth header.
+
+    That is authentication. A variable that also appears in the URL, a body or any other
+    argument is data on its way out.
+    """
+    auth: list[str] = []
+    data: list[str] = []
+
+    def names(word: str) -> list[str]:
+        found = [m.group(1) or m.group(2) for m in _VAR.finditer(word)]
+        return [n for n in found if n not in ctx.vars and n not in ctx.locals]
+
+    i = 0
+    while i < len(raw_args):
+        a = raw_args[i]
+        nxt = raw_args[i + 1] if i + 1 < len(raw_args) else ""
+        if a in ("-H", "--header") and nxt:
+            (auth if _AUTH_HEADER.match(nxt) else data).extend(names(nxt))
+            i += 2
+            continue
+        if a in _AUTH_FLAGS and nxt:
+            auth.extend(names(nxt))
+            i += 2
+            continue
+        data.extend(names(a))
+        i += 1
+    return [n for n in dict.fromkeys(auth) if n not in data]
+
+
 def _expand(word: str, ctx: _Ctx, c: _Cmd) -> str:
     """Replace variables assigned earlier in the command; remember the ones that come from outside."""
     def repl(m: re.Match) -> str:
@@ -1381,6 +1549,7 @@ def _simple(words: list[str], ctx: _Ctx) -> _Cmd | None:
         return c
     c.program = _base(expanded)
     c.raw_program = expanded
+    c.env_auth = _auth_only_vars(args[1:], ctx)
     rest = []
     for a in args[1:]:
         e = _expand(a, ctx, c)
@@ -1402,7 +1571,7 @@ def _is_known(item) -> bool:
 
 def _merge(out: BashAnalysis, inner: BashAnalysis) -> None:
     for name in ("reads", "writes", "uploads", "deletes", "fetches", "destinations", "derived", "env_reads",
-                 "env_uploads", "executed", "staged", "sink_kinds", "opaque_reasons", "programs"):
+                 "env_uploads", "env_auth", "executed", "staged", "sink_kinds", "opaque_reasons", "programs"):
         target = getattr(out, name)
         for item in getattr(inner, name):
             _add(target, item)
@@ -1471,6 +1640,9 @@ def _pipeline(cmds: list[_Cmd], ctx: _Ctx, out: BashAnalysis) -> None:
                 out.env_uploaded = True
             for name in [*c.env_reads, *flow_env_names]:
                 _add(out.env_uploads, name)
+            for name in c.env_auth:
+                if name not in flow_env_names:
+                    _add(out.env_auth, name)
             if flow_encoded or flow_decoded:
                 out.encodes = True
 
@@ -1538,14 +1710,37 @@ def _analyze(command: str, cwd: str | None, depth: int, variables: dict[str, str
     if depth > MAX_DEPTH or not command.strip():
         return out
     ctx = _Ctx(cwd, depth)
-    ctx.vars = variables or {}
+    ctx.vars = {"HOME": "~", "PWD": ".", **(variables or {})}
     text = _lift_heredocs(command, ctx)
     text = _scan(text, ctx)
     tokens = _tokens(text)
-    for pipeline in _split(tokens):
-        cmds = [c for c in (_simple(words, ctx) for words in pipeline) if c is not None]
+    # `cd DIR && command` is how agents write most commands. A file operand after it belongs to
+    # DIR, not to the hook's working directory; a subshell's `cd` ends with the subshell.
+    dirs: list[str | None] = [None]
+    for kind, pipeline in _sequence(tokens):
+        if kind == "(":
+            dirs.append(dirs[-1])
+            continue
+        if kind == ")":
+            if len(dirs) > 1:
+                dirs.pop()
+            continue
+        ctx.dir = dirs[-1]
+        cmds = []
+        for words in pipeline:
+            c = _simple(words, ctx)
+            if c is None:
+                continue
+            if ctx.dir is not None and ctx.dir != _DIR_UNKNOWN:
+                _rebase_cmd(c, ctx.dir)
+            cmds.append(c)
+        if len(pipeline) == 1:   # in a pipeline `cd` runs in a subshell and moves nothing
+            target = _cd_target(pipeline[0])
+            if target is not None:
+                dirs[-1] = _join_dir(dirs[-1], target)
         if cmds:
             _pipeline(cmds, ctx, out)
+    ctx.dir = None
     # substitutions that no command consumed (a bare "$(...)" or an assignment) still ran
     for kind, inner in ctx.subs:
         _merge(out, inner)
@@ -1569,6 +1764,13 @@ def analyze_bash(command: str, cwd: str | None = None) -> BashAnalysis:
     opaque so that it is treated as a possible sink.
     """
     command = command or ""
+    if len(command) > MAX_COMMAND_CHARS:
+        out = BashAnalysis(opaque=True, is_sink=True, carries_payload=True, sink_kinds=["opaque"])
+        _add(out.opaque_reasons, f"the command is {len(command):,} characters long, too long to analyse")
+        for url in _URL.findall(command)[:50]:
+            _add(out.destinations, ("url", url.rstrip(".,)'\"")))
+        out.summary = " ".join(command[:400].split())[:200]
+        return out
     try:
         out = _analyze(command, cwd, 0)
     except Exception as exc:   # noqa: BLE001 - a parser bug must never make a command look safe

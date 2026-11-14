@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import fnmatch
 import os
+import re
 import secrets
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
@@ -54,6 +55,9 @@ class Config:
     llm: str = "auto"
     # Tell the agent at session start that it is being watched and what a block means.
     announce: bool = True
+    # Why the config file could not be read, if it could not. The guard then runs on the
+    # defaults (plus the mode and fail_closed lines, when those two are legible) and says so.
+    config_error: str = ""
 
     @property
     def db_path(self) -> Path:
@@ -137,20 +141,18 @@ class Config:
 def find_root(cwd: str | os.PathLike[str] | None = None) -> Path:
     """The project a working directory belongs to.
 
-    The nearest ancestor that already has a ``.tainttrail`` directory wins, then the
-    nearest git repository root, then the directory itself.
+    The nearest ancestor that has a ``.tainttrail`` directory or is a git repository
+    root, then the directory itself. Nearest wins whichever of the two it is: a
+    ``.tainttrail`` directory further up (in the home directory, say, once a session was
+    started there) must not swallow every repository below it.
     """
     start = Path(cwd or os.getcwd()).expanduser()
     try:
         start = start.resolve()
     except OSError:
         pass
-    candidates = [start, *start.parents]
-    for d in candidates:
-        if (d / HOME_DIRNAME).is_dir():
-            return d
-    for d in candidates:
-        if (d / ".git").exists():
+    for d in (start, *start.parents):
+        if (d / HOME_DIRNAME).is_dir() or (d / ".git").exists():
             return d
     return start
 
@@ -169,16 +171,57 @@ def load_config(cwd: str | os.PathLike[str] | None = None) -> Config:
         root = find_root(cwd)
         home = root / HOME_DIRNAME
     cfg = Config(root=root, home=home)
+    path = home / CONFIG_FILENAME
+    raw: dict[str, Any] = {}
     try:
-        with open(home / CONFIG_FILENAME, "rb") as fh:
+        with open(path, "rb") as fh:
             raw = _toml.load(fh)
     except FileNotFoundError:
-        raw = {}
-    _apply(cfg, raw)
+        pass
+    except (OSError, ValueError) as exc:   # unreadable, or not TOML
+        cfg.config_error = f"{path} could not be read ({exc}); the defaults are in use"
+        raw = _salvage(path)
+    try:
+        _apply(cfg, raw)
+    except (TypeError, ValueError, AttributeError) as exc:   # a string where a table belongs, and the like
+        cfg = Config(root=root, home=home)
+        cfg.config_error = f"{path} has a value of the wrong kind ({exc}); the defaults are in use"
+        _apply(cfg, {k: raw[k] for k in ("mode", "fail_closed") if k in raw})
     env_mode = os.environ.get("TAINTTRAIL_MODE")
     if env_mode in defaults.MODES:
         cfg.mode = env_mode
     return cfg
+
+
+_SALVAGE = re.compile(r"""^\s*(mode|fail_closed)\s*=\s*("?)(monitor|guard|strict|true|false)\2\s*(?:\#.*)?$""", re.M)
+
+
+def _salvage(path: Path) -> dict[str, Any]:
+    """The two safety settings of a config file that does not parse, if their lines are legible.
+
+    A typo elsewhere in the file must not turn ``fail_closed = true`` or ``mode = "strict"``
+    back into the defaults without anyone noticing.
+    """
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return {}
+    out: dict[str, Any] = {}
+    for name, _quote, value in _SALVAGE.findall(text):
+        if name == "mode" and value in defaults.MODES:
+            out["mode"] = value
+        elif name == "fail_closed" and value in ("true", "false"):
+            out["fail_closed"] = value == "true"
+    return out
+
+
+def _table(raw: dict[str, Any], name: str) -> dict[str, Any]:
+    value = raw.get(name)
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise TypeError(f"[{name}] must be a table")
+    return value
 
 
 def _apply(cfg: Config, raw: dict[str, Any]) -> None:
@@ -191,16 +234,16 @@ def _apply(cfg: Config, raw: dict[str, Any]) -> None:
         cfg.announce = raw["announce"]
     if raw.get("llm") in ("auto", "claude-cli", "none"):
         cfg.llm = raw["llm"]
-    hosts = raw.get("hosts") or {}
+    hosts = _table(raw, "hosts")
     cfg.trusted_hosts = _extend(cfg.trusted_hosts, hosts.get("trusted"), hosts.get("replace_trusted"))
-    paths = raw.get("paths") or {}
+    paths = _table(raw, "paths")
     cfg.sensitive_paths = _extend(cfg.sensitive_paths, paths.get("sensitive"))
     cfg.protected_paths = _extend(cfg.protected_paths, paths.get("protected"))
     cfg.untrusted_paths = _extend(cfg.untrusted_paths, paths.get("untrusted"))
     cfg.sensitive_path_exceptions = _extend(cfg.sensitive_path_exceptions, paths.get("not_sensitive"))
-    rules = raw.get("rules") or {}
+    rules = _table(raw, "rules")
     cfg.rules = {str(k).upper(): str(v).lower() for k, v in rules.items() if str(v).lower() in (*ACTIONS, "off")}
-    limits = raw.get("limits") or {}
+    limits = _table(raw, "limits")
     for name in ("max_content_bytes", "max_chunks", "max_entities", "lock_timeout_ms"):
         value = limits.get(name)
         if isinstance(value, int) and value > 0:

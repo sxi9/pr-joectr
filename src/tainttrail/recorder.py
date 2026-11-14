@@ -213,7 +213,8 @@ class Recorder:
             {"sid": event.session_id, "cid": cid},
         )
         if analysis.sensitive and analysis.source is not None and analysis.source.kind == "file":
-            self.store.write("MATCH (e:Entity {id: $id}) SET e.sensitive = true", {"id": analysis.source.id})
+            self.store.write("MATCH (e:Entity {id: $id}) SET e.sensitive = true, e.holds_secret = true",
+                             {"id": analysis.source.id})
         return cid
 
     # -- tool calls ------------------------------------------------------------------------
@@ -315,7 +316,7 @@ class Recorder:
                 WITH f, sum(CASE WHEN k.kind IN ['secret', 'token'] THEN 1 ELSE 0 END) AS strong,
                      sum(CASE WHEN k.kind = 'line' THEN 1 ELSE 0 END) AS lines
                 WHERE strong >= 1 OR lines >= $min_lines
-                SET f.sensitive = true
+                SET f.sensitive = true, f.holds_secret = true
                 """,
                 {"id": cid, "min_lines": COPY_TAINT_MIN_CHUNKS},
             )
@@ -386,7 +387,9 @@ class Recorder:
             MATCH (s:Entity {id: p.s})
             MERGE (t)-[d:DERIVED_FROM]->(s)
             SET d.call = $id,
+                t.holds_secret = coalesce(t.holds_secret, false) OR coalesce(s.sensitive, false),
                 t.sensitive = coalesce(t.sensitive, false) OR coalesce(s.sensitive, false),
+                t.tainted = coalesce(t.tainted, false) OR coalesce(s.untrusted, false) OR s.kind IN ['url', 'host'],
                 t.untrusted = coalesce(t.untrusted, false) OR coalesce(s.untrusted, false)
                               OR s.kind IN ['url', 'host']
             """,
@@ -413,7 +416,8 @@ class Recorder:
             )
             if content.sensitive and content.source is not None and content.source.kind == "file":
                 self.store.write(
-                    "MATCH (e:Entity {id: $id}) SET e.sensitive = true", {"id": content.source.id}
+                    "MATCH (e:Entity {id: $id}) SET e.sensitive = true, e.holds_secret = true",
+                    {"id": content.source.id}
                 )
             if not event.failed:
                 self._taint_written_files(call_id)
@@ -429,7 +433,7 @@ class Recorder:
             WHERE n >= $min_chunks OR coalesce(u.injection_score, 0.0) >= $min_injection
                   OR coalesce(f.protected, false)
             MERGE (f)-[t:TAINTED_BY]->(u)
-            SET t.strength = 'copy', t.call = $id, t.chunks = n, f.untrusted = true
+            SET t.strength = 'copy', t.call = $id, t.chunks = n, f.untrusted = true, f.tainted = true, f.reviewed = false
             """,
             {"id": call_id, "min_chunks": COPY_TAINT_MIN_CHUNKS, "min_injection": COPY_TAINT_MIN_INJECTION},
         )
@@ -480,7 +484,8 @@ class Recorder:
         if not row:
             return False
         self.store.write(
-            "MATCH (e:Entity {id: $id}) OPTIONAL MATCH (e)-[t:TAINTED_BY]->() DELETE t SET e.untrusted = false",
+            "MATCH (e:Entity {id: $id}) OPTIONAL MATCH (e)-[t:TAINTED_BY]->() DELETE t "
+            "SET e.untrusted = false, e.tainted = false, e.reviewed = true",
             {"id": entity_id},
         )
         return True
@@ -632,9 +637,11 @@ class Recorder:
             ON CREATE SET e.kind = r.kind, e.value = r.value, e.name = r.name, e.first_seen = $ts,
                           e.sensitive = r.sensitive, e.protected = r.protected,
                           e.untrusted = r.untrusted, e.trusted = r.trusted, e.local = r.local
-            ON MATCH SET e.sensitive = coalesce(e.sensitive, false) OR r.sensitive,
-                         e.protected = coalesce(e.protected, false) OR r.protected,
-                         e.untrusted = coalesce(e.untrusted, false) OR r.untrusted
+            ON MATCH SET e.sensitive = r.sensitive OR coalesce(e.holds_secret, false),
+                         e.protected = r.protected,
+                         e.untrusted = (r.untrusted AND NOT coalesce(e.reviewed, false)) OR coalesce(e.tainted, false),
+                         e.trusted = r.trusted OR coalesce(e.trust_reason, '') <> '',
+                         e.local = r.local
             """,
             {"rows": list(rows.values()), "ts": ts},
         )

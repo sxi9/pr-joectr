@@ -156,6 +156,16 @@ def test_an_internal_error_fails_open_or_closed_as_configured(project, monkeypat
     assert fire(project, "PostToolUse", **call, tool_response="x") is None, "only the pre-tool hook can block"
 
 
+def test_a_broken_config_file_is_reported_and_the_guard_keeps_working(project, capsys):
+    (project / ".tainttrail").mkdir(exist_ok=True)
+    (project / ".tainttrail" / "config.toml").write_text('mode = "guard"\n[hosts]\ntrusted = ["unclosed\n')
+    out = fire(project, "SessionStart", source="startup")
+    assert "config.toml could not be read" in out["systemMessage"]
+    assert attack(project)["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert cli_main(["-C", str(project), "status"]) == 0
+    assert "could not be read" in capsys.readouterr().out
+
+
 def test_a_damaged_graph_is_replaced_and_the_user_is_told(project):
     assert attack(project)["hookSpecificOutput"]["permissionDecision"] == "deny"
     graph = project / ".tainttrail" / "graph.rl"

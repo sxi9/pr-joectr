@@ -25,7 +25,7 @@ import math
 import os
 import re
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Callable, Iterable
 from urllib.parse import unquote, unquote_plus, urlsplit
 
 from .config import normalize_path
@@ -181,10 +181,14 @@ def find_urls(text: str) -> list[str]:
     out = []
     for m in _URL.finditer(text):
         url = m.group(0)
-        while url and url[-1] in _TRAILING:
-            if url[-1] == ")" and url.count("(") >= url.count(")"):
-                break   # the bracket belongs to the address: .../Foo_(bar)
-            url = url[:-1]
+        end, opened, closed = len(url), url.count("("), url.count(")")
+        while end and url[end - 1] in _TRAILING:
+            if url[end - 1] == ")":
+                if opened >= closed:
+                    break   # the bracket belongs to the address: .../Foo_(bar)
+                closed -= 1
+            end -= 1
+        url = url[:end]
         if "://" in url and len(url) > url.index("://") + 3:
             out.append(url)
     return out
@@ -271,7 +275,8 @@ class SecretHit:
     end: int
 
 
-_GENERIC_NAME = r"(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|auth|credential)"
+# "author" and "tokenizer" are not credentials; the look-aheads keep them out.
+_GENERIC_NAME = r"(?:password|passwd|pwd|secret|token(?!iz)|api[_-]?key|access[_-]?key|private[_-]?key|auth(?!or)|credential)"
 _SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str], int], ...] = (
     ("private_key", re.compile(r"-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----.*?(?:-----END (?:[A-Z0-9 ]+ )?PRIVATE KEY-----|\Z)", re.S), 0),
     ("aws_access_key_id", re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"), 0),
@@ -287,11 +292,17 @@ _SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str], int], ...] = (
     ("npm_token", re.compile(r"\bnpm_[A-Za-z0-9]{36}\b"), 0),
     ("pypi_token", re.compile(r"\bpypi-[A-Za-z0-9_-]{40,}"), 0),
     ("sendgrid_key", re.compile(r"\bSG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}"), 0),
-    ("jwt", re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"), 0),
-    ("url_password", re.compile(r"\b[a-z][a-z0-9+.-]*://[^\s:/@]{1,64}:([^\s@/]{3,})@[\w.-]"), 1),
+    # Starts only where a run of token characters starts, and each part is taken whole (the look-ahead
+    # plus back-reference is an atomic group that also works on Python 3.10): no start inside a long
+    # run, no backtracking into one.
+    ("jwt", re.compile(r"(?<![A-Za-z0-9_-])eyJ(?=([A-Za-z0-9_-]{8,}))\1\.eyJ(?=([A-Za-z0-9_-]{8,}))\2\.[A-Za-z0-9_-]{8,}"), 0),
+    ("url_password", re.compile(r"\b[a-z][a-z0-9+.-]{0,20}://[^\s:/@]{1,64}:([^\s@/]{3,200})@[\w.-]"), 1),
     ("canary", re.compile(r"\bcanary-[A-Za-z0-9_-]{8,}"), 0),
+    # Anchored on the keyword, with every repeat bounded: a pattern that may start anywhere in a run
+    # of dots or word characters and scan to its end is quadratic, and one line of test-runner dots
+    # was enough to keep a hook busy past its timeout.
     ("assigned_secret", re.compile(
-        r"(?im)(?<![\w-])[\"']?[\w.-]*" + _GENERIC_NAME + r"[\w.-]*[\"']?\s*[=:]\s*[\"']?([^\s\"'#,;`<>(){}\[\]]{8,})"), 1),
+        r"(?i)" + _GENERIC_NAME + r"[\w.-]{0,64}[\"']?\s{0,8}[=:]\s{0,8}[\"']?([^\s\"'#,;`<>(){}\[\]]{8,})"), 1),
     ("env_value", re.compile(r"(?m)^(?:export\s+)?[A-Z][A-Z0-9_]{2,}\s*=\s*[\"']?([A-Za-z0-9+/=_-]{20,})[\"']?\s*$"), 1),
 )
 _PLACEHOLDER = re.compile(
@@ -311,6 +322,31 @@ def shannon_entropy(s: str) -> float:
     return -sum(c / n * math.log2(c / n) for c in counts.values())
 
 
+_NAME_ENDS_IN_CREDENTIAL_WORD = re.compile(
+    r"(?i)(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|secret[_-]?key|credentials?|auth)$")
+_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*")
+
+
+def _plausible_assignment(text: str, m: "re.Match[str]", value: str) -> bool:
+    """Whether a ``name = value`` hit can be a credential at all.
+
+    ``auth = HTTPBasicAuth(user, pw)``, ``"token_type": "bearer12"``, ``POSTGRES_PASSWORD: postgres``
+    and ``token = create_access_token(...)`` are code and configuration, not secrets. Taking them
+    for secrets fingerprints ordinary words, and the next commit message that repeats one is then
+    "carrying a secret".
+    """
+    head = text[m.start():m.start(1)]
+    name = re.match(r"[\w.-]+", head)
+    if not name or not _NAME_ENDS_IN_CREDENTIAL_WORD.search(name.group(0)):
+        return False            # token_type, AUTH_USER_MODEL, password_hint, secret.txt
+    quoted = head.rstrip()[-1:] in ("\"", "'")
+    after = text[m.end(1):m.end(1) + 1]
+    if not quoted and _IDENTIFIER.fullmatch(value):
+        if "." in value or after in ("(", "[", ".") or not any(ch.isdigit() for ch in value):
+            return False        # request.form, create_access_token(...), hashedPassword, postgres
+    return True
+
+
 def find_secrets(text: str) -> list[SecretHit]:
     """Credentials in the text, recognised by their shape. Non-overlapping, in order."""
     if not text:
@@ -326,6 +362,8 @@ def find_secrets(text: str) -> list[SecretHit]:
                 if _PLACEHOLDER.match(value) or ("example" in value.lower() and not value.lower().startswith("canary")):
                     continue
                 if value.startswith(("http://", "https://", "/", "./", "~/")) or value.endswith((":", "=")):
+                    continue
+                if not _plausible_assignment(text, m, value):
                     continue
             if kind == "env_value" and (
                     shannon_entropy(value) < 3.8 or value.startswith("-") or "=" in value.rstrip("=")
@@ -470,6 +508,8 @@ def content_chunks(text: str, key: bytes, *, limit: int = 400) -> list[ChunkRef]
                 chunks[fp] = ChunkRef(fp, kind, hint, len(value))
 
     for hit in find_secrets(text):
+        if hit.kind in ("assigned_secret", "url_password") and len(hit.value) < 12 and hit.value.isalpha():
+            continue    # a short dictionary-like word is no evidence when it shows up again
         add(hit.value, "secret", hit.kind)
         if hit.kind == "private_key":
             body = [ln.strip() for ln in hit.value.splitlines() if ln.strip() and not ln.startswith("-----")]
@@ -481,8 +521,7 @@ def content_chunks(text: str, key: bytes, *, limit: int = 400) -> list[ChunkRef]
             for part in _tokens(hit.value, MIN_SUBTOKEN):
                 add(part, "secret", hit.kind)
     for url in find_urls(text):
-        if "?" in url:
-            add(url, "url")
+        add(url, "url")     # every link the content lists: a later GET of exactly it is "following a link"
     budget = len(chunks) + max(0, (limit - len(chunks)) // 2)
     for token in _tokens(text, MIN_SOURCE_TOKEN):
         if len(chunks) >= budget:
@@ -660,38 +699,111 @@ _CRED_WORDS = (r"(?:\.env\b|id_rsa|ssh[ _-]?keys?|private[ _-]?keys?|api[ _-]?(?
                r"|credentials?|secrets?|passwords?|environment variables|your environment|auth(?:entication)? tokens?"
                r"|output of (?:the )?[`'\"]?(?:env|printenv)[`'\"]?)")
 _SEND_VERBS = r"(?:send|post|upload|attach|include|paste|transmit|share|e-?mail|append|forward|submit|exfiltrate|leak)"
-_AGENT_WORDS = r"(?:AI|LLM|language model|assistant|agent|claude|copilot|chatgpt|gemini|cursor|model)s?"
-_INJECTION_MARKERS: tuple[tuple[str, float, re.Pattern[str]], ...] = (
+_ADDRESSEE = r"(?:AI|LLM|language model|assistant|(?:AI|LLM|automated|coding) agent|claude|copilot|chatgpt|gemini)s?"
+_MODAL = r"(?:must|should|need to|have to|are required to|shall|please|now)"
+# Three markers are functions, not patterns. As single regular expressions they were either
+# quadratic or cost tens of microseconds per byte on dense input (a page of "<!--", compact JSON
+# full of URLs), which is how a hook comes to outlive its timeout. Each scans the text once.
+_CRED_RX = re.compile(_CRED_WORDS, re.I)
+_SEND_TO_URL_RX = re.compile(r"\b" + _SEND_VERBS + r"\b[^\n]{0,80}https?://", re.I)
+_TEMPLATE_RX = re.compile(r"<[^<>\s]{0,60}(?:token|key|secret|password|credential|\.env)[^<>\s]{0,60}>", re.I)
+# "<!-- prettier-ignore-start -->" and "<!-- this must stay in sync -->" are ordinary comments.
+_COMMENT_WORD_RX = re.compile(
+    r"\b(?:assistants?|agents?|AI|LLM|claude|copilot|instructions?)\b|\bignore\s+(?:all|any|the|previous|prior|above)", re.I)
+_SPACE_RX = re.compile(r"\s")
+
+
+def _read_then_send(text: str) -> bool:
+    """A credential word, then within the same or the next line a send verb followed by a URL."""
+    sends = [m.start() for m in _SEND_TO_URL_RX.finditer(text)]
+    if not sends:
+        return False
+    creds = [m.end() for m in _CRED_RX.finditer(text)]
+    if not creds:
+        return False
+    lo = 0
+    for send in sends:
+        while lo < len(creds) and creds[lo] < send - 241:
+            lo += 1
+        i = lo
+        while i < len(creds) and creds[i] <= send:
+            gap = text[creds[i]:send]
+            first = gap.find("\n")
+            if first < 0:
+                if len(gap) <= 240:
+                    return True
+            elif first <= 80 and len(gap) - first - 1 <= 160 and "\n" not in gap[first + 1:]:
+                return True
+            i += 1
+    return False
+
+
+def _secret_in_url_template(text: str) -> bool:
+    """A URL with a placeholder for a secret in it: https://host/collect?d=<API_KEY>."""
+    for m in _TEMPLATE_RX.finditer(text):
+        before = text[max(0, m.start() - 300):m.start()]
+        cut = 0
+        for ws in _SPACE_RX.finditer(before):
+            cut = ws.end()
+        address = before[cut:].lower()
+        if "http://" in address or "https://" in address:
+            return True
+    return False
+
+
+def _hidden_comment(text: str) -> bool:
+    """An HTML comment that, within its first 800 characters, addresses an agent or gives an order."""
+    at = text.find("<!--")
+    while at >= 0:
+        end = text.find("-->", at + 4)
+        if end < 0:
+            return False
+        if _COMMENT_WORD_RX.search(text, at + 4, min(end, at + 4 + 800)):
+            return True
+        at = text.find("<!--", end + 3)
+    return False
+
+
+_INJECTION_MARKERS: tuple[tuple[str, float, "re.Pattern[str] | Callable[[str], bool]"], ...] = (
     ("ignore-previous", 0.6, re.compile(
         r"\b(?:ignore|disregard|forget|override)\b.{0,40}\b(?:previous|prior|above|earlier|all|any|your)\b.{0,40}"
         r"\b(?:instruction|prompt|rule|direction|guideline)s?\b", re.I | re.S)),
+    # A markdown heading is a fake role tag only when it is written as one ("### System:"). "## System
+    # Requirements" and "## Instructions" are in every README.
     ("fake-role-tag", 0.5, re.compile(
-        r"<\s*/?\s*(?:system|assistant|instructions?)\s*>|\[/?INST\]|^#{2,3}\s*(?:system|instruction)s?\b"
-        r"|<\|(?:im_start|system|assistant)\|>|BEGIN (?:SYSTEM|ADMIN) (?:PROMPT|MESSAGE)", re.I | re.M)),
+        r"<\s*/?\s*(?:system|assistant|instructions?)\s*>|\[/?INST\]|^#{2,3}\s*(?:system|instructions?)\s*:"
+        r"|^#{2,3}\s*system\s+(?:prompt|message)\b|<\|(?:im_start|system|assistant)\|>|BEGIN (?:SYSTEM|ADMIN) (?:PROMPT|MESSAGE)",
+        re.I | re.M)),
+    # "model" and "cursor" are everyday nouns (Django models, database cursors) and a bare "agent" is
+    # usually a user agent or a build agent. An agent is addressed when the text names an AI assistant,
+    # qualifies the agent ("AI agents", "coding agents") or speaks to it ("agents: ...").
     ("addressed-to-agent", 0.3, re.compile(
-        r"\b" + _AGENT_WORDS + r"\b[^.\n]{0,60}\b(?:must|should|need to|have to|are required to|shall|please|now)\b"
-        r"|\b(?:attention|note to|message for|instructions? for)\b[^.\n]{0,20}\b" + _AGENT_WORDS + r"\b", re.I)),
+        r"\b" + _ADDRESSEE + r"\b[^.\n]{0,60}\b" + _MODAL + r"\b"
+        r"|\bagents?\s*[:,]\s*[^.\n]{0,80}\b" + _MODAL + r"\b"
+        r"|\b(?:attention|note (?:to|for)|message for|instructions? for)\b[^.\n]{0,24}\b(?:" + _ADDRESSEE + r"|agents?)\b", re.I)),
     ("new-instructions", 0.3, re.compile(
         r"\b(?:new|updated|additional|important|urgent|special|system)\s+(?:instructions?|task|directive)s?\b\s*[:\-]", re.I)),
+    # "Send ... credentials" needs somewhere to send them. "Include your API key in the Authorization
+    # header of every request" is how every API documents authentication.
     ("send-credentials", 0.4, re.compile(
-        r"\b" + _SEND_VERBS + r"\b[^.\n]{0,100}" + _CRED_WORDS + r"|" + _CRED_WORDS + r"[^.\n]{0,100}\b(?:to|into)\s+https?://",
-        re.I)),
+        r"\b" + _SEND_VERBS + r"\b[^.\n]{0,100}" + _CRED_WORDS + r"[^.\n]{0,80}"
+        r"(?:\bto\s+(?:https?://|[\w-]+(?:\.[\w-]+)+\b|the\s+(?:server|endpoint|url|address|webhook|maintainers?))"
+        r"|\b(?:in|into|as)\s+(?:your|the|a|an)\s+(?:[\w-]+\s+){0,2}"
+        r"(?:comments?|reply|review|issue|pull request|pr|message|response|summary|commit|gist|blob|paste))"
+        r"|" + _CRED_WORDS + r"[^.\n]{0,100}\b(?:to|into)\s+https?://", re.I)),
     ("secrecy", 0.25, re.compile(
         r"\b(?:do not|don't|never|without)\b[^.\n]{0,30}\b(?:tell|mention|reveal|inform|alert|notify|show|asking)\b"
         r"[^.\n]{0,30}\b(?:user|human|developer|anyone|operator)\b"
         r"|\bdo (?:this|it|so) (?:silently|quietly)\b|\bwithout (?:telling|asking|notifying|mentioning)\b", re.I)),
     ("note-for-agent", 0.3, re.compile(
         r"\((?:for|to) (?:the |any |all )?[\w -]{0,24}(?:agents?|assistants?)\)", re.I)),
-    ("read-then-send", 0.4, re.compile(
-        _CRED_WORDS + r"[^\n]{0,80}\n?[^\n]{0,160}\b" + _SEND_VERBS + r"\b[^\n]{0,80}https?://", re.I)),
-    ("secret-in-url-template", 0.4, re.compile(
-        r"https?://[^\s<>]*[?&=/][^\s]*<[^>]{0,60}(?:token|key|secret|password|credential|\.env)[^>]{0,60}>", re.I)),
+    ("read-then-send", 0.4, _read_then_send),
+    ("secret-in-url-template", 0.4, _secret_in_url_template),
     ("permission-waiver", 0.3, re.compile(
         r"\b(?:does(?:n't| not) care about privacy|no need to (?:ask|confirm|check with)|(?:do not|don't) (?:ask|wait) for "
         r"(?:permission|confirmation|approval)|put everything you find)\b", re.I)),
     ("send-to-url", 0.1, re.compile(r"\b" + _SEND_VERBS + r"\b[^.\n]{0,80}https?://", re.I)),
-    ("hidden-comment", 0.3, re.compile(
-        r"<!--(?:(?!-->).){0,400}?\b(?:assistant|agent|AI|ignore|instruction|must|system)\b(?:(?!-->).){0,400}?-->", re.I | re.S)),
+    ("hidden-comment", 0.3, _hidden_comment),
     ("invisible-characters", 0.25, re.compile(r"(?:[\u200b\u200c\u200d\u2060\ufeff][^\u200b\u200c\u200d\u2060\ufeff]{0,3}){3,}|[\U000e0000-\U000e007f]")),
     ("hidden-style", 0.15, re.compile(
         r"display\s*:\s*none|visibility\s*:\s*hidden|font-size\s*:\s*0|opacity\s*:\s*0(?!\.)", re.I)),
@@ -715,7 +827,7 @@ def injection_score(text: str) -> tuple[float, list[str]]:
     miss = 1.0
     fired: list[str] = []
     for name, weight, pattern in _INJECTION_MARKERS:
-        if pattern.search(sample):
+        if pattern(sample) if callable(pattern) else pattern.search(sample):
             fired.append(name)
             miss *= 1.0 - weight
     if fired and fired != ["send-to-url"] and _URGENCY.search(sample):

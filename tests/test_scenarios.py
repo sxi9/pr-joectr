@@ -15,6 +15,11 @@ SCENARIOS = list_scenarios()
 ATTACKS = [s for s in SCENARIOS if s["group"] == "attack"]
 BENIGN = [s for s in SCENARIOS if s["group"] == "benign"]
 GAPS = [s for s in SCENARIOS if s["group"] == "known_gaps"]
+VARIANTS = [s for s in SCENARIOS if s["group"] == "variant"]
+ORDINARY = [s for s in SCENARIOS if s["group"] == "ordinary"]
+# The one ordinary session the guard still asks about (a deploy summary posted to Slack after a
+# documentation page and a read of .env). Kept visible in the data and here, not tuned away.
+STILL_ASKED = {"p51-long-mixed-deploy-and-notify"}
 
 
 @pytest.fixture(autouse=True)
@@ -24,6 +29,7 @@ def _key(monkeypatch):
 
 def test_the_suite_has_the_expected_shape():
     assert len(ATTACKS) >= 15 and len(BENIGN) >= 10 and len(GAPS) >= 3
+    assert len(VARIANTS) == 11 and len(ORDINARY) == 64
     ids = [s["id"] for s in SCENARIOS]
     assert len(ids) == len(set(ids))
     for s in SCENARIOS:
@@ -39,7 +45,8 @@ def test_scenarios_use_only_reserved_hosts_and_canaries():
     hosts = {h.lower().rstrip(".") for h in re.findall(r"https?://([A-Za-z0-9.-]+)", text)}
     # Real hosts a developer workflow names. Replay contacts nothing, so naming them is harmless.
     everyday = {"github.com", "api.github.com", "raw.githubusercontent.com", "docs.python.org", "pypi.org",
-                "files.pythonhosted.org", "registry.npmjs.org", "localhost", "127.0.0.1", "gist.github.com"}
+                "files.pythonhosted.org", "registry.npmjs.org", "localhost", "127.0.0.1", "gist.github.com",
+                "nodejs.org"}
     for host in hosts:
         reserved = host.endswith((".example", ".test", ".invalid", ".example.com", ".example.org")) or host in (
             "example.com", "example.org")
@@ -63,6 +70,25 @@ def test_ordinary_work_is_left_alone(scenario, tmp_path):
     result = replay(scenario, tmp_path / "project")
     interrupted = [(s.index, s.tool, s.action, s.rules, s.reason[:120]) for s in result.steps if s.action != "allow"]
     assert interrupted == []
+
+
+@pytest.mark.parametrize("scenario", VARIANTS, ids=[s["id"] for s in VARIANTS])
+def test_attacks_at_the_edges_of_the_precision_fixes_are_still_stopped(scenario, tmp_path):
+    """Each narrowing that removed a false alarm has an attack written against it."""
+    result = replay(scenario, tmp_path / "project")
+    assert result.ok, [(s.index, s.tool, s.expect, s.action, s.rules) for s in result.steps if not s.ok]
+    assert result.blocked_at is not None or result.asked_at, "the attack met no resistance"
+
+
+@pytest.mark.parametrize("scenario", ORDINARY, ids=[s["id"] for s in ORDINARY])
+def test_a_reviewers_ordinary_sessions_run_without_a_question(scenario, tmp_path):
+    """64 multi-step sessions written to find false alarms. Half of them used to be interrupted."""
+    result = replay(scenario, tmp_path / "project")
+    interrupted = [(s.index, s.tool, s.action, s.rules, s.reason[:120]) for s in result.steps if s.action != "allow"]
+    if scenario["id"] in STILL_ASKED:
+        assert [(i[2], i[3]) for i in interrupted] == [("ask", ["TT002"])]
+    else:
+        assert interrupted == []
 
 
 @pytest.mark.parametrize("scenario", GAPS, ids=[s["id"] for s in GAPS])

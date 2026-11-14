@@ -41,11 +41,59 @@ _ID_KEYS = ("owner", "repo", "repository", "project", "number", "issue_number", 
             "query", "q", "path", "url", "channel", "ref")
 _MENTION = re.compile(r"(?<![\w@])@((?:~|\.{1,2})?/?[\w.-]+(?:/[\w.-]+)*\.?[\w-]*)")
 _FORGE_HOST = {"github": "github.com", "gitlab": "gitlab.com"}
-# Registrable suffixes that are not themselves a party: never treat them as "the parent domain".
-_PUBLIC_SUFFIXES = frozenset({"co.uk", "org.uk", "ac.uk", "com.au", "co.jp", "co.nz", "co.in", "com.br", "github.io",
-                              "gitlab.io", "pages.dev", "workers.dev", "herokuapp.com", "vercel.app", "netlify.app",
-                              "web.app", "amazonaws.com", "s3.amazonaws.com", "cloudfront.net", "azurewebsites.net",
-                              "blob.core.windows.net", "googleapis.com", "appspot.com", "ngrok.io", "ngrok-free.app"})
+# Suffixes that are not themselves a party: nobody "names" co.uk by naming docs.shop.co.uk. This
+# is a short stand-in for the public suffix list. It matters for safety, not only for tidiness:
+# what the user named extends to parent domains, so a missing entry would let one tenant of a
+# shared suffix vouch for all the others.
+_PUBLIC_SUFFIXES = frozenset("""
+    co.uk org.uk ac.uk gov.uk me.uk ltd.uk plc.uk net.uk sch.uk nhs.uk
+    com.au net.au org.au edu.au gov.au id.au  co.nz net.nz org.nz govt.nz ac.nz
+    co.jp ne.jp or.jp ac.jp go.jp  co.kr or.kr ne.kr go.kr ac.kr
+    co.in net.in org.in gen.in firm.in ind.in ac.in gov.in edu.in
+    com.br net.br org.br gov.br edu.br  com.cn net.cn org.cn gov.cn edu.cn
+    com.tw org.tw net.tw edu.tw  com.hk org.hk edu.hk  com.sg edu.sg org.sg gov.sg  com.my org.my
+    co.id or.id ac.id go.id  co.th in.th ac.th or.th  com.ph com.vn com.pk com.bd
+    com.tr org.tr net.tr edu.tr  com.mx org.mx  com.ar com.co com.pe com.ve com.uy com.ec com.bo com.py
+    co.za org.za net.za ac.za  com.ng co.ke com.eg com.gh co.tz co.ug  co.il org.il ac.il  com.sa com.qa
+    com.ua co.ua  com.pl net.pl org.pl  co.at or.at ac.at  com.es org.es  com.pt com.gr com.cy com.mt
+    com.ru org.ru net.ru  co.rs  com.ro  co.hu  com.hr
+""".split())
+# Domains under which strangers get their own names at any depth (hosting, tunnels, buckets,
+# request catchers). A host under one of them has no parent domain worth the name.
+_SHARED_BASES = tuple("""
+    amazonaws.com amazonaws.com.cn elasticbeanstalk.com awsapprunner.com cloudfront.net
+    azurewebsites.net windows.net azureedge.net azurestaticapps.net cloudapp.azure.com trafficmanager.net
+    googleapis.com googleusercontent.com appspot.com run.app cloudfunctions.net web.app firebaseapp.com
+    github.io githubusercontent.com gitlab.io pages.dev workers.dev r2.dev herokuapp.com vercel.app
+    netlify.app onrender.com fly.dev railway.app repl.co replit.dev glitch.me surge.sh deno.dev
+    digitaloceanspaces.com ondigitalocean.app supabase.co blogspot.com wordpress.com notion.site
+    webflow.io readthedocs.io gitbook.io pythonanywhere.com
+    ngrok.io ngrok.app ngrok-free.app ngrok-free.dev trycloudflare.com loca.lt localtunnel.me serveo.net
+    duckdns.org nip.io sslip.io pipedream.net webhook.site requestcatcher.com oastify.com interact.sh
+""".split())
+
+
+def parent_domains(host: str) -> list[str]:
+    """The domains a host sits under, nearest first, stopping before anything shared or public.
+
+    ``api.eu.vendor.example`` gives ``eu.vendor.example`` and ``vendor.example``;
+    ``docs.shop.co.uk`` gives ``shop.co.uk``; ``tenant.github.io`` and an IP address give nothing.
+    """
+    host = host.lower().strip(".")
+    labels = host.split(".")
+    if len(labels) < 3 or labels[-1].isdigit() or ":" in host:
+        return []
+    if any(host == base or host.endswith("." + base) for base in _SHARED_BASES):
+        return []
+    out: list[str] = []
+    for i in range(1, len(labels) - 1):
+        parent = ".".join(labels[i:])
+        if parent in _PUBLIC_SUFFIXES:
+            break
+        out.append(parent)
+    return out
+
+
 # MCP servers that run on this machine and keep what they are given.
 _LOCAL_MCP = frozenset({"filesystem", "git", "memory", "sqlite", "time", "sequential-thinking", "desktop-commander"})
 # Arguments that identify an object rather than carry free text.
@@ -132,14 +180,10 @@ class _Builder:
             self.add(S.FETCHES, ref)
         if send:
             self.dest(ref)
-        labels = ref.value.split(".")
-        if not labels[-1].isdigit():
-            for i in range(1, len(labels) - 1):
-                parent = EntityRef("host", ".".join(labels[i:]))
-                if parent.value in _PUBLIC_SUFFIXES:
-                    break
-                rel = S.SENDS_TO if send else S.FETCHES
-                self.actions.setdefault((rel, parent.id), Action(rel, parent, {"via": "suffix"}))
+        for name in parent_domains(ref.value):
+            parent = EntityRef("host", name)
+            rel = S.SENDS_TO if send else S.FETCHES
+            self.actions.setdefault((rel, parent.id), Action(rel, parent, {"via": "suffix"}))
 
     def http(self, url: str, *, send: bool = True, fetch: bool = True) -> None:
         u = url_entity(url)
@@ -185,6 +229,8 @@ def analyze_call(tool_name: str, tool_input: dict, cfg: Config, *, cwd: str, lab
         pieces = [tool_input.get("content"), tool_input.get("new_string"), tool_input.get("new_source")]
         pieces += [e.get("new_string") for e in tool_input.get("edits") or [] if isinstance(e, dict)]
         call.arg_text = "\n".join(str(p) for p in pieces if isinstance(p, str))[:limit]
+        olds = [tool_input.get("old_string")] + [e.get("old_string") for e in tool_input.get("edits") or [] if isinstance(e, dict)]
+        call.extra["old_text"] = "\n".join(str(p) for p in olds if isinstance(p, str))[:limit]
         call.summary = f"{tool} {ref.name if ref else ''}".strip()
     elif tool in SEARCH_TOOLS:
         root = str(tool_input.get("path") or cwd)
@@ -274,6 +320,9 @@ def _analyze_bash(call: CallAnalysis, b: _Builder, command: str, cfg: Config, cw
     call.encodes = ba.encodes
     call.env_dump = ba.env_dump
     call.extra["carries_payload"] = ba.carries_payload
+    call.extra["env_auth"] = list(ba.env_auth)
+    # A request that is nothing but a GET of a URL: no body, no upload, no variable, no pipe into it.
+    call.extra["plain_get"] = not (ba.uploads or ba.env_uploads or ba.env_uploaded or ba.opaque or _NOT_A_GET.search(command))
     if ba.opaque:
         call.extra["opaque_reasons"] = list(ba.opaque_reasons)
     call.arg_text = command[: cfg.max_content_bytes]
@@ -324,6 +373,10 @@ def _analyze_mcp(call: CallAnalysis, b: _Builder, server: str, tool: str, tool_i
             if looks_local:
                 b.add(S.WRITES if labels.local_write else S.READS, file_entity(value, cwd))
 
+    for key, value in leaves:
+        v = value.strip()
+        if key.lower() in _OBJECT_KEYS and 2 <= len(v) <= 80 and not re.search(r"\s", v):
+            b.add(S.REFERENCES if labels.external_sink else S.READS, EntityRef("mcp", f"{server}/obj:{v}"), object=True)
     call.is_sink = bool(labels.external_sink)
     free_text = [v for k, v in leaves if k.lower() not in _ID_LIKE and k.lower() not in _URL_KEYS]
     roomy = any(len(v) >= 40 for v in free_text) or sum(len(v) for v in free_text) >= 80
@@ -343,6 +396,14 @@ def _analyze_mcp(call: CallAnalysis, b: _Builder, server: str, tool: str, tool_i
     call.extra["mcp_server"] = server
     call.extra["mcp_key"] = _mcp_key(by_key)
     call.summary = f"{server}.{tool} {call.extra['mcp_key']}".strip()
+
+
+# Arguments that name the remote object a call reads or writes (a page, an issue, a channel).
+_OBJECT_KEYS = frozenset({"id", "page_id", "pageid", "issueid", "issue_id", "channel_id", "channel", "document_id",
+                          "doc_id", "project_id", "ticket_id", "thread_id", "conversation_id"})
+_NOT_A_GET = re.compile(
+    r"(?:^|\s)(?:-d|--data[\w-]*|--json|-F|--form[\w-]*|-T|--upload-file|--post-data|--post-file|--body-data|--body-file)(?:\s|=)"
+    r"|-X\s*(?:POST|PUT|PATCH|DELETE)|\|\s*(?:curl|wget|nc|ncat|netcat|ssh)\b")
 
 
 def _mcp_key(by_key: dict[str, str]) -> str:
@@ -467,10 +528,19 @@ def analyze_result(tool_name: str, tool_input: dict, tool_response: Any, call: C
         key = call.extra.get("mcp_key") or ""
         fetched = [act.entity for act in call.actions if act.rel == S.FETCHES and act.entity.kind == "url"]
         a.source = fetched[0] if fetched else EntityRef("mcp", f"{server}/{tool} {key}".strip()[:200])
-        if call.labels.untrusted_input:
-            untrusted(f"source:{server}")
-        if call.labels.private_data:
-            sensitive(f"private:{server}")
+        if (match_server(server, catalog=load_catalog()) or {}).get("id") in _LOCAL_MCP:
+            for ref in [e for e in call.entities(S.READS) if e.kind == "file"]:
+                if cfg.is_untrusted_path(ref.value):
+                    untrusted("path:untrusted")
+                if ref.id in tainted:
+                    untrusted(f"tainted:{ref.name}")
+                if cfg.is_sensitive_path(ref.value):
+                    sensitive("path:sensitive")
+        else:
+            if call.labels.untrusted_input:
+                untrusted(f"source:{server}")
+            if call.labels.private_data:
+                sensitive(f"private:{server}")
     elif tool in READ_TOOLS or tool in SEARCH_TOOLS:
         read = call.entities(S.READS)
         a.source = read[0] if read else None
@@ -494,16 +564,23 @@ def analyze_result(tool_name: str, tool_input: dict, tool_response: Any, call: C
         reads = [file_entity(p, cwd) for p in ba.reads]
         fetched = [url_entity(u) for u in ba.fetches]
         fetched = [u for u in fetched if u is not None]
-        if ba.untrusted_output:
+        # A response from this machine is not third-party text. (A local service can relay stored
+        # third-party text; `paths.untrusted` and the injection score still apply to what it returns.)
+        all_local = bool(fetched) and all(cfg.is_local_host(host_of(u.value) or "") for u in fetched)
+        if ba.untrusted_output and not all_local:
             untrusted("source:network" if fetched else "source:third-party")
+        # A file that is sourced (`. ./.env`) is not printed, and a variable that is sent elsewhere
+        # is not in the output: the output is sensitive when the command prints the secret.
+        sourced = {file_entity(p, cwd).id for p in ba.executed if "://" not in p}
         for ref in reads:
             if cfg.is_untrusted_path(ref.value):
                 untrusted("path:untrusted")
             if ref.id in tainted:
                 untrusted(f"tainted:{ref.name}")
-            if cfg.is_sensitive_path(ref.value):
+            if cfg.is_sensitive_path(ref.value) and ref.id not in sourced:
                 sensitive("path:sensitive")
-        if ba.env_dump or any(_SECRETISH.search(name) for name in ba.env_reads):
+        prints = ba.env_dump or any(prog in ("echo", "printf", "printenv") for prog in ba.programs)
+        if ba.env_dump or (prints and any(_SECRETISH.search(name) for name in ba.env_reads)):
             sensitive("environment")
         if ba.sensitive_output:
             sensitive("credential-command")
@@ -561,4 +638,20 @@ def analyze_prompt(prompt: str, cfg: Config, *, cwd: str) -> ContentAnalysis:
         if ref.id not in seen:
             a.mentions.append(ref)
             seen.add(ref.id)
+
+    def also(ref: EntityRef) -> None:
+        if ref.id not in seen:
+            a.mentions.append(ref)
+            seen.add(ref.id)
+
+    # "the token is in PYPI_TOKEN" names the variable as surely as "$PYPI_TOKEN" does
+    for m in re.finditer(r"(?<![\w$])[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+(?![\w])", prompt):
+        also(EntityRef("env", m.group(0)))
+    # naming docs.vendor.example names the vendor: its other hosts are not strangers
+    for ref in [m for m in a.mentions if m.kind == "host"]:
+        for parent in parent_domains(ref.value):
+            also(EntityRef("host", parent))
+    # a bucket the user typed is the host the upload goes to
+    for m in re.finditer(r"\bs3://([a-z0-9][a-z0-9.-]{1,62})", prompt):
+        also(EntityRef("host", f"{m.group(1)}.s3.amazonaws.com"))
     return a

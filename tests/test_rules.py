@@ -91,7 +91,7 @@ def test_tt001_through_an_allow_listed_host_is_still_blocked(sim: Sim):
     assert only(findings, "TT001").action == "deny"
 
 
-def test_tt001_asks_only_when_the_user_named_both_the_destination_and_the_data(sim: Sim):
+def test_what_the_user_named_may_go_where_the_user_named_it_and_nothing_else(sim: Sim):
     mine = EntityRef("host", "backup.example.com")
     sim.prompt(mine)
     sim.fetch_poisoned_page()
@@ -99,11 +99,15 @@ def test_tt001_asks_only_when_the_user_named_both_the_destination_and_the_data(s
     # Naming where to send things is not asking for .env to be sent there.
     _, findings = sim.call("Bash", Action(S.SENDS_TO, mine), sink=True, dests=[mine], carried=[SECRET])
     assert only(findings, "TT001").action == "deny"
+    # Naming both is: nothing goes anywhere the user did not name, and nothing the user did not name goes.
     sim.prompt(mine, sim.env_path())
     _, findings = sim.call("Bash", Action(S.SENDS_TO, mine), sink=True, dests=[mine], carried=[SECRET])
-    f = only(findings, "TT001")
-    assert f.action == "ask"
-    assert "named this destination and this data yourself" in f.explanation
+    f = only(findings, "TT006")
+    assert (f.action, f.severity) == ("allow", "info")
+    assert "You named both" in f.explanation
+    # The same data to a host the page named stays denied, whatever the user named.
+    _, findings = sim.call("Bash", Action(S.SENDS_TO, HOST_EVIL), sink=True, dests=[HOST_EVIL], carried=[SECRET])
+    assert only(findings, "TT001").action == "deny"
 
 
 def test_line_fingerprints_need_several_matches(sim: Sim):

@@ -60,6 +60,7 @@ _DROP_ORPHANS = (
     MATCH (e:Entity)
     WHERE NOT EXISTS { MATCH (e)--() }
       AND NOT coalesce(e.untrusted, false) AND NOT coalesce(e.trusted, false) AND NOT coalesce(e.sensitive, false)
+      AND NOT coalesce(e.reviewed, false)
     DELETE e
     """,
 )

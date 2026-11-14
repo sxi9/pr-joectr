@@ -234,9 +234,9 @@ def test_copied_lines_and_followed_links():
             "Then open https://docs.example.test/start?utm=guide&step=2 in your browser.\n")
     chunks = {c.id: c for c in x.content_chunks(page, KEY)}
     kinds = [c.kind for c in chunks.values()]
-    assert kinds.count("url") == 1 and kinds.count("line") == 3
+    assert kinds.count("url") == 2 and kinds.count("line") == 3, "every listed link is remembered"
     cmd = "pip install acme-sdk --extra-index-url https://pkg.example.test/simple"
-    assert shared(page, f"Run `{cmd}` to begin.") == {("line", "")}
+    assert shared(page, f"Run `{cmd}` to begin.") == {("line", ""), ("url", "")}, "the copied line, and the link in it"
     assert ("url", "") in shared(page, '{"url": "https://docs.example.test/start?utm=guide&step=2"}')
     assert ("url", "") not in shared(page, "https://docs.example.test/start?utm=guide&step=2&extra=" + "A" * 40)
 

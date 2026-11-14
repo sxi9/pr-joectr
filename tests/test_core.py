@@ -104,6 +104,33 @@ def test_config_file_is_read_and_extends_defaults(tmp_path, monkeypatch):
     assert cfg.max_chunks == 50
 
 
+@pytest.mark.parametrize("text, mode, fail_closed", [
+    ('mode = "strict"\nfail_closed = true\n[hosts]\ntrusted = ["a.example\n', "strict", True),     # unclosed quote
+    ('fail_closed = true\nhosts = "oops"\n', "guard", True),                                       # a string for a table
+    ('this is not toml at all', "guard", False),
+])
+def test_a_config_file_that_does_not_parse_never_switches_the_guard_off(tmp_path, monkeypatch, text, mode, fail_closed):
+    for name in ("TAINTTRAIL_HOME", "TAINTTRAIL_MODE"):
+        monkeypatch.delenv(name, raising=False)
+    root = tmp_path / "proj"
+    (root / ".tainttrail").mkdir(parents=True)
+    (root / ".tainttrail" / "config.toml").write_text(text)
+    cfg = load_config(root)
+    assert (cfg.mode, cfg.fail_closed) == (mode, fail_closed), "the two safety settings survive when their lines are legible"
+    assert "config.toml" in cfg.config_error and "defaults are in use" in cfg.config_error
+    assert cfg.is_trusted_host("github.com"), "and everything else is the defaults"
+
+
+def test_a_tainttrail_dir_further_up_does_not_swallow_a_repository(tmp_path):
+    home = tmp_path / "home"
+    (home / ".tainttrail").mkdir(parents=True)          # a session was once started in the home directory
+    repo = home / "work" / "repo"
+    (repo / ".git").mkdir(parents=True)
+    (repo / "src").mkdir()
+    assert find_root(repo / "src") == repo.resolve()
+    assert find_root(home / "work") == home.resolve()
+
+
 def test_find_root_prefers_tainttrail_dir_then_git(tmp_path):
     outer = tmp_path / "outer"
     inner = outer / "pkg" / "deep"

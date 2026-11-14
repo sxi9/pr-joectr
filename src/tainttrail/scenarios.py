@@ -24,7 +24,11 @@ from typing import Any, Iterator
 
 from .config import CONFIG_FILENAME, HOME_DIRNAME, load_config
 
-GROUPS = ("attack", "benign", "known_gaps")
+# attack, benign and known_gaps were written from public incident reports before the replay
+# harness existed. variant and ordinary came out of a review: 64 ordinary multi-step sessions
+# written to find false alarms, and 11 attacks aimed at the edges the resulting fixes moved.
+GROUPS = ("attack", "variant", "benign", "ordinary", "known_gaps")
+DATA_FILES = ("scenarios.json", "attack_variants.json", "ordinary_sessions.json")
 DEFAULT_ORIGIN = "git@github.com:tt-demo-victim/webapp.git"
 
 
@@ -104,8 +108,13 @@ def _env(**values: str | None) -> Iterator[None]:
 
 
 def _catalog() -> dict[str, Any]:
-    text = resources.files("tainttrail").joinpath("data", "scenarios.json").read_text(encoding="utf-8")
-    return json.loads(text)
+    merged: dict[str, Any] = {}
+    for name in DATA_FILES:
+        data = json.loads(resources.files("tainttrail").joinpath("data", name).read_text(encoding="utf-8"))
+        for group in GROUPS:
+            if group in data:
+                merged.setdefault(group, []).extend(data[group])
+    return merged
 
 
 def list_scenarios() -> list[dict[str, Any]]:

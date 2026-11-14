@@ -143,6 +143,8 @@ def handle(payload: dict[str, Any], cfg: Config | None = None) -> dict[str, Any]
         _log(cfg, {"event": name, "session": event.session_id, "tool": event.tool_name, "action": decision.action,
                    "rules": [f.rule for f in decision.findings if f.action in ("ask", "deny")],
                    "ms": round((time.perf_counter() - started) * 1000, 1)})
+    if cfg.config_error and name == "SessionStart":
+        decision.notice = f"TaintTrail: {cfg.config_error}. {decision.notice}".strip()
     return render(name, decision, announce=bool(getattr(cfg, "announce", True)))
 
 

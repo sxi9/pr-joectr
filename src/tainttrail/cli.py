@@ -94,7 +94,7 @@ def cmd_status(args: argparse.Namespace, cfg: Config) -> int:
     color = report.use_color()
     registered = [scope for scope in ("project", "local", "user") if install.is_installed(install.settings_path(cfg, scope))]
     info: dict[str, Any] = {"project": str(cfg.root), "mode": cfg.mode, "fail_closed": cfg.fail_closed,
-                            "hooks": registered, "graph": str(cfg.db_path)}
+                            "hooks": registered, "graph": str(cfg.db_path), "config_error": cfg.config_error}
     try:
         with _read_store(cfg) as store:
             info.update(report.status(store))
@@ -106,6 +106,8 @@ def cmd_status(args: argparse.Namespace, cfg: Config) -> int:
         return 0
     _out(f"project      {cfg.root}")
     _out(f"mode         {cfg.mode}" + ("  (fail closed)" if cfg.fail_closed else ""))
+    if cfg.config_error:
+        _out("config       " + report.paint(cfg.config_error, "bright_red", "bold", color=color))
     hooks = ", ".join(registered) if registered else report.paint("not registered: run `tainttrail init`", "yellow", color=color)
     _out(f"hooks        {hooks}")
     if not info.get("nodes"):
@@ -276,7 +278,9 @@ def cmd_demo(args: argparse.Namespace, cfg: Config) -> int:
         for sc in scenarios.list_scenarios():
             if sc["group"] != last:
                 last = sc["group"]
-                heading = {"attack": "Attacks the guard must stop", "benign": "Ordinary work it must leave alone",
+                heading = {"attack": "Attacks the guard must stop", "variant": "Attack variants, aimed at the edges of the rules",
+                           "benign": "Ordinary work it must leave alone",
+                           "ordinary": "Ordinary sessions, a reviewer's corpus for false alarms",
                            "known_gaps": "Harder cases"}[last]
                 _out(report.paint(heading, "bold", color=color))
             _out(f"  {sc['id'].split('-', 1)[0]:5s} {sc['title']}")
@@ -295,6 +299,11 @@ def cmd_demo(args: argparse.Namespace, cfg: Config) -> int:
         return 1
 
     keep = Path(args.keep).resolve() if args.keep else None
+    if keep is not None:
+        problem = _claim_demo_dir(keep)
+        if problem:
+            _err(problem)
+            return 2
     modes = [False, True] if args.compare else [not args.no_guard]
     _out(report.paint(f"{scenario['id']}  {scenario['title']}", "bold", color=color))
     _wrap(scenario.get("story", ""), color=False)
@@ -334,6 +343,28 @@ def cmd_demo(args: argparse.Namespace, cfg: Config) -> int:
     return status
 
 
+DEMO_MARKER = ".tainttrail-demo"
+
+
+def _claim_demo_dir(path: Path) -> str | None:
+    """Make ``path`` an empty directory that belongs to the demo, or say why not.
+
+    A replay writes a whole project: a ``.git/config``, a ``.env``, the guard's config. It
+    must never do that to a directory that already holds something else.
+    """
+    if path.exists():
+        if not path.is_dir():
+            return f"{path} is not a directory"
+        if any(path.iterdir()):
+            if not (path / DEMO_MARKER).is_file():
+                return (f"{path} is not empty. --keep writes a whole demo project (a .git/config, a .env, "
+                        "the guard's config) and will not write into an existing directory; give it a new one.")
+            shutil.rmtree(path)   # an earlier demo run: start again rather than replay on top of it
+    path.mkdir(parents=True, exist_ok=True)
+    (path / DEMO_MARKER).write_text("Created by `tainttrail demo --keep`. Safe to delete.\n", encoding="utf-8")
+    return None
+
+
 def _demo_all(args: argparse.Namespace, color: bool) -> int:
     """Replay every scenario and print one line each: the suite as a table."""
     from . import scenarios
@@ -351,12 +382,34 @@ def _demo_all(args: argparse.Namespace, color: bool) -> int:
                           "rules": sorted({x for s in r.steps for x in s.rules}), "ms": r.elapsed_ms}
                          for sc, r in rows], indent=1))
         return 0 if all(r.ok for _, r in rows) else 1
-    headings = {"attack": "Attacks", "benign": "Ordinary work", "known_gaps": "Harder cases"}
+    headings = {"attack": "Attacks", "variant": "Attack variants", "benign": "Ordinary work",
+                "ordinary": "Ordinary sessions", "known_gaps": "Harder cases"}
+    # The two large groups are summarised; a row is printed only when it is not the expected kind.
+    folded = () if getattr(args, "full", False) else ("variant", "ordinary")
+
+    def untouched(r: Any) -> bool:
+        return all(s.action == "allow" for s in r.steps)
+
+    def stopped(r: Any) -> bool:
+        return not r.leaked and (r.blocked_at is not None or bool(r.asked_at))
+
     last = None
     for sc, r in rows:
-        if sc["group"] != last:
-            last = sc["group"]
-            _out(report.paint(f"{headings[last]:<62} outcome", "bold", color=color))
+        group = sc["group"]
+        if group != last:
+            last = group
+            members = [x for y, x in rows if y["group"] == group]
+            if group in folded:
+                good = sum(1 for x in members if (untouched(x) if group == "ordinary" else stopped(x)))
+                word = "untouched" if group == "ordinary" else "denied or asked"
+                _out(report.paint(f"{headings[group]:<62} {good} of {len(members)} {word}", "bold", color=color)
+                     + report.paint("   (--full lists them)", "dim", color=color))
+            else:
+                _out(report.paint(f"{headings[group]:<62} outcome", "bold", color=color))
+        if group in folded and not args.no_guard and (untouched(r) if group == "ordinary" else stopped(r)):
+            continue
+        if group in folded and args.no_guard:
+            continue
         rules = " ".join(sorted({x for s in r.steps for x in s.rules}))
         if r.leaked:
             outcome = report.paint(f"LEAKED {len(r.leaked)}", "bright_red", "bold", color=color)
@@ -369,19 +422,22 @@ def _demo_all(args: argparse.Namespace, color: bool) -> int:
         flag = "" if r.ok or args.no_guard else report.paint("  (not as expected)", "bright_red", color=color)
         title = sc["title"] if len(sc["title"]) <= 55 else sc["title"][:54] + "…"
         _out(f"  {sc['id'].split('-', 1)[0]:5s} {title:<55} {outcome}{flag}")
-    attacks = [r for sc, r in rows if sc["group"] == "attack"]
-    benign = [r for sc, r in rows if sc["group"] == "benign"]
-    gaps = [r for sc, r in rows if sc["group"] == "known_gaps"]
+
+    def of(group: str) -> list[Any]:
+        return [r for sc, r in rows if sc["group"] == group]
+
+    attacks, variants, benign, ordinary, gaps = of("attack"), of("variant"), of("benign"), of("ordinary"), of("known_gaps")
     _out()
     if args.no_guard:
         leaked = sum(len(r.leaked) for _, r in rows)
         _out(f"Monitor mode: nothing was stopped. {leaked} canary secrets left the machine across {len(rows)} scenarios.")
         return 0
-    stopped = sum(1 for r in attacks if not r.leaked and (r.blocked_at is not None or r.asked_at))
-    _out(f"attacks stopped or put to the user   {stopped} of {len(attacks)}   "
+    _out(f"attacks stopped or put to the user   {sum(map(stopped, attacks))} of {len(attacks)}   "
          f"({sum(1 for r in attacks if r.blocked_at is not None)} denied outright)")
-    _out(f"ordinary work left untouched         {sum(1 for r in benign if all(s.action == 'allow' for s in r.steps))} of {len(benign)}")
-    _out(f"harder cases put to the user         {sum(1 for r in gaps if not r.leaked and (r.asked_at or r.blocked_at is not None))} of {len(gaps)}")
+    _out(f"attack variants stopped              {sum(map(stopped, variants))} of {len(variants)}")
+    _out(f"ordinary work left untouched         {sum(map(untouched, benign))} of {len(benign)}")
+    _out(f"ordinary sessions left untouched     {sum(map(untouched, ordinary))} of {len(ordinary)}")
+    _out(f"harder cases put to the user         {sum(map(stopped, gaps))} of {len(gaps)}")
     _out(f"canary secrets that left             {sum(len(r.leaked) for _, r in rows)}")
     per_event = statistics.median(r.elapsed_ms / max(1, 2 * sum(1 for s in r.steps if s.kind == 'tool') + 2) for _, r in rows)
     _out(report.paint(f"{len(rows)} scenarios replayed through the Claude Code hook adapter, {per_event:.0f} ms per hook event in process",
@@ -441,6 +497,8 @@ def cmd_doctor(args: argparse.Namespace, cfg: Config) -> int:
     line(True, "tainttrail", f"{__version__} at {Path(__file__).parent}")
     registered = [scope for scope in ("project", "local", "user") if install.is_installed(install.settings_path(cfg, scope))]
     line(bool(registered) or None, "hooks", ", ".join(registered) if registered else "not registered for this project (`tainttrail init`)")
+    if cfg.config_error:
+        line(False, "config", cfg.config_error)
     try:
         with open_store(cfg) as store:
             nodes = store.scalar("MATCH (n) RETURN count(n)", default=0)
@@ -578,6 +636,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-guard", action="store_true", help="monitor mode: record, stop nothing")
     p.add_argument("--compare", action="store_true", help="run without the guard, then with it")
     p.add_argument("--keep", metavar="DIR", help="keep the replayed project (and its graph) in DIR")
+    p.add_argument("--full", action="store_true", help="with `all`: list every scenario of the two large groups too")
     p.add_argument("--brief", action="store_true", help="timeline and verdict only")
     p.add_argument("--no-query", action="store_true")
     p.set_defaults(func=cmd_demo)
