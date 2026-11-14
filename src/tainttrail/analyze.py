@@ -291,7 +291,7 @@ def analyze_call(tool_name: str, tool_input: dict, cfg: Config, *, cwd: str, lab
         if tool == "Bash":
             # "$PWD/.env" is not the file ./PWD/.env. The shell analysis resolves what it can; here the
             # variable or substitution goes, together with the path glued to it.
-            text = _SHELL_VALUE.sub(lambda m: " " * len(m.group(0)), text)
+            text = _SHELL_VALUE.sub(_without_shell_value, text)
         b.references(extract_entities(text, cwd=cwd, limit=cfg.max_entities))
     call.actions = b.build()
     call.destinations = list(b.destinations.values())
@@ -467,6 +467,18 @@ def _analyze_mcp(call: CallAnalysis, b: _Builder, server: str, tool: str, tool_i
 
 
 _SHELL_VALUE = re.compile(r"""\$(?:\{[^}\n]{0,80}\}|\([^)\n]{0,200}\)|[A-Za-z_][A-Za-z0-9_]{0,60})["']?[^\s"';|&<>]{0,300}""")
+
+
+def _without_shell_value(m: "re.Match[str]") -> str:
+    """A variable or substitution and the path glued to it, blanked. A host glued to it stays:
+    in ``${SCHEME:-https}://cfg.example.test/x`` the scheme is unknown and the host is not."""
+    text = m.group(0)
+    at = text.find("://")
+    if 0 < at and re.match(r"://[A-Za-z0-9\[]", text[at:]):
+        return " " * max(0, at - 5) + "https" + text[at:]
+    return " " * len(text)
+
+
 _OWN_COMMAND = re.compile(r"(?:^|[\s;&|(/])(?:tainttrail|python[\d.]{0,6}\s{1,4}-m\s{1,4}tainttrail)(?:\s|$)")
 # Arguments that name the remote object a call reads or writes (a page, an issue, a channel).
 _OBJECT_KEYS = frozenset({"id", "page_id", "pageid", "issueid", "issue_id", "channel_id", "channel", "document_id",

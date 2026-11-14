@@ -93,3 +93,34 @@ def test_parsing_a_long_command_stays_within_budget(command):
     started = time.perf_counter()
     bashparse.analyze_bash(command, "/project")
     assert time.perf_counter() - started < 3.0
+
+
+@pytest.mark.parametrize("distinct", [False, True], ids=["one repository read many times", "a repository for every read"])
+def test_the_cross_repository_rule_does_not_slow_down_with_the_session(mem, distinct):
+    """A page can ask for two hundred reads before the write that leaks. The rule that speaks for
+    that write once took twenty seconds at that point, and a hook is killed after ten."""
+    from tainttrail import rules
+
+    n = 600
+    mem.run("CREATE (:ToolCall {id: 'c', session_id: 's', seq: $seq})-[:SENDS_TO]->(:Entity {id: 'repo:q', kind: 'repo', value: 'q'})",
+            {"seq": 2 * n + 10})
+    if not distinct:
+        mem.run("CREATE (:Entity {id: 'repo:p', kind: 'repo', value: 'p'})")
+    mem.run("""
+        UNWIND range(1, $n) AS i
+        CREATE (r:ToolCall {id: 'r' + toString(i), session_id: 's', seq: 2 * i})
+        CREATE (s:Content {id: 'k' + toString(i), session_id: 's', seq: 2 * i + 1, sensitive: true, untrusted: true})
+        CREATE (r)-[:RETURNED]->(s)
+        WITH r, i
+        MERGE (p:Entity {id: CASE WHEN $distinct THEN 'repo:p' + toString(i) ELSE 'repo:p' END})
+          ON CREATE SET p.kind = 'repo', p.value = 'p' + toString(i)
+        CREATE (r)-[:READS]->(p)""", {"n": n, "distinct": distinct})
+    best = None
+    for _ in range(3):
+        started = time.perf_counter()
+        rows = mem.run(rules.CYPHER["TT011"].strip(), {"call": "c"})
+        took = time.perf_counter() - started
+        best = took if best is None else min(best, took)
+    assert len(rows) == 1 and rows[0]["r"]["props"]["id"] == f"r{n}", "the latest read of another repository"
+    assert rows[0]["u"]["props"]["id"] == f"k{n - 1}", "and the latest untrusted content before it"
+    assert best < 0.5, f"{best:.2f} s for one rule at {n} reads"

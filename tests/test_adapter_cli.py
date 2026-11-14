@@ -217,6 +217,51 @@ def test_a_result_that_arrives_while_the_graph_is_busy_is_recorded_later(project
     assert list((project / ".tainttrail" / "pending").glob("*.json")) == []
 
 
+def test_the_queue_is_taken_a_slice_at_a_time_and_only_whole_files(project, monkeypatch):
+    """A hook that tried to record a long queue before its own event would be killed, and so would the next."""
+    cfg = load_config(project)
+    fire(project, "SessionStart", source="startup")
+    for i in range(claude_code.REPLAY_SLICE + 7):
+        claude_code._queue(cfg, {"session_id": "sess-1", "cwd": str(project), "hook_event_name": "PostToolUse",
+                                 "tool_name": "Read", "tool_use_id": f"toolu_r{i}", "tool_input": {"file_path": f"{project}/a{i}.py"},
+                                 "tool_response": {"type": "text", "file": {"filePath": f"{project}/a{i}.py", "content": f"x = {i}\n"}}})
+    pending = project / ".tainttrail" / "pending"
+    assert len(list(pending.glob("*.json"))) == claude_code.REPLAY_SLICE + 7 and list(pending.glob("*.part")) == []
+    # a file its writer has not finished is left alone; one whose writer died long ago is removed
+    fresh, old = pending / "000000000000000001-1-aa.part", pending / "000000000000000002-2-bb.part"
+    fresh.write_text('{"half": ')
+    old.write_text('{"half": ')
+    os.utime(old, (1_000_000_000, 1_000_000_000))
+    fire(project, "PreToolUse", tool_name="Bash", tool_use_id="toolu_b1", tool_input={"command": "ls"})
+    assert len(list(pending.glob("*.json"))) == 7, "one slice was recorded, the rest waits for the next hook"
+    assert fresh.exists() and not old.exists()
+    fire(project, "PreToolUse", tool_name="Bash", tool_use_id="toolu_b2", tool_input={"command": "ls"})
+    assert list(pending.glob("*.json")) == []
+    # what waits in the queue is raw tool output: the guard's own rules treat it as sensitive
+    assert cfg.is_sensitive_path(pending / "000000000000000003-3-cc.json")
+
+
+def test_a_hook_waits_no_longer_than_the_harness_lets_it_live(project, monkeypatch):
+    from tainttrail.guard import Guard
+
+    seen = {}
+    real = Guard.handle
+
+    def spy(self, event, earlier=()):
+        seen[event.kind] = self.cfg.lock_timeout_ms
+        return real(self, event, earlier)
+
+    monkeypatch.setattr("tainttrail.guard.Guard.handle", spy)
+    monkeypatch.setattr(claude_code, "_age_ms", lambda: 100.0)
+    fire(project, "UserPromptSubmit", prompt="hello")
+    fire(project, "PreToolUse", tool_name="Bash", tool_use_id="toolu_w1", tool_input={"command": "ls"})
+    assert seen["user_prompt"] == claude_code.RECORDING_LOCK_MS and seen["pre_tool"] <= load_config(project).lock_timeout_ms
+    # a process that took seven seconds to start has little left of its ten
+    monkeypatch.setattr(claude_code, "_age_ms", lambda: 7_000.0)
+    fire(project, "UserPromptSubmit", prompt="again")
+    assert 500 <= seen["user_prompt"] <= 1_500
+
+
 def test_a_broken_config_file_is_reported_and_the_guard_keeps_working(project, capsys):
     (project / ".tainttrail").mkdir(exist_ok=True)
     (project / ".tainttrail" / "config.toml").write_text('mode = "guard"\n[hosts]\ntrusted = ["unclosed\n')

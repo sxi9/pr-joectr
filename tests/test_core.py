@@ -59,6 +59,9 @@ def test_host_classification(cfg: Config):
     assert cfg.is_local_host("10.1.2.3")
     assert cfg.is_local_host("[::1]")
     assert not cfg.is_local_host("8.8.8.8")
+    # addresses reserved for documentation are somewhere else, not this network
+    assert not cfg.is_local_host("192.0.2.5") and not cfg.is_local_host("[2001:db8::bad]")
+    assert cfg.is_local_host("192.168.1.9") and cfg.is_local_host("fd00::1") and cfg.is_local_host("::ffff:10.0.0.5")
     assert not cfg.is_local_host("attacker.example")
 
 

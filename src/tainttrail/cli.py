@@ -562,10 +562,14 @@ def cmd_doctor(args: argparse.Namespace, cfg: Config) -> int:
 
         payload = json.dumps({"session_id": "doctor", "cwd": str(result.root), "hook_event_name": "PreToolUse",
                               "tool_name": "Bash", "tool_input": {"command": "ls"}, "tool_use_id": "doctor"})
+        # The scratch project, whatever the caller's environment says: this must not be recorded
+        # in the project the doctor was started from.
+        scratch = {k: v for k, v in os.environ.items()
+                   if k not in ("CLAUDE_PROJECT_DIR", "TAINTTRAIL_DB", "TAINTTRAIL_HOME", "TAINTTRAIL_MODE")}
         spent = []
         for _ in range(args.rounds):
             started = time.perf_counter()
-            subprocess.run(shlex.split(install.hook_command()), input=payload, text=True,
+            subprocess.run(shlex.split(install.hook_command()), input=payload, text=True, env=scratch,
                            capture_output=True, cwd=result.root, timeout=60, check=False)
             spent.append((time.perf_counter() - started) * 1000)
         whole = statistics.median(spent)

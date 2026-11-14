@@ -198,20 +198,18 @@ LIMIT 1""",
     # untrusted content, then a read of repository P, then a write to repository Q
     "TT011": """
 MATCH (c:ToolCall {id: $call})-[:SENDS_TO]->(q:Entity {kind: 'repo'})
+OPTIONAL MATCH (t:Content {session_id: c.session_id, origin: 'user'})-[:MENTIONS]->(n:Entity {kind: 'repo'})
+WHERE t.seq < c.seq
+WITH c, q, collect(DISTINCT n.id) AS named
 MATCH (r:ToolCall {session_id: c.session_id})-[:READS]->(p:Entity {kind: 'repo'})
-WHERE r.seq < c.seq AND p.id <> q.id
+WHERE r.seq < c.seq AND p.id <> q.id AND NOT p.id IN named
   AND EXISTS { MATCH (r)-[:RETURNED]->(:Content {sensitive: true}) }
-  AND NOT EXISTS {
-    MATCH (t:Content {origin: 'user'})-[:MENTIONS]->(p)
-    WHERE t.session_id = c.session_id AND t.seq < c.seq
-  }
 WITH c, q, r, p ORDER BY r.seq DESC LIMIT 1
 MATCH (r)-[:RETURNED]->(s:Content {sensitive: true})
 MATCH (u:Content {session_id: c.session_id, untrusted: true})
 WHERE u.seq < r.seq
-RETURN u, r, p, s, c, q
-ORDER BY u.seq DESC
-LIMIT 1""",
+WITH c, q, p, r, s, u ORDER BY u.seq DESC LIMIT 1
+RETURN u, r, p, s, c, q""",
     # a copy of a sensitive file, written or staged in this session, behind a push
     "egress.commit": """
 MATCH (c:ToolCall {id: $call})

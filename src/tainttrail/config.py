@@ -93,7 +93,8 @@ class Config:
         if not home or not p.startswith(home + "/"):
             return False
         rest = p[len(home) + 1:]
-        return rest == "key" or rest.endswith(".rl") or rest.startswith("archive/")
+        # ... and the queue of events that could not be recorded yet, which holds raw tool results.
+        return rest == "key" or rest.endswith(".rl") or rest.startswith(("archive/", "pending/"))
 
     def is_protected_path(self, path: str | os.PathLike[str]) -> bool:
         return _matches_any(normalize_path(path, self.root), self.protected_paths)
@@ -370,6 +371,13 @@ def _host_in(host: str, hosts: tuple[str, ...]) -> bool:
     return False
 
 
+# This machine and its own network: loopback, the private-use ranges, link-local, unique-local.
+# Not everything the address registries call "not globally reachable": the documentation and
+# benchmarking ranges (192.0.2.0/24, 2001:db8::/32 and the like) are somewhere else by definition.
+_LOCAL_NETWORKS = ("127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "0.0.0.0/32",
+                   "::1/128", "::/128", "fc00::/7", "fe80::/10")
+
+
 def _is_private_ip(host: str) -> bool:
     import ipaddress
 
@@ -377,4 +385,7 @@ def _is_private_ip(host: str) -> bool:
         ip = ipaddress.ip_address(host)
     except ValueError:
         return False
-    return ip.is_private or ip.is_loopback or ip.is_link_local
+    mapped = getattr(ip, "ipv4_mapped", None)
+    if mapped is not None:
+        ip = mapped
+    return any(ip in net for net in map(ipaddress.ip_network, _LOCAL_NETWORKS) if net.version == ip.version)

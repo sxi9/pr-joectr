@@ -20,7 +20,7 @@ import os
 import sys
 import time
 import traceback
-from typing import Any, TextIO
+from typing import Any, Iterator, TextIO
 
 from ..config import Config, load_config
 from ..model import Decision, HookEvent
@@ -117,10 +117,27 @@ def _render(event_name: str, decision: Decision, *, announce: bool) -> dict[str,
 
 
 RECORDING_EVENTS = ("SessionStart", "UserPromptSubmit", "PostToolUse", "PostToolUseFailure")
-RECORDING_LOCK_MS = 8_000
+HOOK_LIMIT_MS = 10_000          # the time limit install.py registers; the harness kills a hook that passes it
+RECORDING_LOCK_MS = 6_000       # the longest a recording hook waits for the graph
 PENDING_DIRNAME = "pending"
 MAX_PENDING_FILES = 200
 MAX_PENDING_BYTES = 2_000_000
+REPLAY_SLICE = 25               # queued events one hook records before its own
+STALE_PENDING_SECONDS = 7 * 24 * 3600
+_IMPORTED = time.monotonic()
+
+
+def _age_ms() -> float:
+    """How long this process has been alive. The harness counts its limit from the start, and under
+    a burst of parallel hooks the start itself can take seconds."""
+    try:
+        with open("/proc/self/stat", encoding="ascii", errors="replace") as fh:
+            fields = fh.read().rsplit(")", 1)[1].split()
+        with open("/proc/uptime", encoding="ascii") as fh:
+            uptime = float(fh.read().split()[0])
+        return max(0.0, (uptime - int(fields[19]) / os.sysconf("SC_CLK_TCK")) * 1000)
+    except (OSError, ValueError, IndexError, AttributeError):
+        return (time.monotonic() - _IMPORTED) * 1000
 
 
 def _queue(cfg: Config, payload: dict[str, Any]) -> None:
@@ -136,22 +153,46 @@ def _queue(cfg: Config, payload: dict[str, Any]) -> None:
         if len(text) > MAX_PENDING_BYTES or len(list(directory.iterdir())) >= MAX_PENDING_FILES:
             _log(cfg, {"event": payload.get("hook_event_name"), "error": "an event was dropped: the queue is full or the event too large"})
             return
-        fd = os.open(directory / f"{int(time.time() * 1000):015d}-{os.getpid()}.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        # Written under another name and renamed: a reader never meets half a file.
+        name = f"{time.time_ns() // 1000:018d}-{os.getpid()}-{os.urandom(3).hex()}"   # oldest first by name
+        fd = os.open(directory / f"{name}.part", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(text)
+        os.replace(directory / f"{name}.part", directory / f"{name}.json")
     except OSError:
         pass
 
 
-def _pending(cfg: Config) -> list[tuple[Any, HookEvent]]:
-    """Queued events, oldest first, with the files that hold them."""
+def _pending(cfg: Config, limit: int = REPLAY_SLICE) -> list[tuple[Any, HookEvent]]:
+    """The oldest queued events, with the files that hold them.
+
+    Call it while the graph is held: two hooks that read the queue at the same moment would both
+    record it. A slice, not the whole queue: a hook that tried to record two hundred events before
+    its own would be killed by the harness, and so would the next one.
+    """
     directory = cfg.home / PENDING_DIRNAME
     try:
-        paths = sorted(p for p in directory.iterdir() if p.suffix == ".json")
+        paths = sorted(p for p in directory.iterdir() if p.suffix in (".json", ".part"))
     except OSError:
         return []
     out = []
-    for path in paths[:MAX_PENDING_FILES]:
+    now = time.time()
+    for path in paths:
+        if len(out) >= limit:
+            break
+        try:
+            age = now - path.stat().st_mtime
+        except OSError:
+            continue
+        if path.suffix == ".part" or age > STALE_PENDING_SECONDS:
+            # Half a file whose writer died, or an event of a session long over: a queued event
+            # holds a raw tool result, which is not something to keep around.
+            if path.suffix != ".part" or age > 60:
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+            continue
         try:
             event = to_event(json.loads(path.read_text(encoding="utf-8")))
         except (OSError, ValueError):
@@ -195,13 +236,27 @@ def handle(payload: dict[str, Any], cfg: Config | None = None) -> dict[str, Any]
     cfg = cfg or load_config(os.environ.get("CLAUDE_PROJECT_DIR") or event.cwd)
     started = time.perf_counter()
     name = str(payload.get("hook_event_name"))
+    # What is left of the harness's time limit, less the work itself. A hook that waits past the
+    # limit is killed, and a killed hook neither answers nor queues its event.
+    left = HOOK_LIMIT_MS - _age_ms() - 1_500
     if name in RECORDING_EVENTS:
-        # A hook that only records can wait for the graph almost as long as the harness lets it
-        # run; a PreToolUse hook holds up a tool call and gives up sooner.
-        cfg.lock_timeout_ms = max(cfg.lock_timeout_ms, RECORDING_LOCK_MS)
-    queued = _pending(cfg)
-    decision = Guard(cfg).handle(event, earlier=[old for _, old in queued])
-    for path, _ in queued:
+        # A hook that only records can wait for the graph longer than one that holds up a tool call.
+        cfg.lock_timeout_ms = int(max(500, min(RECORDING_LOCK_MS, left)))
+    else:
+        cfg.lock_timeout_ms = int(max(500, min(cfg.lock_timeout_ms, left)))
+    taken: list[Any] = []
+
+    def earlier() -> Iterator[HookEvent]:
+        """Events that could not be recorded when they happened. Read once the graph is held."""
+        until = time.monotonic() + (2.5 if name in RECORDING_EVENTS else 1.0)
+        for path, old in _pending(cfg):
+            if time.monotonic() > until:
+                break
+            taken.append(path)
+            yield old
+
+    decision = Guard(cfg).handle(event, earlier=earlier)
+    for path in taken:      # recorded and published, or never recordable: either way done with
         try:
             path.unlink()
         except OSError:

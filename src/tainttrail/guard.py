@@ -8,7 +8,7 @@ only decisions that reach the harness are "ask" and "deny".
 from __future__ import annotations
 
 import os
-from typing import Iterable
+from typing import Callable, Iterable
 
 from . import retention, rules, schema as S
 from .analyze import (
@@ -41,13 +41,16 @@ class Guard:
         self.cfg = cfg
         self._store = store
 
-    def handle(self, event: HookEvent, earlier: Iterable[HookEvent] = ()) -> Decision:
+    def handle(self, event: HookEvent,
+               earlier: "Iterable[HookEvent] | Callable[[], Iterable[HookEvent]]" = ()) -> Decision:
         """Record one event and decide. ``earlier`` are events that could not be recorded when they
-        happened (the graph was busy); they are recorded first, under the same open of the store."""
+        happened (the graph was busy); they are recorded first, under the same open of the store.
+        Given as a function, it is called once the store is held, so that two hooks cannot both
+        take the same queued events."""
         if self._store is not None:
             return self._handle(self._store, event)
         with open_store(self.cfg) as store:
-            for old in earlier:
+            for old in (earlier() if callable(earlier) else earlier):
                 try:
                     self._handle(store, old)
                 except Exception:   # noqa: BLE001 - a queued event that cannot be recorded must not block this one

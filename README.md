@@ -152,7 +152,7 @@ session, through a notes file. That is a path question.
 
 ### Living inside a hook
 
-Three things had to hold for an embedded store that a new process opens on every tool call.
+Four things had to hold for a guard that a new process runs on every tool call.
 
 - **A killed hook must not cost the graph.** The agent harness kills a hook that runs past
   its time limit. Each event is therefore written to a private copy of the file, which
@@ -168,8 +168,12 @@ Three things had to hold for an embedded store that a new process opens on every
   it. Sessions with findings go last. `tainttrail ui --file <archive>` opens one.
 - **Parallel tool calls must not drop events.** A recording hook that finds the store busy
   waits, and one that would run out of time leaves its event in `.tainttrail/pending/` for
-  the next hook to replay first. A check that could not be made in time is put to the
-  user, never passed in silence.
+  the next hook to replay first, a bounded slice at a time. A check that could not be made
+  in time is put to the user, never passed in silence.
+- **A hook must not run the project's code.** It starts in the project folder, and
+  `python -m` would put that folder first on the module path, where a planted `json.py`
+  could switch the guard off from the inside. The registered command starts Python with
+  `-P`, or with an equivalent start-up line on Python 3.10.
 
 ## Setup and run
 
@@ -351,7 +355,9 @@ break it, each with one concern, and their findings were fixed and turned into t
 - **Robustness.** 22 failure cases, among them a store left unopenable by a kill, a hook
   that slowed down with every tool call, text patterns that took seconds on awkward input,
   and events lost when twenty tools returned at once. All are fixed and have tests; every
-  text pattern is now checked to be linear.
+  text pattern is now checked to be linear. A second reviewer then re-ran the cases against
+  the fixes: one rule query was still quadratic on very long sessions and the queue for
+  events that arrive while the store is busy had defects of its own. Both were redone.
 - **Secrecy.** 12 ways for a secret value or a credential-bearing URL to reach the graph,
   the log or the guard's own output. All closed; a test replays every scenario and searches
   the graph for the canaries in plain, encoded and hex form.
@@ -362,6 +368,11 @@ break it, each with one concern, and their findings were fixed and turned into t
 - **The scanner.** Ways for a repository's configuration to hide a server or a path from
   the map (fields that only other clients read, rules the agent ignores, look-alike hosts),
   secrets in stored command lines, and writes through symbolic links. Fixed.
+- **The layer an agent talks to.** The audit report hid the incident in monitor mode; an
+  address without a dot was not defanged, so an agent that read the guard's own answer could
+  pass the attacker's host on as its own; `read_cypher` could reach withheld text through
+  unusual spellings; and a Python file planted in the project folder was imported by the
+  hook. Fixed: queries now run on a copy of the graph in which withheld text is overwritten.
 
 ## What it does not do
 

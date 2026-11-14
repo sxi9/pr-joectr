@@ -397,3 +397,16 @@ def test_verbose_curl_with_a_credential_prints_it():
     assert analyze_bash('curl -v -u "$API_USER:$API_TOKEN" https://api.example.test/health').sensitive_output
     assert not analyze_bash('curl -s -H "Authorization: Bearer $API_TOKEN" https://api.example.test/health').sensitive_output
     assert not analyze_bash("curl -v https://api.example.test/health").sensitive_output
+
+
+def test_a_substitution_whose_output_is_known_is_followed_to_the_file(tmp_path):
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "sub").mkdir()
+    root = str(tmp_path)
+    assert analyze_bash("cat $(pwd)/.env", cwd=root).reads == ["./.env"]
+    assert analyze_bash("cat `pwd`/.env", cwd=root).reads == ["./.env"]
+    assert analyze_bash('cat "$(git rev-parse --show-toplevel)"/.env', cwd=root + "/sub").reads == [root + "/.env"]
+    assert analyze_bash("cd sub && cat $(pwd)/.env", cwd=root).reads == ["sub/.env"]
+    # after a change of directory the top level is another repository's, or nobody's
+    assert analyze_bash("cd /tmp && cat $(git rev-parse --show-toplevel)/.env", cwd=root).reads == []
+    assert analyze_bash("echo $(date)", cwd=root).reads == []

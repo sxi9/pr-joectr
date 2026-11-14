@@ -229,6 +229,33 @@ class _Ctx:
         return os.path.join(self.cwd or "", os.path.expanduser(self.dir))
 
 
+_PWD_SUB = re.compile(r"^\s*pwd(?:\s+-[LP])?\s*$")
+_TOPLEVEL_SUB = re.compile(r"^\s*git\s+rev-parse\s+--show-toplevel\s*$")
+
+
+_CD_BEFORE = re.compile(r"(?:^|[;&|\n(])[ \t]{0,40}(?:cd|pushd)\s")
+
+
+def _known_substitution(inner: str, ctx: _Ctx, before: str = "") -> str | None:
+    """The text of a substitution whose output is known without running it: $(pwd), $(git rev-parse --show-toplevel).
+
+    ``cat $(pwd)/.env`` reads ``.env`` as surely as ``cat .env`` does. The top level is only known
+    when nothing earlier on the line changed directory.
+    """
+    if _PWD_SUB.match(inner):
+        return ctx.vars.get("PWD", ".")
+    if _TOPLEVEL_SUB.match(inner) and ctx.cwd and not _CD_BEFORE.search(before[-4096:]):
+        d = os.path.abspath(ctx.cwd)
+        while True:
+            if os.path.exists(os.path.join(d, ".git")):
+                return d
+            parent = os.path.dirname(d)
+            if parent == d:
+                return None
+            d = parent
+    return None
+
+
 def _scan(command: str, ctx: _Ctx) -> str:
     """Replace substitutions with placeholders and turn newlines into ``;``.
 
@@ -279,6 +306,11 @@ def _scan(command: str, ctx: _Ctx) -> str:
             end = command.find("`", i + 1)
             end = n if end < 0 else end
             inner = command[i + 1:end]
+            known = _known_substitution(inner, ctx, command[:i])
+            if known is not None:
+                out.append(known)
+                i = end + 1
+                continue
             ctx.subs.append(("cmd", _analyze(inner, ctx.cwd, ctx.depth + 1, dict(ctx.vars))))
             out.append(f"\x00S{len(ctx.subs) - 1}\x00")
             i = end + 1
@@ -302,6 +334,11 @@ def _scan(command: str, ctx: _Ctx) -> str:
                     depth -= 1
                 j += 1
             inner = command[start:j - 1] if depth == 0 else command[start:]
+            known = _known_substitution(inner, ctx, command[:i]) if kind == "cmd" else None
+            if known is not None:
+                out.append(known)
+                i = j
+                continue
             ctx.subs.append((kind, _analyze(inner, ctx.cwd, ctx.depth + 1, dict(ctx.vars))))
             placeholder = f"\x00S{len(ctx.subs) - 1}\x00"
             out.append(placeholder if kind == "cmd" else f" {placeholder} ")
