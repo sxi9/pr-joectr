@@ -122,20 +122,42 @@ class Config:
         if env:
             return env.encode("utf-8")
         path = self.home / KEY_FILENAME
-        try:
-            return bytes.fromhex(path.read_text(encoding="ascii").strip())
-        except (FileNotFoundError, ValueError):
-            pass
+        key = _read_key(path)
+        if key is not None:
+            return key
         self.home.mkdir(parents=True, exist_ok=True)
         key = secrets.token_bytes(32)
-        # O_EXCL so two hooks racing on first use agree on one key.
-        try:
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        except FileExistsError:
-            return bytes.fromhex(path.read_text(encoding="ascii").strip())
+        # Written whole under another name, then linked into place: a hook killed half way cannot
+        # leave an empty key file behind, and two hooks racing on first use agree on one key.
+        temp = path.with_name(f"{KEY_FILENAME}.tmp-{os.getpid()}")
+        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w", encoding="ascii") as fh:
             fh.write(key.hex())
+        try:
+            try:
+                os.link(temp, path)
+            except FileExistsError:
+                theirs = _read_key(path)
+                if theirs is not None:
+                    return theirs
+                os.replace(temp, path)   # empty, cut short or not hex: an unusable key is replaced
+            except OSError:              # no hard links here
+                os.replace(temp, path)
+        finally:
+            try:
+                os.unlink(temp)
+            except OSError:
+                pass
         return key
+
+
+def _read_key(path: Path) -> bytes | None:
+    """The key in a key file, or None when the file is missing, empty, cut short or not hex."""
+    try:
+        raw = bytes.fromhex(path.read_text(encoding="ascii").strip())
+    except (OSError, ValueError):
+        return None
+    return raw if len(raw) >= 16 else None
 
 
 def find_root(cwd: str | os.PathLike[str] | None = None) -> Path:
@@ -177,7 +199,17 @@ def load_config(cwd: str | os.PathLike[str] | None = None) -> Config:
         with open(path, "rb") as fh:
             raw = _toml.load(fh)
     except FileNotFoundError:
-        pass
+        # No config in this project: the user-level file, written by `init --scope user`, applies.
+        base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+        path = Path(base) / "tainttrail" / CONFIG_FILENAME
+        try:
+            with open(path, "rb") as fh:
+                raw = _toml.load(fh)
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError) as exc:
+            cfg.config_error = f"{path} could not be read ({exc}); the defaults are in use"
+            raw = _salvage(path)
     except (OSError, ValueError) as exc:   # unreadable, or not TOML
         cfg.config_error = f"{path} could not be read ({exc}); the defaults are in use"
         raw = _salvage(path)

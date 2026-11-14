@@ -118,10 +118,10 @@ def test_one_long_session_keeps_line_and_link_detail_for_its_recent_results_only
     for n in range(30):
         fetch_page(project, "s1", n)
     detailed = count(project, "MATCH (c:Content {session_id: 's1', detail: true}) RETURN count(c)")
-    assert detailed == 10
+    assert detailed == 8
     assert count(project, "MATCH (c:Content {session_id: 's1', untrusted: true}) RETURN count(c)") == 30, "no result is forgotten"
-    assert count(project, "MATCH (k:Chunk) RETURN count(k)") <= 10 * 120
-    assert count(project, "MATCH (e:Entity {kind: 'url'}) RETURN count(e)") <= 10 * 40 + 30 + 5
+    assert count(project, "MATCH (k:Chunk) RETURN count(k)") <= 8 * 120
+    assert count(project, "MATCH (e:Entity {kind: 'url'}) RETURN count(e)") <= 8 * 40 + 30 + 5
     # Every host an old page named is still named: that is what decides who sent the agent somewhere.
     assert count(project, "MATCH (:Content {session_id: 's1', untrusted: true})-[:MENTIONS]->(h:Entity {kind: 'host'}) "
                           "RETURN count(DISTINCT h)") == 30

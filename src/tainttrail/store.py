@@ -252,6 +252,10 @@ class Store:
         except BaseException as exc:
             if not _engine_failure(exc):
                 raise
+            problem = _engine_problem()
+            if problem is not None:
+                raise StoreError(f"the Relate engine does not start ({problem}); the graph at {self.path} "
+                                 "was not touched") from exc
             raise StoreDamaged(
                 f"{self.path} cannot be opened ({_first_line(exc)}). The next recorded event, or "
                 "`tainttrail doctor`, sets the file aside and continues from the version before it."
@@ -282,10 +286,18 @@ class Store:
             if not _engine_failure(exc):
                 raise
             error = _first_line(exc)
-        # The live file does not open. Set it aside; continue from the version before it if
-        # that one opens, and from an empty graph if not.
         _remove(work)
-        damaged = f"{self._base}.damaged-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}{SINGLE_FILE}"
+        # A refusal is not proof of damage. The engine also refuses every store, a new one
+        # included, when its environment is wrong (an unknown RELATE_* variable, for one). Then
+        # the graph is fine and must be left exactly where it is.
+        problem = _engine_problem()
+        if problem is not None:
+            self._work = None
+            raise StoreError(f"the Relate engine does not start ({problem}); the graph at {self.path} was not touched")
+        # The engine works and this file does not open. Set it aside; continue from the version
+        # before it if that one opens, and from an empty graph if not. Nothing is deleted.
+        stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        damaged = f"{self._base}.damaged-{stamp}{SINGLE_FILE}"
         os.replace(self.path, damaged)
         self.recovered = {"damaged": damaged, "error": error, "restored": "empty"}
         if os.path.exists(prev):
@@ -298,7 +310,7 @@ class Store:
                 if not _engine_failure(exc):
                     raise
                 _remove(work)
-                _remove(prev)
+                os.replace(prev, f"{self._base}.damaged-{stamp}-previous{SINGLE_FILE}")
         return self._connect(work, deadline, read_only=False)
 
     def _publish(self) -> None:
@@ -410,6 +422,17 @@ except ImportError:  # pragma: no cover - Windows
 def _engine_failure(exc: BaseException) -> bool:
     """Whether an exception is the engine refusing a file (an engine panic is not an ``Exception``)."""
     return isinstance(exc, relate.Error) or type(exc).__name__ == "PanicException"
+
+
+def _engine_problem() -> str | None:
+    """Why the engine cannot open even an empty in-memory store, or None when it can."""
+    try:
+        relate.connect(MEMORY).close()
+    except BaseException as exc:
+        if not _engine_failure(exc):
+            raise
+        return _first_line(exc)
+    return None
 
 
 def _first_line(exc: BaseException) -> str:

@@ -37,7 +37,11 @@ DELEGATED: dict[str, tuple[str, str, str, str]] = {
 
 
 def _out(text: str = "") -> None:
-    sys.stdout.write(text + "\n")
+    try:
+        sys.stdout.write(text + "\n")
+    except UnicodeEncodeError:   # a terminal or a pipe that is not UTF-8: say it with what it has
+        encoding = sys.stdout.encoding or "ascii"
+        sys.stdout.write((text + "\n").encode(encoding, "replace").decode(encoding))
 
 
 def _err(text: str) -> None:
@@ -59,10 +63,14 @@ def cmd_init(args: argparse.Namespace, cfg: Config) -> int:
     except (ValueError, json.JSONDecodeError) as exc:
         _err(f"could not update the settings file: {exc}. Nothing was changed.")
         return 1
+    except OSError as exc:
+        _err(f"could not write {exc.filename or 'a file'}: {exc.strerror or exc}")
+        return 1
     for line in lines:
         _out(line)
     _out()
-    _out("TaintTrail now sees every prompt and tool call of Claude Code sessions in this project.")
+    where = "on this machine" if args.scope == "user" else "in this project"
+    _out(f"TaintTrail now sees every prompt and tool call of Claude Code sessions {where}.")
     _out("Next: start a session, then `tainttrail log` and `tainttrail findings`. `tainttrail demo list` shows scripted attacks.")
     return 0
 
@@ -75,6 +83,9 @@ def cmd_uninstall(args: argparse.Namespace, cfg: Config) -> int:
             _out(line)
     except (ValueError, json.JSONDecodeError) as exc:
         _err(f"could not update the settings file: {exc}")
+        return 1
+    except OSError as exc:
+        _err(f"could not write {exc.filename or 'a file'}: {exc.strerror or exc}")
         return 1
     return 0
 
@@ -229,15 +240,16 @@ def cmd_query(args: argparse.Namespace, cfg: Config) -> int:
     if not rows:
         _out("(no rows)")
     else:
-        columns = list(rows[0])
-        cells = [[_cell(r[c]) for c in columns] for r in rows[: args.limit]]
-        widths = [min(60, max(len(c), *(len(row[i]) for row in cells))) for i, c in enumerate(columns)]
+        columns = [str(report.printable(c)) for c in rows[0]]
+        shown = rows[: args.limit] if args.limit and args.limit > 0 else rows
+        cells = [[report.printable(_cell(v)) for v in r.values()] for r in shown]
+        widths = [min(60, max([len(c), *(len(row[i]) for row in cells)])) for i, c in enumerate(columns)]
         color = report.use_color()
         _out(report.paint("  ".join(c.ljust(w) for c, w in zip(columns, widths)), "bold", color=color))
         for row in cells:
             _out("  ".join((v if len(v) <= w else v[: w - 1] + "…").ljust(w) for v, w in zip(row, widths)))
-        if len(rows) > args.limit:
-            _out(f"... {len(rows) - args.limit} more rows (--limit)")
+        if len(rows) > len(shown):
+            _out(f"... {len(rows) - len(shown)} more rows (--limit)")
     _out(report.paint(f"{len(rows)} row{'s' if len(rows) != 1 else ''} in {elapsed:.1f} ms", "dim", color=report.use_color()))
     return 0
 
@@ -257,6 +269,9 @@ def cmd_trust(args: argparse.Namespace, cfg: Config) -> int:
     from .recorder import Recorder
 
     ref = file_entity(args.path, os.getcwd())
+    if not cfg.db_path.exists():   # looking must not create a graph, and with it a "project"
+        _err(f"nothing has been recorded in {cfg.root}; there is no taint to clear")
+        return 1
     with open_store(cfg) as store:
         ok = Recorder(store, cfg).trust_entity(ref.id)
     if not ok:
@@ -499,17 +514,20 @@ def cmd_doctor(args: argparse.Namespace, cfg: Config) -> int:
     line(bool(registered) or None, "hooks", ", ".join(registered) if registered else "not registered for this project (`tainttrail init`)")
     if cfg.config_error:
         line(False, "config", cfg.config_error)
-    try:
-        with open_store(cfg) as store:
-            nodes = store.scalar("MATCH (n) RETURN count(n)", default=0)
-            recovered = store.recovered
-        if recovered:
-            source = "the version before it" if recovered["restored"] == "previous" else "a new, empty graph"
-            line(None, "graph", f"{cfg.db_path} did not open ({recovered['error']}); it was set aside as "
-                                f"{Path(recovered['damaged']).name} and replaced by {source}")
-        line(True, "graph", f"{cfg.db_path} opens for writing ({nodes} nodes)")
-    except Exception as exc:   # noqa: BLE001
-        line(False, "graph", f"{cfg.db_path}: {exc}")
+    if not cfg.db_path.exists():   # a check must not create a graph, and with it a "project"
+        line(None, "graph", f"nothing recorded yet in {cfg.root}")
+    else:
+        try:
+            with open_store(cfg) as store:
+                nodes = store.scalar("MATCH (n) RETURN count(n)", default=0)
+                recovered = store.recovered
+            if recovered:
+                source = "the version before it" if recovered["restored"] == "previous" else "a new, empty graph"
+                line(None, "graph", f"{cfg.db_path} did not open ({recovered['error']}); it was set aside as "
+                                    f"{Path(recovered['damaged']).name} and replaced by {source}")
+            line(True, "graph", f"{cfg.db_path} opens for writing ({nodes} nodes)")
+        except Exception as exc:   # noqa: BLE001
+            line(False, "graph", f"{cfg.db_path}: {exc}")
     claude = shutil.which("claude")
     line(bool(claude) or None, "claude cli", claude or "not on PATH (only needed for `tainttrail audit --agent`)")
 
@@ -658,7 +676,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     # The hook path must stay fast and must not depend on the other commands' modules.
-    if argv[:1] == ["hook"]:
+    if argv[:1] == ["hook"] and argv[1:2] in ([], ["claude-code"]):
         from .hooks import claude_code
 
         return claude_code.main()

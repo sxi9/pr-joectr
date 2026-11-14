@@ -9,6 +9,8 @@ depends on an activated virtualenv fails silently when the virtualenv is not act
 from __future__ import annotations
 
 import json
+import os
+import re
 import shlex
 import shutil
 import sys
@@ -79,11 +81,19 @@ def hook_command(python: str | None = None) -> str:
     return f"{shlex.quote(python or sys.executable)} {MARKER} claude-code"
 
 
+# What the installer writes, and nothing looser: `<python> -m tainttrail hook claude-code` at the end
+# of the command. A wrapper or an audit script that merely mentions "tainttrail hook" is someone
+# else's handler and is left alone.
+_OURS = re.compile(r"(?:^|\s)-m\s+tainttrail\s+hook(?:\s+claude-code)?\s*$")
+
+
 def _is_ours(handler: Any) -> bool:
     if not isinstance(handler, dict):
         return False
-    text = str(handler.get("command") or "") + " " + " ".join(str(a) for a in handler.get("args") or [])
-    return MARKER in text or "tainttrail hook" in text
+    args = handler.get("args")
+    text = str(handler.get("command") or "") + " " + " ".join(str(a) for a in args if isinstance(a, str)) \
+        if isinstance(args, list) else str(handler.get("command") or "")
+    return bool(_OURS.search(text.strip()))
 
 
 def _load(path: Path) -> dict[str, Any]:
@@ -103,18 +113,42 @@ def _save(path: Path, data: dict[str, Any]) -> None:
     path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
 
 
+def _handlers(group: Any) -> list[Any] | None:
+    """The handler list of a hook group, or None when the group is not shaped like one.
+
+    A group whose "hooks" is a single object or a string is somebody's mistake or somebody's
+    extension; either way it is not ours to rewrite.
+    """
+    if not isinstance(group, dict):
+        return None
+    hooks = group.get("hooks")
+    return hooks if isinstance(hooks, list) else None
+
+
+def _sees_every_tool(group: dict[str, Any]) -> bool:
+    return group.get("matcher") in (None, "", "*")
+
+
 def is_installed(path: Path) -> bool:
-    """Whether a settings file registers the guard on PreToolUse."""
+    """Whether a settings file registers the guard on PreToolUse for every tool."""
     try:
         data = _load(path)
     except (ValueError, OSError):
         return False
-    groups = (data.get("hooks") or {}).get("PreToolUse") or []
-    return any(_is_ours(h) for g in groups if isinstance(g, dict) for h in g.get("hooks") or [])
+    hooks = data.get("hooks")
+    groups = hooks.get("PreToolUse") if isinstance(hooks, dict) else None
+    if not isinstance(groups, list):
+        return False
+    return any(_is_ours(h) for g in groups if _handlers(g) is not None and _sees_every_tool(g) for h in _handlers(g) or [])
 
 
 def register_hooks(data: dict[str, Any], command: str, *, fail_closed: bool = False) -> bool:
-    """Add or refresh the guard's handlers in a settings object. Returns True if it changed."""
+    """Add or refresh the guard's handlers in a settings object. Returns True if it changed.
+
+    The guard gets a group of its own for each event, one that matches every tool. A handler
+    of ours found in a narrower group (a hand edit, an older layout) is moved, because a guard
+    that only sees Bash is not a guard.
+    """
     before = json.dumps(data, sort_keys=True)
     hooks = data.setdefault("hooks", {})
     if not isinstance(hooks, dict):
@@ -127,24 +161,23 @@ def register_hooks(data: dict[str, Any], command: str, *, fail_closed: bool = Fa
         if fail_closed and event == "PreToolUse":
             handler["onFailure"] = "block"   # covers what the script cannot catch: a missing interpreter, a kill
         placed = False
+        kept_groups = []
         for group in groups:
-            if not isinstance(group, dict):
+            handlers = _handlers(group)
+            if handlers is None or not any(_is_ours(h) for h in handlers):
+                kept_groups.append(group)
                 continue
-            kept = []
-            for h in group.get("hooks") or []:
-                if _is_ours(h):
-                    if not placed:
-                        kept.append(handler)
-                        placed = True
-                else:
-                    kept.append(h)
-            group["hooks"] = kept
-        groups[:] = [g for g in groups if not isinstance(g, dict) or g.get("hooks")]
+            others = [h for h in handlers if not _is_ours(h)]
+            if not placed and not others and (_sees_every_tool(group) or not by_tool):
+                group["hooks"] = [handler]      # our own group, already in the right place: refresh it
+                kept_groups.append(group)
+                placed = True
+            elif others:
+                group["hooks"] = others         # someone else's group: take ours out, leave theirs
+                kept_groups.append(group)
+        groups[:] = kept_groups
         if not placed:
-            group = {"hooks": [handler]}
-            if by_tool:
-                group = {"matcher": "*", "hooks": [handler]}
-            groups.append(group)
+            groups.append({"matcher": "*", "hooks": [handler]} if by_tool else {"hooks": [handler]})
     return json.dumps(data, sort_keys=True) != before
 
 
@@ -157,10 +190,16 @@ def unregister_hooks(data: dict[str, Any]) -> bool:
             groups = hooks[event]
             if not isinstance(groups, list):
                 continue
+            kept = []
             for group in groups:
-                if isinstance(group, dict):
-                    group["hooks"] = [h for h in group.get("hooks") or [] if not _is_ours(h)]
-            hooks[event] = [g for g in groups if not isinstance(g, dict) or g.get("hooks")]
+                handlers = _handlers(group)
+                if handlers is None or not any(_is_ours(h) for h in handlers):
+                    kept.append(group)
+                    continue
+                group["hooks"] = [h for h in handlers if not _is_ours(h)]
+                if group["hooks"]:
+                    kept.append(group)
+            hooks[event] = kept
             if not hooks[event]:
                 del hooks[event]
         if not hooks:
@@ -168,30 +207,51 @@ def unregister_hooks(data: dict[str, Any]) -> bool:
     return json.dumps(data, sort_keys=True) != before
 
 
+def user_config_path() -> Path:
+    """Defaults for every project that has no config file of its own."""
+    base = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+    return Path(base) / "tainttrail" / CONFIG_FILENAME
+
+
 def init(cfg: Config, *, scope: str = "project", python: str | None = None, mode: str = "guard",
          fail_closed: bool = False) -> list[str]:
-    """Install the guard for a project. Safe to run again. Returns what was done, one line each."""
-    done: list[str] = []
-    cfg.home.mkdir(parents=True, exist_ok=True)
-    conf = cfg.home / CONFIG_FILENAME
-    if not conf.exists():
-        conf.write_text(DEFAULT_CONFIG.format(mode=mode, fail_closed="true" if fail_closed else "false"),
-                        encoding="utf-8")
-        done.append(f"wrote {conf}")
-    else:
-        done.append(f"kept existing {conf}")
+    """Install the guard. Safe to run again. Returns what was done, one line each.
 
-    if (cfg.root / ".git").exists():
-        ignore = cfg.root / ".gitignore"
-        text = ignore.read_text(encoding="utf-8") if ignore.exists() else ""
-        if not any(line.strip().rstrip("/") == HOME_DIRNAME for line in text.splitlines()):
-            with open(ignore, "a", encoding="utf-8") as fh:
-                fh.write(("" if not text or text.endswith("\n") else "\n") + f"{HOME_DIRNAME}/\n")
-            done.append(f"added {HOME_DIRNAME}/ to {ignore}")
-
+    With scope "user" the hooks run in every project, so the mode and the fail-closed choice
+    are written where every project reads them (the user-level config), not into the one
+    project this command happened to be run in.
+    """
     path = settings_path(cfg, scope)
-    data = _load(path)   # a file that does not parse is left alone: the error reaches the caller
-    if register_hooks(data, hook_command(python), fail_closed=fail_closed):
+    data = _load(path)   # first: a settings file that does not parse stops everything before anything is written
+    changed = register_hooks(data, hook_command(python), fail_closed=fail_closed)
+
+    done: list[str] = []
+    text = DEFAULT_CONFIG.format(mode=mode, fail_closed="true" if fail_closed else "false")
+    if scope == "user":
+        conf = user_config_path()
+        if not conf.exists():
+            conf.parent.mkdir(parents=True, exist_ok=True)
+            conf.write_text(text, encoding="utf-8")
+            done.append(f"wrote {conf} (the defaults for every project without a config of its own)")
+        else:
+            done.append(f"kept existing {conf}")
+    else:
+        cfg.home.mkdir(parents=True, exist_ok=True)
+        conf = cfg.home / CONFIG_FILENAME
+        if not conf.exists():
+            conf.write_text(text, encoding="utf-8")
+            done.append(f"wrote {conf}")
+        else:
+            done.append(f"kept existing {conf}")
+        if (cfg.root / ".git").exists():
+            ignore = cfg.root / ".gitignore"
+            existing = ignore.read_text(encoding="utf-8") if ignore.exists() else ""
+            if not any(line.strip().rstrip("/") == HOME_DIRNAME for line in existing.splitlines()):
+                with open(ignore, "a", encoding="utf-8") as fh:
+                    fh.write(("" if not existing or existing.endswith("\n") else "\n") + f"{HOME_DIRNAME}/\n")
+                done.append(f"added {HOME_DIRNAME}/ to {ignore}")
+
+    if changed:
         _save(path, data)
         done.append(f"registered the hooks in {path}")
     else:

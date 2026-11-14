@@ -57,6 +57,29 @@ def _unicode_ok() -> bool:
     return "utf" in enc
 
 
+def printable(value: Any) -> Any:
+    """Recorded text as it may be shown on a terminal.
+
+    A command, a prompt or a tool result can hold escape sequences, and whoever wrote the
+    content the guard was watching chose them. Printed raw they move the cursor, erase lines
+    or repaint the very table that says what was denied. Control and format characters
+    (bidirectional overrides and zero-width characters among them) are replaced; line breaks
+    and tabs stay.
+    """
+    if isinstance(value, str):
+        if value.isprintable():
+            return value
+        mark = "\ufffd" if _unicode_ok() else "?"
+        return "".join(ch if ch in "\n\t" or ch.isprintable() else mark for ch in value)
+    if isinstance(value, dict):
+        return {k: printable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return type(value)(printable(v) for v in value)
+    if isinstance(value, PathStep):
+        return PathStep(**{k: printable(v) for k, v in vars(value).items()})
+    return value
+
+
 def _ellipsis(text: str, width: int) -> str:
     text = " ".join(str(text).split())
     return text if len(text) <= width else text[: max(0, width - 1)] + ("…" if _unicode_ok() else "~")
@@ -222,6 +245,7 @@ def render_path(steps: Iterable[PathStep], *, color: bool = False, decision: str
     The arrow points the way the stored edge points, so the diagram reads as evidence:
     ``page MENTIONS host``, ``call SENDS_TO host``.
     """
+    steps = printable(list(steps))
     steps = list(steps)
     if not steps:
         return f"{indent}(no path recorded)"
@@ -253,6 +277,7 @@ def render_path(steps: Iterable[PathStep], *, color: bool = False, decision: str
 
 def render_finding(f: dict[str, Any], *, color: bool = False, width: int = 96, show_query: bool = True) -> str:
     """One finding in full: verdict, explanation, path, and the query that found it."""
+    f = printable(f)
     action, intended = f["action"], f.get("intended") or f["action"]
     if action == "allow" and intended in ("ask", "deny"):
         verdict = paint(f"would be {ACTION_WORD[intended]}", *ACTION_STYLE[intended], color=color) + \
@@ -278,6 +303,7 @@ def render_finding(f: dict[str, Any], *, color: bool = False, width: int = 96, s
 
 
 def render_findings(rows: list[dict[str, Any]], *, color: bool = False, width: int = 110) -> str:
+    rows = printable(rows)
     if not rows:
         return "No findings."
     lines = []
@@ -299,6 +325,7 @@ def render_findings(rows: list[dict[str, Any]], *, color: bool = False, width: i
 
 def render_timeline(rows: list[dict[str, Any]], *, color: bool = False, width: int = 110) -> str:
     """A session as a table: what entered the context, what was called, what was decided."""
+    rows = printable(rows)
     if not rows:
         return "No events recorded for this session."
     what_w = max(24, width - 46)
@@ -344,6 +371,7 @@ def render_timeline(rows: list[dict[str, Any]], *, color: bool = False, width: i
 
 
 def render_sessions(rows: list[dict[str, Any]], *, color: bool = False) -> str:
+    rows = printable(rows)
     if not rows:
         return "No sessions recorded yet."
     lines = [paint(f"{'session':<38} {'started':<24} {'calls':>5} {'asked':>5} {'denied':>6} {'findings':>8}",

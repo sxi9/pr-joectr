@@ -94,9 +94,29 @@ def _base(word: str) -> str:
     return word.rsplit("/", 1)[-1].lower()
 
 
+_SEEN: dict[int, set] = {}     # membership sets for the lists _add fills, by list identity
+
+
 def _add(items: list, value) -> None:
-    if value is None or value == "" or value in items:
+    """Append unless already there. Constant time: a command can have ten thousand operands."""
+    if value is None or value == "":
         return
+    seen = _SEEN.get(id(items))
+    if seen is None or len(seen) != len(items):     # a new list, or one that was changed elsewhere
+        try:
+            seen = _SEEN[id(items)] = set(items)
+        except TypeError:                           # something unhashable: fall back to the slow test
+            if value not in items:
+                items.append(value)
+            return
+    if value in seen:
+        return
+    try:
+        seen.add(value)
+    except TypeError:
+        if value in items:
+            return
+        _SEEN.pop(id(items), None)
     items.append(value)
 
 
@@ -1764,6 +1784,7 @@ def analyze_bash(command: str, cwd: str | None = None) -> BashAnalysis:
     opaque so that it is treated as a possible sink.
     """
     command = command or ""
+    _SEEN.clear()
     if len(command) > MAX_COMMAND_CHARS:
         out = BashAnalysis(opaque=True, is_sink=True, carries_payload=True, sink_kinds=["opaque"])
         _add(out.opaque_reasons, f"the command is {len(command):,} characters long, too long to analyse")

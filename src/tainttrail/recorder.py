@@ -28,6 +28,8 @@ _SECRETISH_ENV = re.compile(r"KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|PRIVAT
 COPY_TAINT_MIN_CHUNKS = 3
 COPY_TAINT_MIN_INJECTION = 0.3
 
+MAX_ACTIONS_PER_CALL = 400
+
 # A link as an entity of its own that nothing refers to any more, except the edge to its host.
 _DROP_UNREFERENCED_LINKS = """
 MATCH (e:Entity {kind: 'url'})
@@ -58,10 +60,10 @@ class Recorder:
 
     # -- sessions ---------------------------------------------------------------------
 
-    def ensure_session(self, event: HookEvent) -> None:
-        """Create the session on first sight. Hooks can be installed mid-session."""
+    def ensure_session(self, event: HookEvent) -> bool:
+        """Create the session on first sight. Hooks can be installed mid-session. True when it was created."""
         if self.store.one("MATCH (s:Session {id: $id}) RETURN s.id AS id", {"id": event.session_id}):
-            return
+            return False
         self.store.write(
             """
             MERGE (s:Session {id: $id})
@@ -74,6 +76,7 @@ class Recorder:
             {"id": event.session_id, "agent_kind": event.agent_kind, "cwd": event.cwd,
              "ts": event.ts, "mode": self.cfg.mode},
         )
+        return True
 
     def session_start(self, event: HookEvent) -> list[str]:
         """Create the session, trust the project's git remotes, inherit tainted memory.
@@ -82,8 +85,10 @@ class Recorder:
         harness loads by itself and that an earlier session wrote under the influence
         of untrusted content.
         """
-        self.ensure_session(event)
-        self._trust_git_remotes(event)
+        # The harness fires this event again on resume, /clear and compaction. Remotes are trusted
+        # once, when the session begins: one added later, during the session, gets no such trust.
+        if self.ensure_session(event):
+            self._trust_git_remotes(event)
         return self._inherit_memory(event)
 
     def inherited_memory(self, session_id: str) -> list[dict[str, Any]]:
@@ -358,6 +363,20 @@ class Recorder:
 
     def _write_actions(self, cid: str, analysis: CallAnalysis, ts: int) -> None:
         actions = [a for a in analysis.actions if a.rel in S.ACTION_RELS]
+        if len(actions) > MAX_ACTIONS_PER_CALL:
+            # `rm` with five thousand operands is five thousand file nodes for one call. Keep what a
+            # rule can act on (anything sent, uploaded or run; hosts and links; sensitive, protected
+            # and untrusted files) ahead of ordinary files, so padding cannot push it out.
+            def ordinary(a: Any) -> bool:
+                if a.rel in (S.SENDS_TO, S.UPLOADS, S.EXECUTES) or a.entity.kind != "file":
+                    return False
+                row = self.entity_row(a.entity)
+                return not (row["sensitive"] or row["protected"] or row["untrusted"])
+
+            actions.sort(key=ordinary)
+            self.store.write("MATCH (c:ToolCall {id: $id}) SET c.actions_dropped = $n",
+                             {"id": cid, "n": len(actions) - MAX_ACTIONS_PER_CALL})
+            actions = actions[:MAX_ACTIONS_PER_CALL]
         self._merge_entities([a.entity for a in actions] + list(analysis.destinations), ts)
         by_rel: dict[str, list[dict[str, Any]]] = {}
         for a in actions:
@@ -368,16 +387,20 @@ class Recorder:
                 by_rel.setdefault(S.SENDS_TO, []).append({"eid": dest.id, "props": {}})
                 have_sends.add(dest.id)
         for rel, rows in by_rel.items():
-            # rel comes from the fixed ACTION_RELS tuple, never from input.
+            unique = list({row["eid"]: row for row in rows}.values())
+            # rel comes from the fixed ACTION_RELS tuple, never from input. The call was created a
+            # moment ago and has no such edge yet, so the edges are created, not merged: a MERGE
+            # scans the edges the call already has for every row, which is quadratic in a command
+            # with thousands of operands.
             self.store.write(
                 f"""
                 MATCH (c:ToolCall {{id: $id}})
                 UNWIND $rows AS row
                 MATCH (e:Entity {{id: row.eid}})
-                MERGE (c)-[r:{rel}]->(e)
+                CREATE (c)-[r:{rel}]->(e)
                 SET r += row.props
                 """,
-                {"id": cid, "rows": rows},
+                {"id": cid, "rows": unique},
             )
 
     def _write_derived(self, cid: str, analysis: CallAnalysis, ts: int) -> None:
@@ -588,17 +611,18 @@ class Recorder:
                 ]},
             )
             self._remember_secret_lengths(c.length for c in chunks if c.kind == "secret")
-        if any(c.kind in ("line", "url") for c in chunks) or any(m.kind == "url" for m in mentions):
+        if any(c.kind != "secret" for c in chunks) or any(m.kind == "url" for m in mentions):
             self.store.write("MATCH (c:Content {id: $cid}) SET c.detail = true", {"cid": cid})
             self._compact_older_content(event.session_id)
 
     def _compact_older_content(self, session_id: str) -> None:
-        """Keep line and link detail for the most recent results of a session only.
+        """Keep line, token and link detail for the most recent results of a session only.
 
         A session that reads hundreds of pages or private files would otherwise hold tens of
         thousands of fingerprints, and the graph is loaded for every hook event. An older result
-        keeps its node, its flags, its hosts and the fingerprints of its secrets; what it loses
-        is the means to notice a verbatim copy of its lines and the links it listed.
+        keeps its node, its flags, its hosts and the fingerprints of the secrets recognised in it;
+        what it loses is the means to notice a verbatim copy of its lines, of a random-looking
+        string in it that no pattern knew for a secret, and of the links it listed.
         """
         rows = self.store.run(
             "MATCH (c:Content {session_id: $sid, detail: true}) RETURN c.id AS id, coalesce(c.sensitive, false) AS sensitive "
@@ -624,7 +648,7 @@ class Recorder:
             MATCH (c:Content {id: id})
             SET c.detail = false
             WITH c
-            OPTIONAL MATCH (c)-[h:HAS_CHUNK]->(k:Chunk) WHERE k.kind IN ['line', 'url']
+            OPTIONAL MATCH (c)-[h:HAS_CHUNK]->(k:Chunk) WHERE k.kind <> 'secret'
             DELETE h
             """,
             {"ids": old},

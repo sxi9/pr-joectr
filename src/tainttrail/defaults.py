@@ -157,8 +157,8 @@ MAX_CHUNKS_UNTRUSTED = 120
 # Line and link fingerprints, and links as entities, are kept for the most recent results of a
 # session only: this many that hold sensitive data, this many that are merely untrusted. Older
 # results keep their flags, their hosts and the fingerprints of their secrets.
-DETAIL_WINDOW_SENSITIVE = 16
-DETAIL_WINDOW_UNTRUSTED = 10
+DETAIL_WINDOW_SENSITIVE = 12
+DETAIL_WINDOW_UNTRUSTED = 8
 # The live graph is opened and closed for every hook event, at about 45 ms per thousand
 # nodes. Past this many session nodes the oldest sessions move to archive files. 0 keeps
 # everything.

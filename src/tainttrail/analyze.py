@@ -227,9 +227,9 @@ def analyze_call(tool_name: str, tool_input: dict, cfg: Config, *, cwd: str, lab
         ref = file_entity(path, cwd) if path else None
         b.add(S.WRITES, ref)
         pieces = [tool_input.get("content"), tool_input.get("new_string"), tool_input.get("new_source")]
-        pieces += [e.get("new_string") for e in tool_input.get("edits") or [] if isinstance(e, dict)]
+        pieces += [e.get("new_string") for e in _as_list(tool_input.get("edits")) if isinstance(e, dict)]
         call.arg_text = "\n".join(str(p) for p in pieces if isinstance(p, str))[:limit]
-        olds = [tool_input.get("old_string")] + [e.get("old_string") for e in tool_input.get("edits") or [] if isinstance(e, dict)]
+        olds = [tool_input.get("old_string")] + [e.get("old_string") for e in _as_list(tool_input.get("edits")) if isinstance(e, dict)]
         call.extra["old_text"] = "\n".join(str(p) for p in olds if isinstance(p, str))[:limit]
         call.summary = f"{tool} {ref.name if ref else ''}".strip()
     elif tool in SEARCH_TOOLS:
@@ -437,34 +437,61 @@ def response_text(tool_name: str, tool_response: Any) -> str:
     if isinstance(r, dict):
         if "error" in r and len(r) <= 2 and isinstance(r["error"], str):
             return r["error"]
-        if tool in READ_TOOLS:
-            file = r.get("file")
-            if isinstance(file, dict) and isinstance(file.get("content"), str):
-                return file["content"]
-            return ""
         if tool in WRITE_TOOLS:
             return ""          # the agent sees a confirmation, not new content
-        if tool == "Bash":
-            return "\n".join(x for x in (r.get("stdout"), r.get("stderr")) if isinstance(x, str) and x)
-        if tool == "Grep":
-            content = r.get("content")
-            names = r.get("filenames") or []
-            return content if isinstance(content, str) and content else "\n".join(str(n) for n in names)
-        if tool in ("Glob", "LS"):
-            return "\n".join(str(n) for n in r.get("filenames") or [])
-        if tool == "WebFetch":
-            return str(r.get("result") or "")
-        if tool in SUBAGENT_TOOLS:
-            return _blocks_text(r.get("content")) or str(r.get("result") or "")
-        if isinstance(r.get("content"), list):
-            text = _blocks_text(r["content"])
-            if text:
-                return text
+        text = _known_shape(tool, r)
+        if text is not None:
+            return text
+        # A shape this version does not know (a notebook's cells, a background command's handle):
+        # every string in it still entered the context. Dropping it would record the result as
+        # empty, and nothing in it could ever appear on a path.
+        return _flat_text(r, 1_000_000)
     if isinstance(r, list):
         text = _blocks_text(r)
         if text:
             return text
     return _flat_text(r, 1_000_000)
+
+
+def _known_shape(tool: str, r: dict[str, Any]) -> str | None:
+    """The text of a result in the shape the harness uses for this tool; None for any other shape."""
+    if tool in READ_TOOLS:
+        file = r.get("file")
+        if not isinstance(file, dict):
+            return None
+        if isinstance(file.get("content"), str):
+            return file["content"]
+        if "base64" in file:
+            return ""      # an image or another binary: no text entered the context
+        return _flat_text({k: v for k, v in file.items() if k not in ("filePath", "path")}, 1_000_000)
+    if tool == "Bash":
+        if "stdout" not in r and "stderr" not in r:
+            return None
+        return "\n".join(x for x in (r.get("stdout"), r.get("stderr")) if isinstance(x, str) and x)
+    if tool == "Grep":
+        if "content" not in r and "filenames" not in r:
+            return None
+        content = r.get("content")
+        if isinstance(content, str) and content:
+            return content
+        return "\n".join(str(n) for n in _as_list(r.get("filenames")))
+    if tool in ("Glob", "LS"):
+        return "\n".join(str(n) for n in _as_list(r["filenames"])) if "filenames" in r else None
+    if tool == "WebFetch":
+        if "result" not in r:
+            return None
+        return r["result"] if isinstance(r["result"], str) else _flat_text(r["result"], 1_000_000)
+    if tool in SUBAGENT_TOOLS:
+        if "content" not in r and "result" not in r:
+            return None
+        return _blocks_text(r.get("content")) or (r["result"] if isinstance(r.get("result"), str) else "")
+    if isinstance(r.get("content"), list):
+        return _blocks_text(r["content"]) or None
+    return None
+
+
+def _as_list(value: Any) -> list[Any]:
+    return value if isinstance(value, list) else []
 
 
 def _blocks_text(blocks: Any) -> str:

@@ -305,7 +305,7 @@ def cmd_export(args: argparse.Namespace, cfg: Config) -> int:
     if fmt == "rl":
         try:
             write_rl(export, args.out)
-        except FileExistsError as exc:
+        except OSError as exc:   # the file exists, the directory does not, no permission
             print(f"tainttrail export: {exc}", file=sys.stderr)
             return 1
         text = None
@@ -316,7 +316,11 @@ def cmd_export(args: argparse.Namespace, cfg: Config) -> int:
 
     if text is not None:
         if args.out:
-            Path(args.out).write_text(text, encoding="utf-8")
+            try:
+                Path(args.out).write_text(text, encoding="utf-8")
+            except OSError as exc:
+                print(f"tainttrail export: cannot write {args.out}: {exc.strerror or exc}", file=sys.stderr)
+                return 1
         else:
             sys.stdout.write(text)
     if args.out:
