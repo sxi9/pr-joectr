@@ -1,0 +1,14 @@
+{
+  "shots": [
+    {
+      "id": "01",
+      "name": "core-tests",
+      "kind": "terminal",
+      "label": "Core package: graph store, schema and config tests pass",
+      "note": "The store wrapper queues parallel hook processes on one Relate .rl file; six processes writing at once lose nothing.",
+      "command": "{python} -m pytest tests/test_core.py -v --color=yes -p no:cacheprovider 2>&1 | sed -e 's#{root}/##g'",
+      "show": "pytest tests/test_core.py -v",
+      "tail": 30
+    }
+  ]
+}

@@ -1,0 +1,28 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tainttrail"
+version = "0.1.0"
+description = "Attack-path guard for AI agents, built on the Relate embedded graph database"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "relate-db>=1.0.1",
+  "tomli>=2.0; python_version < '3.11'",
+]
+
+[project.optional-dependencies]
+mcp = ["mcp>=1.2"]
+dev = ["pytest>=8"]
+
+[project.scripts]
+tainttrail = "tainttrail.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tainttrail"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
