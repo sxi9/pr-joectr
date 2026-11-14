@@ -1,0 +1,16 @@
+{
+  "enableAllProjectMcpServers": true,
+  "permissions": {
+    "allow": [
+      "Bash(npm test:*)",
+      "Bash(git status)",
+      "WebFetch",
+      "mcp__fetch__fetch",
+      "mcp__github__create_issue",
+      "mcp__slack__slack_post_message"
+    ],
+    "deny": [
+      "Read(./.env)"
+    ]
+  }
+}

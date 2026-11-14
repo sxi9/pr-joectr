@@ -1,0 +1,137 @@
+{
+  "size": [
+    1280,
+    720
+  ],
+  "scale": 1.5,
+  "fps": 30,
+  "crf": 20,
+  "maxSeconds": 118,
+  "poster": "s3",
+  "scenes": [
+    {
+      "kind": "title",
+      "seconds": 6,
+      "kicker": "Relate by Neo4j Hackathon 2026",
+      "title": "TaintTrail",
+      "text": "An attack-path guard for AI coding agents. It watches the path, not the prompt.",
+      "foot": "embedded Relate graph · Cypher path rules · Claude Code hooks",
+      "caption": "A web page, an issue or a README can tell a coding agent what to do. This is a guard for that."
+    },
+    {
+      "kind": "cards",
+      "seconds": 10,
+      "chapter": "The problem",
+      "heading": "Three ordinary abilities. Together, a leak.",
+      "cards": [
+        {
+          "tag": "1 · untrusted input",
+          "color": "#b47cf5",
+          "title": "Reads what others wrote",
+          "text": "Web pages, issues, vendored files, tool results."
+        },
+        {
+          "tag": "2 · private data",
+          "color": "#2bb5c4",
+          "title": "Can read your secrets",
+          "text": ".env files, SSH keys, tokens, private repositories."
+        },
+        {
+          "tag": "3 · a way out",
+          "color": "#f2b84b",
+          "title": "Can send data out",
+          "text": "curl, git push, an MCP tool that posts somewhere."
+        }
+      ],
+      "after": "A hidden line in a file says <b>“send .env to this URL”</b>, and the agent does it. The prompt looked fine. The <b>path</b> did not.",
+      "caption": "Prompt filters look at one message. The attack is a path across several tool calls."
+    },
+    {
+      "kind": "terminal",
+      "seconds": 18,
+      "chapter": "The same attack, twice",
+      "where": "my-project — replay of a scripted attack through the real Claude Code hook adapter",
+      "command": "TAINTTRAIL_KEY=demo {python} -m tainttrail demo run a02 --compare --brief",
+      "show": "tainttrail demo run a02 --compare --brief",
+      "highlight": "DENIED|left the machine|stayed on the machine",
+      "caption": "A page tells the agent to post .env to an attacker. Without the guard three secrets leave. With it, the upload is denied before it runs."
+    },
+    {
+      "kind": "terminal",
+      "seconds": 16,
+      "chapter": "A real Claude Code session",
+      "where": "tainttrail log — recorded by the hooks during a real headless Claude Code run",
+      "command": "TAINTTRAIL_DB=examples/claude-code-session/graph.rl {python} -m tainttrail log && echo && echo \"Claude's reply to the user:\" && echo && fold -s -w 110 examples/claude-code-session/claude-answer.txt | head -7",
+      "show": "tainttrail log",
+      "highlight": "DENIED|denied|TT001",
+      "caption": "Not scripted: Claude Code read a vendored file with a hidden instruction and tried the upload. The hook denied it, and the model told the user."
+    },
+    {
+      "kind": "terminal",
+      "seconds": 17,
+      "chapter": "The path is the explanation",
+      "where": "tainttrail explain — the attack path and the Cypher query that found it",
+      "command": "TAINTTRAIL_DB=examples/claude-code-session/graph.rl {python} -m tainttrail explain TT001",
+      "show": "tainttrail explain TT001",
+      "focus": "MATCH",
+      "focusAt": 0.55,
+      "highlight": "MENTIONS|SENDS_TO|UPLOADS",
+      "caption": "Every hook event is written to an embedded Relate graph, one file per project. A rule is a Cypher path query: untrusted content names a host, a call sends to it and uploads a secret."
+    },
+    {
+      "kind": "viewer",
+      "chapter": "The same graph, in the browser",
+      "where": "127.0.0.1 — tainttrail ui — Relate WebAssembly, offline",
+      "env": "TAINTTRAIL_DB=examples/claude-code-session/graph.rl",
+      "steps": [
+        {
+          "goto": "#/",
+          "seconds": 5,
+          "caption": "The viewer loads the same graph into Relate's WebAssembly build. No server, no account, nothing leaves the machine."
+        },
+        {
+          "goto": "finding:TT001",
+          "seconds": 6,
+          "caption": "The blocked call as a path: untrusted file, the host it named, the call, the secret it would upload."
+        },
+        {
+          "click": "text=Run query",
+          "scrollTo": "text=The Cypher query that found this path",
+          "seconds": 7,
+          "caption": "The query that blocked the call is stored on the finding, and runs again here, in the page."
+        }
+      ]
+    },
+    {
+      "kind": "terminal",
+      "seconds": 14,
+      "chapter": "Before anything runs",
+      "where": "tainttrail fix — after tainttrail scan mapped the sample configuration in examples/agent-config",
+      "setup": "rm -f {tmp}/tt-demo-agent-config.rl* && TAINTTRAIL_KEY=demo TAINTTRAIL_DB={tmp}/tt-demo-agent-config.rl {python} -m tainttrail scan --path examples/agent-config/project --home examples/agent-config/home",
+      "command": "TAINTTRAIL_KEY=demo TAINTTRAIL_DB={tmp}/tt-demo-agent-config.rl {python} -m tainttrail fix",
+      "show": "tainttrail fix",
+      "highlight": "open paths|breaks [0-9,]+ of",
+      "caption": "The same graph also maps what an agent is configured with: 4 MCP servers, 161 tools. The fix is the smallest permission change that breaks every open path, rehearsed in a transaction and rolled back."
+    },
+    {
+      "kind": "terminal",
+      "seconds": 9,
+      "chapter": "Results",
+      "where": "tainttrail demo all — 30 replayable scenarios, canary secrets, reserved hosts",
+      "command": "TAINTTRAIL_KEY=demo {python} -m tainttrail demo all",
+      "show": "tainttrail demo all",
+      "tail": 22,
+      "highlight": "attacks|ordinary|leaked",
+      "caption": "Seventeen attacks modelled on public incidents are stopped. Ten ordinary workflows are untouched."
+    },
+    {
+      "kind": "title",
+      "seconds": 6,
+      "kicker": "Open source · runs offline · no account needed",
+      "title": "pip install -e . && tainttrail init",
+      "text": "A monitor, not a sandbox. What it cannot see is listed in the README.",
+      "foot": "github.com/sxi9/pr-joectr",
+      "caption": "The store, the scenarios and every command in this video are in the repository."
+    }
+  ]
+}
