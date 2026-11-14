@@ -190,7 +190,7 @@ adapter; every secret is a canary and nothing is contacted.
 tainttrail demo run a02 --compare
 ```
 
-**2. Replay the whole suite**, 161 scenarios, as one table (about 40 seconds):
+**2. Replay the whole suite**, 161 scenarios, as one table (under a minute):
 
 ```bash
 tainttrail demo all
@@ -457,5 +457,5 @@ pip install -e ".[dev]"
 pytest
 ```
 
-1,877 tests, about seven minutes. `node tests/viewer_check.mjs` drives the viewer in a
+About 1,900 tests, three to four minutes. `node tests/viewer_check.mjs` drives the viewer in a
 browser (needs Node and Playwright).

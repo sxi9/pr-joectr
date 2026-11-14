@@ -6,6 +6,18 @@ from tainttrail.config import Config
 from tainttrail.store import Store
 
 
+@pytest.fixture(autouse=True)
+def _callers_environment_does_not_reach_the_tests(monkeypatch):
+    """Tests compare printed text and work in temporary projects.
+
+    A terminal that forces colour, or a TAINTTRAIL_DB left over from trying the README's
+    commands, must not change what they see.
+    """
+    for name in ("FORCE_COLOR", "CLICOLOR_FORCE", "CLICOLOR", "NO_COLOR", "TAINTTRAIL_DB", "TAINTTRAIL_HOME",
+                 "TAINTTRAIL_MODE"):
+        monkeypatch.delenv(name, raising=False)
+
+
 @pytest.fixture()
 def cfg(tmp_path, monkeypatch) -> Config:
     """A project config rooted in a fresh temporary directory."""

@@ -728,3 +728,16 @@ def test_evaluation_stays_fast_on_a_large_graph(store: Store, cfg: Config):
     elapsed = time.perf_counter() - t0
     assert only(findings, "TT001")
     assert elapsed < 0.5, f"record + evaluate took {elapsed * 1000:.0f} ms"
+
+
+def test_a_credential_belongs_to_a_host_by_name_not_by_accident():
+    belongs = rules._stem_match
+    assert belongs("GITHUB_TOKEN", ["api.github.com"]) and belongs("GH_TOKEN", ["github.com/tt-demo/app"])
+    assert belongs("PYPI_TOKEN", ["upload.pypi.org"]) and belongs("NPM_TOKEN", ["registry.npmjs.org"])
+    assert belongs("WEATHERHUB_KEY", ["api.weatherhub.example"]) and belongs("DATADOG_API_KEY", ["api.datadoghq.com"])
+    assert belongs("ACME_STAGING_TOKEN", ["api.staging.webapp-acme.test"])
+    # a generic name belongs nowhere, and a top-level domain or "api" is not a name
+    assert not belongs("API_TOKEN", ["api.example.com"]) and not belongs("SERVICE_TOKEN", ["api.staging.webapp-acme.test"])
+    assert not belongs("AWS_SECRET_ACCESS_KEY", ["paste.example"])
+    assert not belongs("COMPANY_TOKEN", ["paste.example.com"]) and not belongs("NETWORK_KEY", ["collector.example.net"])
+    assert not belongs("CLOUDFLARE_API_TOKEN", ["cloud.example.org"]) and not belongs("ORGANIZATION_KEY", ["paste.example.org"])

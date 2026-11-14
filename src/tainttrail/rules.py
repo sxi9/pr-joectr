@@ -1224,19 +1224,25 @@ class _Eval:
 _SPECIFICITY = {"repo": 0, "email": 1, "mcp": 2, "url": 3, "host": 4}
 _GENERIC_VAR = frozenset("api key keys token tokens secret secrets access auth password passwd pwd id client private public "
                          "test prod live dev staging service app user account bearer oauth url host".split())
-_VAR_ALIASES = {"gh": "github", "npm": "npmjs", "aws": "amazonaws", "gcp": "googleapis", "pg": "paygate"}
+_VAR_ALIASES = {"gh": "github", "npm": "npmjs", "aws": "amazonaws", "gcp": "googleapis"}
+# Parts of a host name that say nothing about whose host it is.
+_GENERIC_LABEL = frozenset("www api app apps dev docs com org net edu gov info biz cloud web mail git cdn static test example "
+                           "invalid local localhost internal staging prod production beta".split())
 
 
 def _stem_match(var: str, places: list[str]) -> bool:
     """Does a variable's name say it belongs to one of these hosts or repositories?
 
-    GITHUB_TOKEN and api.github.com share "github"; PYPI_TOKEN and upload.pypi.org share "pypi".
-    AWS_SECRET_ACCESS_KEY and paste.example share nothing.
+    GITHUB_TOKEN and api.github.com share "github"; PYPI_TOKEN and upload.pypi.org share "pypi";
+    DATADOG_API_KEY and api.datadoghq.com share a beginning. AWS_SECRET_ACCESS_KEY and paste.example
+    share nothing, and neither do COMPANY_TOKEN and any host that ends in .com.
     """
     stems = [t for t in re.split(r"[^a-z0-9]+", var.lower()) if len(t) >= 2 and t not in _GENERIC_VAR]
     stems += [_VAR_ALIASES[t] for t in stems if t in _VAR_ALIASES]
-    labels = [lab for place in places for lab in re.split(r"[^a-z0-9]+", place.lower()) if len(lab) >= 3]
-    return any(len(s) >= 3 and (s in lab or lab in s) for s in stems for lab in labels)
+    labels = [lab for place in places for lab in re.split(r"[^a-z0-9]+", place.lower())
+              if len(lab) >= 3 and lab not in _GENERIC_LABEL]
+    return any(s == lab or (min(len(s), len(lab)) >= 4 and (s.startswith(lab) or lab.startswith(s)))
+               for s in stems if len(s) >= 3 for lab in labels)
 
 
 def _dest_name(dest: dict[str, Any] | None) -> str:
