@@ -101,4 +101,6 @@ TAINTTRAIL_DB=examples/claude-code-session/graph.rl tainttrail explain TT001
 - Make the repository public and add the topics `relate` and `relate-neo4j-hackathon`.
 - Choose a licence (the rules encourage MIT or Apache-2.0) and add a `LICENSE` file. The
   vendored Relate WebAssembly files are Apache-2.0 and carry their own notice.
-- Merge the work into the default branch, so that the README a judge sees first is this one.
+- The work is on `claude/nice-fermi-q7s22r`, which is the repository's only branch and so its
+  default one: the README a judge sees first is this one. Rename the branch to `main` in the
+  repository settings if you prefer.
