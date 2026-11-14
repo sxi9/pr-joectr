@@ -194,8 +194,14 @@ def find_urls(text: str) -> list[str]:
     return out
 
 
-def extract_entities(text: str, *, cwd: str | None = None, limit: int = 200) -> list[EntityRef]:
-    """The things a piece of text names, in first-seen order, without duplicates."""
+def extract_entities(text: str, *, cwd: str | None = None, limit: int = 200, max_urls: int = 40) -> list[EntityRef]:
+    """The things a piece of text names, in first-seen order, without duplicates.
+
+    Every host and repository a link points at is named, but only the first ``max_urls`` links
+    become entities of their own: who named a destination is decided by host, and a page of two
+    hundred links would otherwise put two hundred nodes into a graph that is loaded for every
+    hook event.
+    """
     if not text:
         return []
     found: dict[EntityRef, None] = {}
@@ -205,8 +211,11 @@ def extract_entities(text: str, *, cwd: str | None = None, limit: int = 200) -> 
             found.setdefault(ref)
 
     masked = text
+    urls = 0
     for url in find_urls(text):
-        add(url_entity(url))
+        if urls < max_urls:
+            add(url_entity(url))
+            urls += 1
         add(host_entity(host_of(url) or ""))
         add(repo_entity(url))
     masked = _URL.sub(lambda m: " " * len(m.group(0)), masked)

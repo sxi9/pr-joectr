@@ -135,6 +135,7 @@
    ],
    "props": {
     "bytes": 63,
+    "detail": true,
     "excerpt": "Set up the project by following https://docs.example.test/setup",
     "id": "3f6c1a52-8d0e-4b7a-9c41-5e2d7a90b1c4:prompt:1",
     "injection_markers": [],
@@ -181,6 +182,7 @@
    ],
    "props": {
     "bytes": 212,
+    "detail": true,
     "excerpt": "",
     "id": "3f6c1a52-8d0e-4b7a-9c41-5e2d7a90b1c4:t2:out",
     "injection_markers": [],
@@ -380,6 +382,7 @@
    ],
    "props": {
     "bytes": 72,
+    "detail": true,
     "excerpt": "pytest 9.0 changelog - https://docs.pytest.org/en/stable/changelog.html",
     "id": "c8e2b6f1-0a4d-49e3-b7f5-91d6e2c4a803:t1:out",
     "injection_markers": [],

@@ -138,6 +138,16 @@ def _tokens(text: str) -> list[str]:
     return words
 
 
+def _package_word(word: str) -> str:
+    """A command-line word as a package name: lower case, without a version or an image tag."""
+    w = word.strip().lower()
+    w = re.sub(r"(?<!^)@[\w.\-^~<>=*]+$", "", w)       # pkg@1.2.3, @scope/pkg@latest
+    w = re.sub(r"(?:==|>=|~=)[\w.\-*]+$", "", w)        # pkg==1.2
+    if "://" not in w:
+        w = re.sub(r":[\w.\-]+$", "", w)               # image:tag
+    return w
+
+
 def match_server(name: str, command: str = "", args: list[str] | None = None, url: str = "",
                  catalog: dict[str, Any] | None = None) -> dict[str, Any] | None:
     """The catalog entry for an MCP server, found by its package, its URL host or its name.
@@ -147,7 +157,7 @@ def match_server(name: str, command: str = "", args: list[str] | None = None, ur
     name (``github`` matches ``github`` and ``my-github``, not ``githubbish``).
     """
     catalog = catalog or load_catalog()
-    haystack = " ".join([command, *(args or [])]).lower()
+    words = {_package_word(w) for w in [command, *(args or [])] if w}
     host = ""
     if url:
         try:
@@ -159,7 +169,8 @@ def match_server(name: str, command: str = "", args: list[str] | None = None, ur
     for server in catalog.get("servers", []):
         match = server.get("match") or {}
         for package in match.get("packages") or []:
-            if package and package.lower() in haystack:
+            # A whole word of the command line, not a substring: "mcp/github" is not "mcp/git".
+            if package and any(w == package.lower() or w.endswith("/" + package.lower()) for w in words):
                 return server
         for h in match.get("url_hosts") or []:
             if host and (host == h.lower() or host.endswith("." + h.lower())):

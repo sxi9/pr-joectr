@@ -151,9 +151,14 @@ UNTRUSTED_PATHS: tuple[str, ...] = (
 MODES: tuple[str, ...] = ("monitor", "guard", "strict")
 
 MAX_CONTENT_BYTES = 262_144
-MAX_CHUNKS_PER_CONTENT = 400
+MAX_CHUNKS_PER_CONTENT = 240
 # Untrusted text that holds nothing sensitive is fingerprinted to notice copies of it; fewer suffice.
-MAX_CHUNKS_UNTRUSTED = 150
+MAX_CHUNKS_UNTRUSTED = 120
+# Line and link fingerprints, and links as entities, are kept for the most recent results of a
+# session only: this many that hold sensitive data, this many that are merely untrusted. Older
+# results keep their flags, their hosts and the fingerprints of their secrets.
+DETAIL_WINDOW_SENSITIVE = 16
+DETAIL_WINDOW_UNTRUSTED = 10
 # The live graph is opened and closed for every hook event, at about 45 ms per thousand
 # nodes. Past this many session nodes the oldest sessions move to archive files. 0 keeps
 # everything.

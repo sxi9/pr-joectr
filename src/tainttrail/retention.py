@@ -23,6 +23,7 @@ import datetime as _dt
 import json
 import os
 import re
+import time
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -53,9 +54,15 @@ _DROP_SESSION = (
     "MATCH (s:Session {id: $sid}) DETACH DELETE s",
 )
 
-# What no remaining node refers to any more.
+# What no remaining node refers to any more. A link whose only edge goes to its host counts.
 _DROP_ORPHANS = (
     "MATCH (k:Chunk) WHERE NOT EXISTS { MATCH (:Content)-[:HAS_CHUNK]->(k) } DETACH DELETE k",
+    """
+    MATCH (e:Entity {kind: 'url'})
+    WHERE NOT EXISTS { MATCH (e)-[r]-() WHERE type(r) <> 'ON_HOST' }
+      AND NOT coalesce(e.untrusted, false) AND NOT coalesce(e.trusted, false) AND NOT coalesce(e.sensitive, false)
+    DETACH DELETE e
+    """,
     """
     MATCH (e:Entity)
     WHERE NOT EXISTS { MATCH (e)--() }
@@ -86,12 +93,14 @@ def live_nodes(store: Store) -> int:
         default=0) or 0)
 
 
-def prune(store: Store, cfg: Config, *, keep: Iterable[str] = (), budget: int | None = None) -> list[dict[str, Any]]:
+def prune(store: Store, cfg: Config, *, keep: Iterable[str] = (), budget: int | None = None,
+          seconds: float = 3.0) -> list[dict[str, Any]]:
     """Archive the oldest sessions while the graph is over budget.
 
     Returns one record per archived session: ``{"id", "started", "file", "held"}``. Does
     nothing when the budget is 0 (keep everything) or the graph is within it. Call it
-    inside the caller's transaction, so a session is never half removed.
+    inside the caller's transaction, so a session is never half removed. After ``seconds``
+    it stops with what it has done, because it runs inside a hook that has a time limit.
     """
     budget = cfg.max_live_nodes if budget is None else budget
     if budget <= 0:
@@ -107,9 +116,12 @@ def prune(store: Store, cfg: Config, *, keep: Iterable[str] = (), budget: int | 
     candidates.sort(key=lambda s: (bool(s["held"]), s["started"], s["id"]))
     done: list[dict[str, Any]] = []
     target = int(budget * PRUNE_TO)
+    started = time.monotonic()
     for session in candidates:
         if total <= target:
             break
+        if done and time.monotonic() - started > seconds:
+            break   # the hook has a time limit; the next session start carries on
         file = _archive(store, cfg, session)
         for statement in _DROP_SESSION:
             store.write(statement, {"sid": session["id"]})

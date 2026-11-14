@@ -117,6 +117,12 @@ def _render(event_name: str, decision: Decision, *, announce: bool) -> dict[str,
     return None
 
 
+def _busy(exc: BaseException) -> bool:
+    from ..store import StoreLocked
+
+    return isinstance(exc, StoreLocked)
+
+
 def _log(cfg: Config | None, record: dict[str, Any]) -> None:
     if cfg is None:
         return
@@ -169,6 +175,18 @@ def main(stdin: TextIO | None = None, stdout: TextIO | None = None) -> int:
     except Exception as exc:   # noqa: BLE001 - the guard must not take the agent down with it
         _log(cfg, {"event": event_name, "error": f"{type(exc).__name__}: {exc}",
                    "trace": traceback.format_exc(limit=6)})
+        if _busy(exc) and cfg is not None and cfg.mode != "monitor" and event_name == "PreToolUse":
+            # Not a failure of the guard: other hooks held the graph for the whole wait (a burst of
+            # parallel tool calls). A call that could not be checked in time is put to the user.
+            stdout.write(json.dumps({
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse", "permissionDecision": "ask",
+                    "permissionDecisionReason": ("TaintTrail could not check this call in time: its graph was busy with "
+                                                 "other tool calls. Look at the call before you allow it."),
+                },
+                "systemMessage": "TaintTrail could not check a call in time (the graph was busy) and is asking you instead.",
+            }) + "\n")
+            return 0
         if cfg is not None and cfg.fail_closed and event_name == "PreToolUse":
             stdout.write(json.dumps({"hookSpecificOutput": {
                 "hookEventName": "PreToolUse", "permissionDecision": "deny",

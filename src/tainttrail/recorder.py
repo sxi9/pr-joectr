@@ -17,7 +17,7 @@ from urllib.parse import urlsplit
 
 from . import schema as S
 from .config import Config
-from .defaults import MAX_CHUNKS_UNTRUSTED
+from .defaults import DETAIL_WINDOW_SENSITIVE, DETAIL_WINDOW_UNTRUSTED, MAX_CHUNKS_UNTRUSTED
 from .model import CallAnalysis, ChunkRef, ContentAnalysis, EntityRef, Finding, HookEvent, ToolLabels
 from .store import Store
 
@@ -28,8 +28,18 @@ _SECRETISH_ENV = re.compile(r"KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|PRIVAT
 COPY_TAINT_MIN_CHUNKS = 3
 COPY_TAINT_MIN_INJECTION = 0.3
 
-# Labels a user or a model set by hand outrank the built-in tables.
-_STICKY_LABEL_SOURCES = ("user", "llm", "introspect")
+# A link as an entity of its own that nothing refers to any more, except the edge to its host.
+_DROP_UNREFERENCED_LINKS = """
+MATCH (e:Entity {kind: 'url'})
+WHERE NOT EXISTS { MATCH (e)-[r]-() WHERE type(r) <> 'ON_HOST' }
+  AND NOT coalesce(e.untrusted, false) AND NOT coalesce(e.trusted, false) AND NOT coalesce(e.sensitive, false)
+DETACH DELETE e
+"""
+
+# Labels a user or a model set by hand outrank the built-in tables. So do labels the scanner took
+# from the catalog: it identifies a server by its package or URL, which the tool name alone cannot
+# (a server called "tools" that runs the GitHub image).
+_STICKY_LABEL_SOURCES = ("user", "llm", "introspect", "catalog")
 
 
 def parse_tool_name(name: str) -> tuple[str, str]:
@@ -578,6 +588,57 @@ class Recorder:
                 ]},
             )
             self._remember_secret_lengths(c.length for c in chunks if c.kind == "secret")
+        if any(c.kind in ("line", "url") for c in chunks) or any(m.kind == "url" for m in mentions):
+            self.store.write("MATCH (c:Content {id: $cid}) SET c.detail = true", {"cid": cid})
+            self._compact_older_content(event.session_id)
+
+    def _compact_older_content(self, session_id: str) -> None:
+        """Keep line and link detail for the most recent results of a session only.
+
+        A session that reads hundreds of pages or private files would otherwise hold tens of
+        thousands of fingerprints, and the graph is loaded for every hook event. An older result
+        keeps its node, its flags, its hosts and the fingerprints of its secrets; what it loses
+        is the means to notice a verbatim copy of its lines and the links it listed.
+        """
+        rows = self.store.run(
+            "MATCH (c:Content {session_id: $sid, detail: true}) RETURN c.id AS id, coalesce(c.sensitive, false) AS sensitive "
+            "ORDER BY c.seq DESC, id DESC",
+            {"sid": session_id},
+        )
+        if len(rows) <= DETAIL_WINDOW_UNTRUSTED:
+            return
+        kept = {True: 0, False: 0}
+        limit = {True: DETAIL_WINDOW_SENSITIVE, False: DETAIL_WINDOW_UNTRUSTED}
+        old: list[str] = []
+        for row in rows:
+            kind = bool(row["sensitive"])
+            if kept[kind] < limit[kind]:
+                kept[kind] += 1
+            else:
+                old.append(row["id"])
+        if not old:
+            return
+        self.store.write(
+            """
+            UNWIND $ids AS id
+            MATCH (c:Content {id: id})
+            SET c.detail = false
+            WITH c
+            OPTIONAL MATCH (c)-[h:HAS_CHUNK]->(k:Chunk) WHERE k.kind IN ['line', 'url']
+            DELETE h
+            """,
+            {"ids": old},
+        )
+        self.store.write(
+            "UNWIND $ids AS id MATCH (c:Content {id: id})-[m:MENTIONS]->(e:Entity {kind: 'url'}) DELETE m",
+            {"ids": old},
+        )
+        # Fingerprints no content has and no call carried, and links nothing but their host refers to.
+        self.store.write(
+            "MATCH (k:Chunk) WHERE NOT EXISTS { MATCH (:Content)-[:HAS_CHUNK]->(k) } "
+            "AND NOT EXISTS { MATCH (:ToolCall)-[:CARRIES]->(k) } DETACH DELETE k"
+        )
+        self.store.write(_DROP_UNREFERENCED_LINKS)
 
     def _chunks_worth_keeping(self, a: ContentAnalysis) -> list[ChunkRef]:
         """The fingerprints of a content that a rule can ever look up.
