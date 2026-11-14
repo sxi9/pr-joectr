@@ -29,6 +29,7 @@ import sys
 import tempfile
 import threading
 import webbrowser
+from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
@@ -217,10 +218,18 @@ class ViewerHandler(BaseHTTPRequestHandler):
     def send_error(self, code: int, message: str | None = None, explain: str | None = None) -> None:
         """Errors the base class raises itself (bad request line, unsupported method).
 
-        The stock page echoes parts of the request; a fixed line of text does not.
+        The stock page and the stock message echo parts of the request; a fixed phrase does not.
+        A request line too short to name a version ("GET") is HTTP/0.9 to the base class, which
+        then sends no status line at all: answer it as HTTP/1.0 like any other bad request.
         """
+        if getattr(self, "request_version", "") == "HTTP/0.9":
+            self.request_version = "HTTP/1.0"
         try:
-            self._plain(code, f"{code} {message or 'Error'}\n", self.command != "HEAD")
+            phrase = HTTPStatus(code).phrase
+        except ValueError:
+            phrase = "Error"
+        try:
+            self._plain(code, f"{code} {phrase}\n", getattr(self, "command", None) != "HEAD")
         except (OSError, ValueError):
             pass
         self.close_connection = True
