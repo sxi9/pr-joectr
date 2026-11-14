@@ -48,6 +48,8 @@ class Action:
 
 # -- what a tool can do ---------------------------------------------------------------
 
+CAPABILITY_NAMES = ("untrusted_input", "private_data", "external_sink", "local_write", "code_exec")
+
 
 @dataclass
 class ToolLabels:
@@ -64,8 +66,28 @@ class ToolLabels:
     notes: str = ""
 
     def capabilities(self) -> list[str]:
-        names = ("untrusted_input", "private_data", "external_sink", "local_write", "code_exec")
-        return [n for n in names if getattr(self, n)]
+        return [n for n in CAPABILITY_NAMES if getattr(self, n)]
+
+    def to_props(self) -> dict[str, Any]:
+        """The properties a ``Tool`` node carries for these labels."""
+        props: dict[str, Any] = {n: bool(getattr(self, n)) for n in CAPABILITY_NAMES}
+        props.update(
+            label_source=self.source,
+            label_confidence=float(self.confidence),
+            sink_scope=self.sink_scope or "",
+            notes=self.notes,
+        )
+        return props
+
+    @classmethod
+    def from_props(cls, props: dict[str, Any]) -> "ToolLabels":
+        return cls(
+            **{n: bool(props.get(n)) for n in CAPABILITY_NAMES},
+            source=str(props.get("label_source") or "default"),
+            confidence=float(props.get("label_confidence") or 0.0),
+            sink_scope=(props.get("sink_scope") or None),
+            notes=str(props.get("notes") or ""),
+        )
 
 
 # -- what one tool call does -------------------------------------------------------------
@@ -124,6 +146,9 @@ class PathStep:
     title: str                  # short human description of the node
     rel: str | None = None      # relationship type to the next step, None on the last step
     forward: bool = True        # True when the stored edge points from this step to the next
+    # What the node is in the story: "untrusted" | "sensitive" | "user" | "destination" |
+    # "call" | "file" | "fingerprint" | "entity". Renderers colour by it.
+    role: str = ""
 
 
 @dataclass
@@ -137,7 +162,15 @@ class Finding:
     path: list[PathStep] = field(default_factory=list)
     session_id: str = ""
     target_id: str = ""         # the ToolCall or Content the finding is about
+    target_label: str = "ToolCall"
     ts: int = 0
+    # What the rule called for before the mode and per-rule overrides were applied. In
+    # monitor mode ``action`` is "allow" and this says what would have happened.
+    intended: str = ""
+    # The Cypher path query that produced ``path``, and its parameters. Anyone can
+    # re-run it against the graph (or against an export, in the browser).
+    query: str = ""
+    params: dict[str, Any] = field(default_factory=dict)
 
     @property
     def id(self) -> str:
