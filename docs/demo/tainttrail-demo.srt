@@ -32,11 +32,11 @@ The query that blocked the call is stored on the finding. Run again here, in the
 
 9
 00:01:24,000 --> 00:01:36,960
-The same graph also maps what an agent is configured with: here 4 MCP servers and 161 tools. The fix is the smallest permission change that breaks every open path, rehearsed in a Relate transaction and rolled back.
+Before anything runs, the same graph maps the agent's tools. The fix is the smallest permission change that breaks every open path, rehearsed in a Relate transaction and rolled back.
 
 10
 00:01:37,000 --> 00:01:46,960
-17 attacks modelled on public incidents and 11 variants are stopped. 73 of 74 ordinary sessions run without a single question, and no canary secret leaves.
+17 attacks modelled on public incidents and 64 variants written by reviewers are stopped. 73 of 74 ordinary sessions run without a question. No canary secret leaves; 3 known gaps are listed.
 
 11
 00:01:47,000 --> 00:01:52,960

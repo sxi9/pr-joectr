@@ -15,6 +15,13 @@ AI agents to POST `.env` to `telemetry.attacker.example`.
    denied the `curl` call (rule TT001). `claude-answer.txt` is what the model then told the
    user.
 
+The store is a recording, not a fixture: it shows what the build of that hour did. One rule
+has been tightened since. A file that untrusted text pointed at stays "pointed at" even when a
+directory listing mentions it afterwards, so today's build already questions the read of
+`.env` in step 3 (TT004), one call before the upload, unless the prompt names the file.
+Re-run on the final build, the same prompt ended at that question; with `.env` named in the
+prompt, the read went through and the upload was stopped.
+
 After the two sessions `tainttrail scan` was run in the same project, so the store also holds
 the capability map of that setup: Claude Code's built-in tools with their labels and
 permissions (no MCP servers were configured).
