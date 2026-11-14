@@ -20,8 +20,9 @@ name only, and command lines, URLs and rule texts are redacted before they are s
 from __future__ import annotations
 
 import argparse
-import fnmatch
+import functools
 import json
+import math
 import os
 import re
 import sys
@@ -30,6 +31,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 from urllib.parse import parse_qsl, unquote, unquote_plus, urlsplit
+
+import relate
 
 from . import classify
 from .config import Config
@@ -60,6 +63,13 @@ REDACTED = "«redacted»"
 MAX_CONFIG_BYTES = 32 * 1024 * 1024
 MAX_LENIENT_BYTES = 2 * 1024 * 1024     # comment-tolerant JSON and TOML are parsed in Python: keep them small
 MAX_RULE_CHARS = 2000                   # a permission rule longer than this is not a rule anybody wrote
+# Nobody configures this many of anything. A file that does is read up to the limit and
+# reported, so that its size cannot become the scan's memory or the graph's size.
+MAX_SERVERS_PER_FILE = 2000
+MAX_RULES = 100_000                     # per agent
+MAX_CREDENTIALS = 200                   # per server
+MAX_ARGUMENTS = 500                     # of one command line that are looked at
+MAX_URL_CHARS = 8192
 BUILTIN_SERVER = "builtin"
 
 
@@ -133,6 +143,7 @@ class AgentConfig:
     problems: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     broken: bool = False            # discovery itself failed; nothing reliable is known about the agent
+    warnings: list[str] = field(default_factory=list)   # things a person should look at, found while building the map
 
     @property
     def name(self) -> str:
@@ -321,9 +332,8 @@ _SAFE_QUERY_VALUE = re.compile(r"^(?:true|false|on|off|yes|no|\d{1,6}|[a-z]{1,12
 # invisible Unicode ones (soft hyphen, zero-width and bidirectional marks, line separators, tag
 # characters, variation selectors). The last group is also how text is smuggled past a person.
 _CONTROL = re.compile(
-    "[\x00-\x1f\x7f-\x9f­؜ᅟᅠ឴឵᠋-᠏​-‏ -‮"
-    "⁠-⁯ㅤ︀-️﻿ﾠ￹-￻\U000e0000-\U000e0fff]")
-_TOKEN_TAIL = re.compile(r"[A-Za-z0-9+/=_~.%-]+$")
+    "[\x00-\x1f\x7f-\x9f\xad\u061c\u115f-\u1160\u17b4-\u17b5\u180b-\u180f\u200b-\u200f\u2028-\u202e"
+    "\u2060-\u206f\u3164\ufe00-\ufe0f\ufeff\uffa0\ufff9-\ufffb\U000e0000-\U000e0fff]")
 _WEB_SCHEMES = frozenset({"http", "https", "ws", "wss", "ftp", "file"})
 _FLAG = re.compile(r"^--?[A-Za-z][\w.-]*$")
 _FLAG_VALUE = re.compile(r"^(--?[A-Za-z][\w.-]*)=(.*)$", re.S)
@@ -362,7 +372,7 @@ def is_reference(value: str) -> bool:
 
 def referenced_names(value: str) -> list[str]:
     names: list[str] = []
-    for m in _REF_NAMES.finditer(value):
+    for m in _REF_NAMES.finditer(value[:4096]):
         name = next((g for g in m.groups() if g), None)
         if name and name not in names and name not in _PATH_VARIABLES:
             names.append(name)
@@ -451,12 +461,15 @@ def _redact_query_pair(pair: str) -> str:
 
 def redact_url(url: str) -> str:
     """A URL without its credentials: no user info, no query values, no token-like path parts, no fragment."""
+    url = _as_agents_read(url)
+    if len(url) > MAX_URL_CHARS:        # cut after a separator: what follows it may be the first half of a token
+        url = url[:MAX_URL_CHARS]
+        url = url[: max(url.rfind(mark) for mark in "/?&=") + 1] or url
     if any(hit.kind.endswith("webhook") for hit in find_secrets(url)):
         return _replace_shapes(url)     # some URLs are secret as a whole
-    url = _as_agents_read(url)
     bare = "://" not in url             # "host:port/path", "//host/path": an address written without a scheme
     try:
-        parts = urlsplit("x://" + url.lstrip("/") if bare else url)
+        parts = urlsplit(("x:" if url.startswith("//") else "x://") + url if bare else url)
         host = parts.hostname or ""
         port = parts.port
     except ValueError:
@@ -468,6 +481,25 @@ def redact_url(url: str) -> str:
     path = "/".join(REDACTED if _secret_part(seg) else seg for seg in parts.path.split("/"))
     pairs = [_redact_query_pair(pair) for pair in parts.query.split("&")] if parts.query else []
     return f"{prefix}{netloc}{path}" + ("?" + "&".join(pairs) if pairs else "")
+
+
+def _cut_between_tokens(text: str, limit: int) -> str:
+    """The first ``limit`` characters, ending before the token the cut would go through.
+
+    Half a token is too short to be recognised as one and long enough to matter. A very
+    long run of token characters is a path or a URL rather than one token; there the cut
+    goes back to the last separator inside it.
+    """
+    if len(text) <= limit:
+        return text
+    text = text[:limit]
+    for separators in ("+/=_~.%-", "+=_~%-"):
+        end = len(text)
+        while end > 0 and (text[end - 1].isalnum() or text[end - 1] in separators):
+            end -= 1
+        if len(text) - end <= 256:
+            break
+    return text[:end] if end > 0 else text
 
 
 def _redact_assigned(m: re.Match[str]) -> str:
@@ -493,11 +525,7 @@ def scrub(text: str, max_len: int = 600) -> str:
     """
     if not text:
         return ""
-    text = str(text)
-    if len(text) > max_len * 4:
-        text = text[: max_len * 4]
-        text = _TOKEN_TAIL.sub("", text) or text    # never keep the first half of a token the cut went through
-    text = _CONTROL.sub("?", text)
+    text = _CONTROL.sub("?", _cut_between_tokens(str(text), max_len * 4))
     text = _URL_IN_TEXT.sub(_redact_url_match, text)
     text = _BEARER.sub(lambda m: m.group(0) if is_reference(m.group(2)) else f"{m.group(1)} {REDACTED}", text)
     text = _AUTH_HEADER.sub(_redact_authorization, text)
@@ -515,11 +543,15 @@ def _redact_url_match(m: re.Match[str]) -> str:
     return redact_url(url) + tail
 
 
-def redact_argv(argv: Iterable[str]) -> str:
-    """A command line for display: values of secret-named flags and assignments removed."""
+def redact_argv(argv: Iterable[str], max_len: int = 600) -> str:
+    """A command line for display: values of secret-named flags and assignments removed.
+
+    ``max_len`` bounds the whole line and each argument; what is cut ends in an ellipsis.
+    """
     out: list[str] = []
     redact_next = False
-    for raw in argv:
+    argv = list(argv)
+    for raw in argv[:MAX_ARGUMENTS]:
         arg = str(raw)
         if redact_next:
             redact_next = False
@@ -537,8 +569,10 @@ def redact_argv(argv: Iterable[str]) -> str:
         if m and m.group(2) and (secretish_name(m.group(1)) or value_is_secret(m.group(1), m.group(2))):
             out.append(f"{m.group(1)}=" + (m.group(2) if is_reference(m.group(2)) else REDACTED))
             continue
-        out.append(scrub(arg))
-    return scrub(" ".join(out), max_len=600)
+        out.append(scrub(arg, max_len))
+    if len(argv) > MAX_ARGUMENTS:
+        out.append(f"… ({len(argv) - MAX_ARGUMENTS} more arguments)")
+    return scrub(" ".join(out), max_len)
 
 
 def credentials_of(entry: ServerEntry, catalog_entry: Mapping[str, Any] | None = None) -> list[CredentialRef]:
@@ -550,6 +584,8 @@ def credentials_of(entry: ServerEntry, catalog_entry: Mapping[str, Any] | None =
         name = name.strip()[:120]
         if not re.fullmatch(r"[\w.:\- ]+", name) or looks_random(name, dashed=False) or find_secrets(name):
             return  # not a name: never risk storing a value under the wrong heading
+        if name not in found and len(found) >= MAX_CREDENTIALS:
+            return
         current = found.setdefault(name, CredentialRef(name, kind))
         current.literal = current.literal or literal
         current.secret = current.secret or secret
@@ -569,22 +605,23 @@ def credentials_of(entry: ServerEntry, catalog_entry: Mapping[str, Any] | None =
         if secret or referenced_names(value):
             add(name, "header", literal_value(value) and secret, secret)
             add_references(value, secret)
-    for text in [entry.url, *entry.argv]:
+    argv = entry.argv[:MAX_ARGUMENTS]
+    for position, text in enumerate([entry.url, *argv]):
         if "://" not in text:
             continue
         try:
-            parts = urlsplit(text)
+            parts = urlsplit(_as_agents_read(text[:MAX_URL_CHARS]))
             has_userinfo = parts.username is not None or parts.password is not None
         except ValueError:
             continue
         if has_userinfo and not is_reference(parts.password or parts.username or ""):
-            add("url user info", "url-param" if text == entry.url else "argument", True, True)
+            add("url user info", "url-param" if position == 0 else "argument", True, True)
         for key, value in parse_qsl(parts.query, keep_blank_values=True):
             if secretish_name(key) or value_is_secret(key, value):
                 add(key, "url-param", literal_value(value), True)
                 add_references(value, True)
     previous = ""
-    for arg in entry.argv:
+    for arg in argv:
         m = _FLAG_VALUE.match(arg) or _ASSIGNMENT.match(arg)
         if m and (secretish_name(m.group(1)) or m.group(1) in known or value_is_secret(m.group(1), m.group(2))):
             add(m.group(1).lstrip("-"), "argument", literal_value(m.group(2)), True)
@@ -605,6 +642,17 @@ _REMOTE_TYPES = {
     "remote": "http", "sse": "sse", "ws": "ws", "websocket": "ws",
 }
 _CLAUDE_MODES = ("default", "acceptEdits", "plan", "auto", "dontAsk", "bypassPermissions")
+# Fields of a server entry that switch the server or some of its tools off, or pre-approve them.
+# Each client reads its own. A field written for another client changes nothing there, so it must
+# not hide a server from the scan: "disabled": true in a .mcp.json does not stop Claude Code.
+_ENTRY_FIELDS: dict[str, frozenset[str]] = {
+    "vscode": frozenset({"tools"}),
+    "windsurf": frozenset({"disabled", "disabledTools"}),
+    "gemini-cli": frozenset({"includeTools", "excludeTools", "trust"}),
+    "codex": frozenset({"enabled"}),
+}
+_OTHER_CLIENT_FIELDS = frozenset({"disabled", "enabled", "tools", "includeTools", "excludeTools", "disabledTools",
+                                  "trust", "autoApprove", "alwaysAllow"})
 
 
 def normalize_server_name(name: str) -> str:
@@ -638,21 +686,28 @@ def _server_entry(agent: str, name: str, raw: dict[str, Any], scope: str, source
         entry.notes.append("the entry has neither a command nor a url")
     entry.env = _string_map(raw.get("env") if isinstance(raw.get("env"), dict) else raw.get("environment"))
     entry.headers = _string_map(raw.get("headers"))
-    if raw.get("disabled") is True or raw.get("enabled") is False:
+    reads = _ENTRY_FIELDS.get(agent, frozenset())
+    if ("disabled" in reads and raw.get("disabled") is True) or ("enabled" in reads and raw.get("enabled") is False):
         entry.enabled, entry.status = False, "disabled in the configuration file"
-    if isinstance(raw.get("includeTools"), list):
+    if "includeTools" in reads and isinstance(raw.get("includeTools"), list):
         entry.include_tools = _str_list(raw["includeTools"])
     tools = raw.get("tools")
-    if isinstance(tools, list) and "*" not in tools:  # an availability filter; ["*"] means all
+    if "tools" in reads and isinstance(tools, list) and "*" not in tools:  # an availability filter; ["*"] means all
         entry.include_tools = _str_list(tools)
         if not entry.include_tools:
             entry.enabled, entry.status = False, "its tools list is empty, so no tool is exposed"
-    entry.exclude_tools = _str_list(raw.get("excludeTools")) + _str_list(raw.get("disabledTools"))
-    if raw.get("trust") is True:
+    for key in ("excludeTools", "disabledTools"):
+        if key in reads:
+            entry.exclude_tools += _str_list(raw.get(key))
+    if "trust" in reads and raw.get("trust") is True:
         entry.trust = "trust: true"
-    for key in ("autoApprove", "alwaysAllow"):
-        for tool in _str_list(raw.get(key)):
-            entry.tool_permissions[tool] = ("allow", f"{key}: {tool}")
+    unread = sorted(
+        key for key in _OTHER_CLIENT_FIELDS - reads
+        if (raw.get(key) is False if key == "enabled" else
+            raw.get(key) is True if key in ("disabled", "trust") else isinstance(raw.get(key), list)))
+    if unread:
+        entry.notes.append(f"{AGENT_NAMES.get(agent, agent)} does not read {', '.join(unread)} in a server entry "
+                           "(other clients do): the entry counts as written without it")
     return entry
 
 
@@ -663,14 +718,31 @@ def _server_entries(agent: str, servers: Any, scope: str, source: Path, cfg: Age
         cfg.problems.append(f"{source}: the list of MCP servers is not an object; skipped")
         return []
     out: list[ServerEntry] = []
+    malformed = 0
     for name, raw in servers.items():
         if not isinstance(name, str) or not name.strip():
             continue
+        if len(out) >= MAX_SERVERS_PER_FILE:
+            cfg.problems.append(f"{source}: more than {MAX_SERVERS_PER_FILE} MCP servers; the rest were not read")
+            break
         if not isinstance(raw, dict):
-            cfg.problems.append(f"{source}: server {scrub(name, 80)!r} is not an object; skipped")
+            malformed += 1
+            if malformed <= 20:         # twenty lines say it; a million do not
+                cfg.problems.append(f"{source}: server {scrub(name, 80)!r} is not an object; skipped")
             continue
         out.append(_server_entry(agent, name, raw, scope, str(source)))
     return out
+
+
+def _add_rules(cfg: AgentConfig, kind: str, texts: Any, source: Path | str, scope: str, dialect: str = "claude") -> None:
+    """Append one list of permission rules from a settings file, up to the agent's limit."""
+    for text in _str_list(texts):
+        if len(cfg.rules) >= MAX_RULES:
+            problem = f"{cfg.name}: more than {MAX_RULES:,} permission rules; the rest were not read"
+            if problem not in cfg.problems:
+                cfg.problems.append(problem)
+            return
+        cfg.rules.append(PermissionRule(kind, text, str(source), scope, dialect))
 
 
 def _mcp_servers_of(data: dict[str, Any] | None) -> Any:
@@ -731,9 +803,52 @@ def _policy_matches(policies: list[dict[str, Any]], entry: ServerEntry) -> bool:
         if isinstance(command, list) and entry.argv and [str(c) for c in command] == entry.argv:
             return True
         pattern = policy.get("serverUrl")
-        if isinstance(pattern, str) and entry.url and fnmatch.fnmatchcase(entry.url, pattern):
+        if isinstance(pattern, str) and entry.url and server_url_matches(pattern, entry.url):
             return True
     return False
+
+
+_DEFAULT_PORTS = {"http": "80", "https": "443", "ws": "80", "wss": "443"}
+_URL_SHAPE = re.compile(r"^([A-Za-z*][A-Za-z0-9+.*-]*)://([^/?#]*)(.*)$", re.S)
+
+
+def _url_shape(text: str) -> tuple[str, str, str | None, str] | None:
+    """``(scheme, host, port, the rest)`` of a URL or a URL pattern, without interpreting wildcards."""
+    m = _URL_SHAPE.match(text.strip())
+    if not m:
+        return None
+    authority = m.group(2).rsplit("@", 1)[-1]
+    host, port = authority, None
+    if authority.startswith("["):                       # [::1]:8080
+        host, _, after = authority.partition("]")
+        host, port = host + "]", (after[1:] or None) if after.startswith(":") else None
+    elif ":" in authority:
+        host, _, port = authority.rpartition(":")
+        port = port or None
+    return m.group(1).lower(), host.lower().rstrip("."), port, m.group(3)
+
+
+def server_url_matches(pattern: str, url: str) -> bool:
+    """Does a ``serverUrl`` entry of an allowlist or denylist match a server's URL?
+
+    As Claude Code documents it: ``*`` is a wildcard anywhere, the host is compared without
+    regard to case or a trailing dot, a pattern without a path matches every path, and a
+    pattern without a port matches the scheme's default port only, unless its host holds a
+    wildcard (then every port).
+    """
+    wanted, actual = _url_shape(pattern), _url_shape(_as_agents_read(url))
+    if wanted is None or actual is None:
+        return _glob(pattern, url)
+    scheme, host, port, rest = actual
+    if not _glob(wanted[0], scheme) or not _glob(wanted[1], host):
+        return False
+    default = _DEFAULT_PORTS.get(scheme, "")
+    if wanted[2] is not None:
+        if not _glob(wanted[2], port or default):
+            return False
+    elif "*" not in wanted[1] and (port or default) != default:
+        return False
+    return not wanted[3] or _glob(wanted[3], rest or "/")
 
 
 def _discover_claude_code(home: Path, project: Path, env: Mapping[str, str], system: Path | None) -> AgentConfig:
@@ -761,8 +876,8 @@ def _discover_claude_code(home: Path, project: Path, env: Mapping[str, str], sys
     for scope, path, data in settings:
         permissions = _as_dict(data.get("permissions"))
         for kind in ("deny", "ask", "allow"):
-            cfg.rules += [PermissionRule(kind, text, str(path), scope) for text in _str_list(permissions.get(kind))]
-    cfg.rules += [PermissionRule("allow", text, str(state_path), "local") for text in _str_list(record.get("allowedTools"))]
+            _add_rules(cfg, kind, permissions.get(kind), path, scope)
+    _add_rules(cfg, "allow", record.get("allowedTools"), state_path, "local")
     _claude_default_mode(cfg, settings)
 
     servers: dict[str, ServerEntry] = {}
@@ -806,8 +921,8 @@ def _discover_claude_code(home: Path, project: Path, env: Mapping[str, str], sys
             entry.enabled, entry.status = False, "managed-mcp.json takes exclusive control; this server does not load"
         elif _policy_matches(denied, entry):
             entry.enabled, entry.status = False, "blocked by deniedMcpServers"
-        elif allowed is not None and not _policy_matches(allowed, entry):
-            entry.enabled, entry.status = False, "not in allowedMcpServers"
+        elif allowed is not None and entry.scope != "managed" and not _policy_matches(allowed, entry):
+            entry.enabled, entry.status = False, "not in allowedMcpServers"     # managed servers skip the allowlist
         elif entry.name in switched_off:
             entry.enabled, entry.status = False, "switched off with /mcp (disabledMcpServers)"
         elif entry.scope == "project":
@@ -818,6 +933,12 @@ def _discover_claude_code(home: Path, project: Path, env: Mapping[str, str], sys
             else:
                 entry.status = "pending approval; headless runs (claude -p) load it without asking"
     cfg.servers = list(servers.values())
+    for _scope, path, data in settings:
+        plugins = sorted(str(name) for name, on in _as_dict(data.get("enabledPlugins")).items() if on is True)
+        if plugins or data.get("extraKnownMarketplaces"):
+            shown = ", ".join(scrub(name, 60) for name in plugins[:5]) + (" ..." if len(plugins) > 5 else "")
+            cfg.notes.append(f"{path}: " + (f"enables {len(plugins)} plugins ({shown})" if plugins else "adds a plugin "
+                             "marketplace") + ". A plugin can bring MCP servers and hooks that a scan does not read.")
     cfg.notes.append("Plugin-provided servers and claude.ai connectors are not in these files; "
                      "their tools appear here once a recorded session has used them.")
     return cfg
@@ -888,10 +1009,11 @@ def _discover_cursor(home: Path, project: Path, env: Mapping[str, str], system: 
         if data:
             _merge_servers(servers, _server_entries(cfg.kind, data.get("mcpServers"), scope, path, cfg))
     cli_home = Path(env["CURSOR_CONFIG_DIR"]).expanduser() if env.get("CURSOR_CONFIG_DIR") else home / ".cursor"
-    for scope, path in _unique([("project", project / ".cursor" / "cli.json"), ("user", cli_home / "cli-config.json")]):
+    for scope, path in _unique([("project", project / ".cursor" / "cli.json"), ("user", cli_home / "cli-config.json"),
+                                ("user", _config_home(home, env) / "cursor" / "cli-config.json")]):
         permissions = _as_dict((_load_json(path, cfg) or {}).get("permissions"))
         for kind in ("deny", "allow"):
-            cfg.rules += [PermissionRule(kind, t, str(path), scope, "cursor") for t in _str_list(permissions.get(kind))]
+            _add_rules(cfg, kind, permissions.get(kind), path, scope, "cursor")
     cfg.servers = list(servers.values())
     return cfg
 
@@ -955,7 +1077,7 @@ def _discover_windsurf(home: Path, project: Path, env: Mapping[str, str], system
         _merge_servers(servers, _server_entries(cfg.kind, data.get("mcpServers"), scope, path, cfg))  # older releases
         permissions = _as_dict(data.get("permissions"))
         for kind in ("deny", "ask", "allow"):
-            cfg.rules += [PermissionRule(kind, t, str(path), scope) for t in _str_list(permissions.get(kind))]
+            _add_rules(cfg, kind, permissions.get(kind), path, scope)
     cfg.servers = list(servers.values())
     return cfg
 
@@ -989,12 +1111,12 @@ def _discover_gemini(home: Path, project: Path, env: Mapping[str, str], system: 
             entry.enabled, entry.status = False, "not in mcp.allowed"
     for key, kind in (("exclude", "deny"), ("allowed", "allow")):
         value, source = first("tools", key)
-        cfg.rules += [PermissionRule(kind, t, source, "user", "gemini") for t in _str_list(value)]
+        _add_rules(cfg, kind, value, source, "user", "gemini")
     mode, source = first("general", "defaultApprovalMode")
     if isinstance(mode, str) and mode:
         cfg.permission_mode, cfg.permission_mode_source = scrub(mode, 40), source
     cfg.servers = list(servers.values())
-    cfg.notes.append("Policy files (~/.gemini/policies/*.toml) are not read.")
+    cfg.notes.append("Policy files (~/.gemini/policies/*.toml) and system-wide settings are not read.")
     return cfg
 
 
@@ -1031,8 +1153,10 @@ def _discover_codex(home: Path, project: Path, env: Mapping[str, str], system: P
             continue
         table = data.get("mcp_servers")
         if isinstance(table, dict):
-            _merge_servers(servers, [_codex_entry(str(n), raw, scope, str(path)) for n, raw in table.items()
-                                     if isinstance(raw, dict) and str(n).strip()])
+            tables = [(str(n), raw) for n, raw in table.items() if isinstance(raw, dict) and str(n).strip()]
+            if len(tables) > MAX_SERVERS_PER_FILE:
+                cfg.problems.append(f"{path}: more than {MAX_SERVERS_PER_FILE} MCP servers; the rest were not read")
+            _merge_servers(servers, [_codex_entry(n, raw, scope, str(path)) for n, raw in tables[:MAX_SERVERS_PER_FILE]])
         elif table is not None:
             cfg.problems.append(f"{path}: mcp_servers is not a table; skipped")
         policy = data.get("approval_policy")
@@ -1115,6 +1239,8 @@ _EDIT_FAMILY = frozenset({"Edit", "Write", "MultiEdit", "NotebookEdit"})
 _AGENT_ALIASES = frozenset({"Agent", "Task"})
 # Claude Code accepts a path specifier on these names but never matches it.
 _SPECIFIER_NEVER_MATCHES = frozenset({"Write", "Grep", "Glob"})
+MAX_PARTIAL_RULES = 40          # partial rules listed on one tool
+MAX_UNANCHORED_RULES = 500      # rules such as "*x" have to be tried on every tool; more than this are not
 
 
 def parse_rule(text: str) -> tuple[str, str | None]:
@@ -1152,24 +1278,33 @@ def _glob(pattern: str, text: str) -> bool:
 
 def _match_claude(kind: str, name: str, spec: str | None, tool: ToolSpec) -> str | None:
     """How a Claude Code rule covers a tool: ``"full"``, ``"partial"`` or not at all."""
-    if name == "*":
-        return "full" if kind != "allow" and spec is None else None    # only deny and ask accept it
+    if name.startswith("mcp__") and spec is not None:
+        return None                 # Claude Code skips an mcp__ rule that has parentheses, in every list
+    wildcard = "*" in name
     if tool.server is not None:
-        if name == "mcp__*":
-            return "full" if kind != "allow" else None                 # an allow rule needs a literal server
-        prefix = f"mcp__{tool.server}"
-        if name != prefix and not (name.startswith(prefix + "__") and _glob(name[len(prefix) + 2:], tool.tool)):
-            return None
         if spec is not None:
-            return None if kind == "allow" else "partial"              # an MCP allow rule with (...) matches nothing
-        return "full"
+            return None             # a parameter rule cannot reach an MCP tool from a settings file
+        prefix = f"mcp__{tool.server}"
+        if name == prefix or (name.startswith(prefix + "__") and _glob(name[len(prefix) + 2:], tool.tool)):
+            return "full"
+        # Deny and ask rules also take a glob over the whole tool name: "*", "mcp__*", "mcp__git*".
+        # An allow rule needs a literal server, so "mcp__*" under allow approves nothing.
+        return "full" if wildcard and kind != "allow" and _glob(name, tool.name) else None
     if name.startswith("mcp__"):
         return None
+    if wildcard:
+        if kind == "allow" or not _glob(name, tool.name):
+            return None
+        return "full" if spec is None else "partial"
     same = name == tool.name or (name in _AGENT_ALIASES and tool.name in _AGENT_ALIASES)
     family = (name == "Read" and tool.name in _READ_FAMILY) or (name == "Edit" and tool.name in _EDIT_FAMILY)
     if not (same or family):
         # Read and Edit deny rules also reach file commands inside the shell, best effort.
         return "partial" if tool.name == "Bash" and name in ("Read", "Edit") and kind != "allow" and spec else None
+    if name == "Read" and not same and kind != "allow":
+        # Claude Code applies Read deny and ask rules to Grep, Glob and the like "best effort".
+        # That is not a rule the tool can be said to be denied by, so it stays a leg of a path.
+        return "partial"
     if spec is None:
         return "full"
     if not family and name in _SPECIFIER_NEVER_MATCHES:
@@ -1202,32 +1337,98 @@ def _match_gemini(kind: str, name: str, spec: str | None, tool: ToolSpec) -> str
 _MATCHERS = {"claude": _match_claude, "cursor": _match_cursor, "gemini": _match_gemini}
 
 
-def evaluate_permission(tool: ToolSpec, rules: Iterable[PermissionRule]) -> Permission:
+@dataclass(frozen=True)
+class _ParsedRule:
+    position: int               # where it stands among the agent's rules: highest-precedence file first
+    rule: PermissionRule
+    name: str
+    spec: str | None
+
+
+class RuleSet:
+    """An agent's permission rules, parsed once and found by the tool names they can apply to.
+
+    A settings file may hold many thousands of rules and an agent thousands of tools. Trying
+    every rule on every tool would let the size of somebody else's file decide how long a scan
+    runs, so a rule is filed under the name it gives (or the text before its first ``*``) and
+    looked up from the tool's side.
+    """
+
+    def __init__(self, rules: Iterable[PermissionRule]) -> None:
+        self.too_long: list[PermissionRule] = []        # longer than MAX_RULE_CHARS: not read
+        self.skipped_mcp: list[PermissionRule] = []     # mcp__ rules with parentheses, which Claude Code skips
+        self.unanchored_dropped = 0                     # deny and ask rules past MAX_UNANCHORED_RULES
+        self._named: dict[str, list[_ParsedRule]] = {}
+        self._headed: dict[str, list[_ParsedRule]] = {}
+        self._unanchored: list[_ParsedRule] = []
+        for position, rule in enumerate(rules):
+            if len(rule.text) > MAX_RULE_CHARS:
+                self.too_long.append(rule)
+                continue
+            name, spec = parse_rule(rule.text)
+            parsed = _ParsedRule(position, rule, name, spec)
+            star = name.find("*")
+            if rule.dialect == "claude" and name.startswith("mcp__") and spec is not None:
+                self.skipped_mcp.append(rule)
+            elif star < 0:
+                self._named.setdefault(name, []).append(parsed)
+            elif star > 0:
+                self._headed.setdefault(name[:star], []).append(parsed)
+            elif rule.dialect != "claude" or rule.kind == "allow":
+                pass            # a name that starts with a wildcard only means something in a Claude deny or ask list
+            elif len(self._unanchored) < MAX_UNANCHORED_RULES:
+                self._unanchored.append(parsed)
+            else:
+                self.unanchored_dropped += 1
+        self._head_lengths = sorted({len(head) for head in self._headed})
+
+    def _candidates(self, tool: ToolSpec) -> list[_ParsedRule]:
+        """Rules that could match the tool, in their original order. The matchers make the decision."""
+        names = {tool.name}
+        if tool.server is not None:
+            names.update((f"mcp__{tool.server}", "Mcp"))
+        else:
+            names.update(("Read", "Edit", "Agent", "Task"))     # rule families and aliases
+        found = [parsed for name in names for parsed in self._named.get(name, ())]
+        for length in self._head_lengths:
+            if length > len(tool.name):
+                break
+            found += self._headed.get(tool.name[:length], ())
+        found += self._unanchored
+        found.sort(key=lambda parsed: parsed.position)
+        return found
+
+    def evaluate(self, tool: ToolSpec) -> Permission:
+        result = Permission()
+        candidates = self._candidates(tool)
+        for kind in ("deny", "ask", "allow"):
+            for parsed in candidates:
+                rule = parsed.rule
+                if rule.kind != kind:
+                    continue
+                match = _MATCHERS.get(rule.dialect, _match_claude)(kind, parsed.name, parsed.spec, tool)
+                if match == "full" and result.permission == "default":
+                    result.permission, result.rule, result.source = kind, scrub(rule.text, 200), rule.source
+                elif match == "partial":
+                    if len(result.partial) < MAX_PARTIAL_RULES:
+                        entry = f"{kind} {scrub(rule.text, 200)}"
+                        if entry not in result.partial:
+                            result.partial.append(entry)
+                    if kind == "allow" and parsed.spec is not None:
+                        result.allow_specs.append(parsed.spec)
+                    elif parsed.spec is not None and parsed.name == tool.name:
+                        result.block_specs.append(parsed.spec)
+        return result
+
+
+def evaluate_permission(tool: ToolSpec, rules: "Iterable[PermissionRule] | RuleSet") -> Permission:
     """Apply an agent's allow / ask / deny rules to one tool.
 
     ``rules`` must be ordered highest-precedence file first. A rule that covers only part
     of what the tool can do (``Bash(curl:*)``, ``Read(./.env)``) never becomes the tool's
     permission; it is listed under ``partial``.
     """
-    rules = list(rules)
-    result = Permission()
-    for kind in ("deny", "ask", "allow"):
-        for rule in rules:
-            if rule.kind != kind or len(rule.text) > MAX_RULE_CHARS:
-                continue
-            name, spec = parse_rule(rule.text)
-            match = _MATCHERS.get(rule.dialect, _match_claude)(kind, name, spec, tool)
-            if match == "full" and result.permission == "default":
-                result.permission, result.rule, result.source = kind, scrub(rule.text, 200), rule.source
-            elif match == "partial":
-                entry = f"{kind} {scrub(rule.text, 200)}"
-                if entry not in result.partial and len(result.partial) < 40:
-                    result.partial.append(entry)
-                if kind == "allow" and spec is not None:
-                    result.allow_specs.append(spec)
-                elif spec is not None and name == tool.name:
-                    result.block_specs.append(spec)
-    return result
+    return (rules if isinstance(rules, RuleSet) else RuleSet(rules)).evaluate(tool)
 
 
 # -- what happens when the tool is called ---------------------------------------------------------
@@ -1243,13 +1444,69 @@ class Gate:
     open_partial: list[str] = field(default_factory=list)   # allow rules that open part of it, verbatim
 
 
+# Programs whose arguments are a program. A pattern that leaves those arguments open allows
+# anything; one that fixes them ("npx tsc:*", "python -m pytest:*", "sudo apt-get:*") allows what
+# it names, and is judged by that.
+_SHELLS = frozenset({"sh", "bash", "zsh", "fish", "dash", "ksh", "ash", "pwsh", "powershell"})
 _INTERPRETERS = frozenset({
-    "sh", "bash", "zsh", "fish", "dash", "ksh", "pwsh", "powershell", "python", "python2", "python3", "node",
-    "deno", "bun", "ruby", "perl", "php", "eval", "exec", "env", "xargs", "sudo", "npx", "uvx", "bunx",
-    "busybox", "docker",
+    "python", "python2", "python3", "py", "pypy", "pypy3", "node", "nodejs", "deno", "bun", "ruby", "perl", "php",
+    "lua", "Rscript", "osascript",
 })
-_PROBES = ("", " https://probe.example.test/x", " probe.example.test 443", " ./file user@probe.example.test:/tmp/x")
+_LAUNCHERS = frozenset({
+    "env", "xargs", "sudo", "doas", "npx", "uvx", "bunx", "pipx", "busybox", "direnv", "devbox", "mise", "nix",
+    "nix-shell", "eval", "exec",
+    # run the command given to them as arguments
+    "timeout", "time", "nice", "nohup", "stdbuf", "command", "builtin", "noglob", "watch", "setsid", "ionice",
+    "flock", "chroot", "nsenter", "unshare", "strace", "ltrace", "parallel", "script",
+})
+_CONTAINERS = frozenset({"docker", "podman", "nerdctl"})
+_CODE_FLAGS = frozenset({"-c", "-e", "--eval", "-r", "-p", "--print", "-Command", "-command", "eval"})    # program text follows
+# Clients that connect wherever their arguments say and that the shell analyser does not model.
+_REACHES_OUT = frozenset({
+    "psql", "mysql", "mariadb", "mongosh", "mongo", "redis-cli", "lynx", "w3m", "links", "aria2c", "nmap",
+    "smbclient", "lftp", "rclone", "mc", "s3cmd",
+})
+# Network programs the shell analyser does model. Only needed to complete a program name that a
+# pattern cuts short ("cu*").
+_NETWORK_PROGRAMS = frozenset({
+    "curl", "wget", "http", "https", "xh", "httpie", "nc", "ncat", "netcat", "telnet", "socat", "ssh", "sftp", "mosh",
+    "scp", "rsync", "ftp", "tftp", "mail", "mailx", "sendmail", "mutt", "msmtp", "swaks", "s-nail", "dig",
+    "nslookup", "host", "drill", "ping", "ping6", "traceroute", "tracepath", "whois",
+})
+# What can follow a program name to make it send: tried when a pattern leaves the rest of the
+# command open ("git:*" allows "git push <any remote>").
+_SUBCOMMAND_PROBES: dict[str, tuple[str, ...]] = {
+    "git": ("push https://probe.example.test/r.git main", "send-email --to a@probe.example.test p.patch"),
+    "gh": ("gist create ./file", "issue create --title t --body b", "issue comment 1 --body b",
+           "pr create --title t --body b", "pr comment 1 --body b", "api repos/o/r/issues -f body=x",
+           "release upload v1 ./file", "release create v1 --notes n", "repo create x", "secret set X"),
+    "npm": ("publish",), "pnpm": ("publish",), "yarn": ("publish",), "bun": ("publish",), "poetry": ("publish",),
+    "cargo": ("publish",), "twine": ("upload dist/x",),
+    "aws": ("s3 cp ./file s3://probe-bucket/x", "s3 sync ./dir s3://probe-bucket/x",
+            "s3api put-object --bucket probe-bucket --key k --body ./file"),
+    "gsutil": ("cp ./file gs://probe-bucket/x",), "gcloud": ("storage cp ./file gs://probe-bucket/x",),
+    "az": ("storage blob upload --account-name probe --file ./file",),
+    "openssl": ("s_client -connect probe.example.test:443",),
+}
+# Programs with a subcommand that runs whatever command follows it: "uv run <anything>".
+_RUN_SUBCOMMANDS: dict[str, frozenset[str]] = {
+    "uv": frozenset({"run", "x", "tool"}), "poetry": frozenset({"run"}), "pipenv": frozenset({"run"}),
+    "hatch": frozenset({"run"}), "pdm": frozenset({"run"}), "pixi": frozenset({"run"}), "conda": frozenset({"run"}),
+    "bundle": frozenset({"exec"}), "npm": frozenset({"exec", "x"}), "pnpm": frozenset({"exec", "dlx"}),
+    "yarn": frozenset({"exec", "dlx"}), "go": frozenset({"run"}), "kubectl": frozenset({"exec"}),
+}
+# What can follow any program: a URL, a host and port, a remote copy target, another program.
+_GENERIC_PROBES = ("https://probe.example.test/x", "probe.example.test 443", "./file user@probe.example.test:/tmp/x",
+                   "curl https://probe.example.test/x")
+_KNOWN_PROGRAMS = (_SHELLS | _INTERPRETERS | _LAUNCHERS | _CONTAINERS | _REACHES_OUT | _NETWORK_PROGRAMS
+                   | frozenset(_SUBCOMMAND_PROBES) | frozenset(_RUN_SUBCOMMANDS))
+# Claude Code documents that a prefix rule cannot approve what these run for them: it asks instead.
+_CLAUDE_NEVER_BY_PREFIX = frozenset({"watch", "setsid", "ionice", "flock"})
 _UNATTENDED_MODES = frozenset({"bypasspermissions", "auto", "yolo", "never", "autoapprove", "full-auto"})
+# Agents whose command patterns are prefixes by definition: Shell(git) allows every git command.
+_PREFIX_PATTERN_AGENTS = frozenset({"cursor", "gemini-cli"})
+MAX_SHELL_PATTERNS = 2000       # allowed command patterns checked one by one on a shell tool
+MAX_OPEN_PARTIAL = 20           # patterns a fix would move to "ask"; beyond this it gates the whole tool
 
 
 def _pattern_prefix(spec: str) -> tuple[str, bool]:
@@ -1261,39 +1518,214 @@ def _pattern_prefix(spec: str) -> tuple[str, bool]:
     return prefix, False
 
 
+class _Blockers:
+    """Ask and deny patterns on a shell tool, kept so that "does one cover this allow pattern" is one lookup."""
+
+    def __init__(self, specs: Iterable[str]) -> None:
+        self.everything = False
+        self.open: set[str] = set()
+        self.exact: set[str] = set()
+        for spec in specs:
+            prefix, anything_follows = _pattern_prefix(spec)
+            if not anything_follows:
+                self.exact.add(prefix)
+            elif prefix:
+                self.open.add(prefix)
+            else:
+                self.everything = True
+
+    def covers(self, spec: str) -> bool:
+        inner, inner_open = _pattern_prefix(spec)
+        if self.everything or inner in self.open or (not inner_open and inner in self.exact):
+            return True
+        return any(inner[:i] in self.open for i, ch in enumerate(inner) if ch == " ")
+
+
 def pattern_covers(blocker: str, spec: str) -> bool:
     """Does an ask or deny pattern catch every command an allow pattern lets through?
 
     Ask and deny are checked before allow, so an allow pattern they cover opens nothing.
     """
-    outer, outer_open = _pattern_prefix(blocker)
-    inner, inner_open = _pattern_prefix(spec)
-    if outer_open:
-        return not outer or inner == outer or inner.startswith(outer + " ")
-    return not inner_open and inner == outer
+    return _Blockers([blocker]).covers(spec)
 
 
-def shell_pattern_sends(spec: str) -> bool:
-    """Can a command that a ``Bash(...)`` allow pattern covers send data off the machine?
+def _program(words: list[str]) -> tuple[str, list[str]]:
+    """The program a command starts (past leading ``VAR=value`` words) and its arguments."""
+    for index, word in enumerate(words):
+        if not _ASSIGNMENT.match(word):
+            return os.path.basename(word), words[index + 1:]
+    return "", []
 
-    The pattern's fixed prefix is given to the shell analyser with a few probe
-    arguments. A pattern that allows an interpreter or everything counts as yes.
-    """
-    prefix, _ = _pattern_prefix(spec)
-    if not prefix or prefix.startswith("*"):
-        return True
-    program = os.path.basename(prefix.split()[0])
-    if program in _INTERPRETERS:
-        return True
+
+def _continuations(words: list[str]) -> list[str]:
+    """Texts to try after a fixed command prefix: the generic ones, and the program's sending subcommands."""
+    program, rest = _program(words)
+    plain = [word for word in rest if not word.startswith("-")]
+    out = list(_GENERIC_PROBES)
+    for probe in _SUBCOMMAND_PROBES.get(program, ()):
+        parts = probe.split()
+        if parts[: len(plain)] == plain:
+            out.append(" ".join(parts[len(plain):]))    # "gh issue" + "create ...", "git" + "push ..."
+        elif len(plain) != len(rest):
+            out.append(probe)                           # an option may have taken a word as its value
+    return [text for text in out if text]
+
+
+def _sends(command: str) -> bool:
     from .bashparse import analyze_bash  # imported late: the shell analyser is large
 
-    for probe in _PROBES:
-        try:
-            if analyze_bash(prefix + probe).is_sink:
-                return True
-        except Exception:  # noqa: BLE001 - an unparsable pattern is treated as dangerous
+    return bool(analyze_bash(command).is_sink)
+
+
+def _open_prefix_sends(words: list[str], claude: bool) -> bool:
+    """Can some command that starts with these words send data? Anything may follow them."""
+    program, args = _program(words)
+    if not program:
+        return True                     # nothing but VAR=value words: any program may follow
+    if claude and program in _CLAUDE_NEVER_BY_PREFIX:
+        return False
+    if program in _REACHES_OUT:
+        return True
+    plain = [arg for arg in args if not arg.startswith("-")]
+    if program in _LAUNCHERS:
+        # A launcher's own arguments cannot be told from the command it runs ("flock FILE curl",
+        # "sudo -u USER psql"), so every tail of the words is tried as that command.
+        return not plain or any(_open_prefix_sends(args[i:], claude) for i in range(len(args))
+                                if not args[i].startswith("-"))
+    if program in _CONTAINERS:
+        verb = next((arg for arg in plain if arg != "compose"), "")
+        if verb in ("", "run", "exec"):
+            return True                 # any image or container, and any command inside it
+    if program in _SHELLS or program in _INTERPRETERS:
+        if not plain or args[-1] in _CODE_FLAGS:
+            return True                 # any script, or program text of the caller's choosing
+        if program == "deno" and plain == [plain[0]] and plain[0] in ("run", "eval", "repl", "x"):
+            return True                 # deno run <any URL>
+        if program == "bun" and plain[0] in ("x", "exec") and len(plain) == 1:
             return True
-    return False
+        if "-m" in args and _open_prefix_sends(args[args.index("-m") + 1:] or [""], claude):
+            return True                 # python -m <module>: judged as that module's command
+        # What is left names a script on disk or spells its code out: the analyser reads the latter.
+    if program in _RUN_SUBCOMMANDS:
+        if not plain:
+            return True                 # "uv:*": the caller picks "run" and then any command
+        if plain[0] in _RUN_SUBCOMMANDS[program]:
+            inner = args[args.index(plain[0]) + 1:]
+            if not [arg for arg in inner if not arg.startswith("-")]:
+                return True             # "uv run:*": any command
+            if _open_prefix_sends(inner, claude):
+                return True             # "uv run python:*"
+    text = " ".join(words)
+    if _sends(text):
+        return True
+    pending = len(words) > 1 and words[-1].startswith("-")      # "git -C": the next word is the option's value
+    return any(_sends(f"{text} {more}") or (pending and _sends(f"{text} x {more}")) for more in _continuations(words))
+
+
+def _open_quote(text: str) -> tuple[str, int]:
+    """The quote character a text ends inside of (``""`` when it ends outside quotes) and where that quote opened."""
+    quote, opened, i = "", -1, 0
+    while i < len(text):
+        ch = text[i]
+        if ch == "\\" and quote != "'":
+            i += 2
+            continue
+        if quote:
+            if ch == quote:
+                quote = ""
+        elif ch in "\"'":
+            quote, opened = ch, i
+        i += 1
+    return quote, opened
+
+
+def _prefix_sends(fixed: str, at_word_end: bool, claude: bool) -> bool:
+    """Can a command send that starts with ``fixed`` and goes on with anything at all?"""
+    words = fixed.split()
+    if not words:
+        return True                     # "*", "* --version": any program at all
+    if at_word_end:
+        return _open_prefix_sends(words, claude)
+    base, stem = words[:-1], words[-1]
+    if not _program(base)[0]:           # the program name itself is cut short: "cu*" matches curl
+        stem = os.path.basename(stem)
+        return any(_open_prefix_sends([*base, name], claude) for name in sorted(_KNOWN_PROGRAMS)
+                   if name.startswith(stem))
+    if _open_prefix_sends(words, claude):
+        return True                     # "curl https://api.internal.test/*": the cut word, then anything
+    text = " ".join(base)
+    return any(_sends(f"{text} {more}") for more in _continuations(base) if more.split()[0].startswith(stem))
+
+
+@functools.lru_cache(maxsize=4096)
+def _pattern_sends(pattern: str, claude: bool) -> bool:
+    fixed, wildcard = (pattern[:-2], True) if pattern.endswith(":*") else (pattern, False)
+    star = fixed.find("*")              # ":*" is only a wildcard at the very end; a "*" is one anywhere
+    if star >= 0:
+        wildcard, fixed = True, fixed[:star]    # everything before the first wildcard is what limits the rule
+    if not wildcard:
+        # One exact command. It sends when the analyser says so; a script it names is the project's
+        # own code, like a Makefile target, and is not read.
+        return bool(fixed.split()) and _sends(fixed)
+    at_word_end = star < 0 or not fixed or fixed[-1].isspace()
+    quote, opened = _open_quote(fixed)
+    if quote:
+        # The wildcard sits inside a quoted argument, as in: git commit -m "*". It can stand for the
+        # rest of that argument, the closing quote and any further arguments, so the pattern is read
+        # twice: with the argument closed here, and as if the quote were not there (git "p*" also
+        # matches: git "push" <remote> "main").
+        program = _program(fixed[:opened].split())[0]
+        if program in _SHELLS or program in _INTERPRETERS or program in _LAUNCHERS or program in _CONTAINERS:
+            return True                 # the quoted text is a program: bash -c "npm test && *"
+        if _prefix_sends(fixed + quote, True, claude):
+            return True
+        inside = fixed[opened + 1:]
+        if any(ch in inside for ch in "|;&<>$`\n"):
+            return False                # an operator that is only text inside the quotes is not an operator
+        fixed = fixed[:opened] + inside
+        at_word_end = not fixed or fixed[-1].isspace()
+    return _prefix_sends(fixed, at_word_end, claude)
+
+
+def shell_pattern_sends(spec: str, *, agent: str = "claude-code") -> bool:
+    """Can a command that a ``Bash(...)`` allow pattern covers send data off the machine?
+
+    The fixed text before the pattern's first wildcard is what limits it. That text is given
+    to the shell analyser, alone and followed by the things that would make it send (a URL, a
+    host, ``push <remote>`` for git, ``publish`` for npm, ...). A pattern that leaves the
+    arguments of an interpreter or a launcher open, or allows every program, counts as yes;
+    so does one the analyser cannot read. A pattern that runs the project's own code
+    (``make:*``, ``npm run *``, ``python manage.py:*``) does not: what that code does is not
+    something a permission rule says.
+    """
+    try:
+        return _pattern_sends(spec.strip(), agent == "claude-code")
+    except Exception:  # noqa: BLE001 - an unparsable pattern is treated as dangerous
+        return True
+
+
+def _sending_patterns(agent: AgentConfig, permission: Permission) -> tuple[list[str], bool]:
+    """Allow patterns on a shell tool that can send data and that no ask or deny pattern covers.
+
+    Returns the specifiers as written and whether every pattern was looked at.
+    """
+    if agent.kind in _PREFIX_PATTERN_AGENTS:
+        as_pattern = lambda spec: spec if "*" in spec else spec.strip() + ":*"     # noqa: E731
+    else:
+        as_pattern = lambda spec: spec                                              # noqa: E731
+    blockers = _Blockers(as_pattern(spec) for spec in permission.block_specs)
+    sending: list[str] = []
+    seen: set[str] = set()
+    for spec in permission.allow_specs:
+        if spec in seen:
+            continue
+        if len(seen) >= MAX_SHELL_PATTERNS:
+            return sending, False
+        seen.add(spec)
+        pattern = as_pattern(spec)
+        if shell_pattern_sends(pattern, agent=agent.kind) and not blockers.covers(pattern):
+            sending.append(spec)
+    return sending, True
 
 
 def effective_gate(agent: AgentConfig, kind: str, permission: Permission, *, rule_name: str = "Bash") -> Gate:
@@ -1315,17 +1747,27 @@ def effective_gate(agent: AgentConfig, kind: str, permission: Permission, *, rul
         return Gate("open", "runs without a prompt in every permission mode")
     if kind == "edit" and mode in ("acceptEdits", "auto_edit"):
         return Gate("open", f"permission mode {mode} applies file edits without asking")
-    if agent.kind == "claude-code" and mode == "dontAsk":
-        return Gate("deny", "dontAsk mode refuses calls that no rule pre-approves")
+    never_asks = agent.kind == "claude-code" and mode == "dontAsk"     # what would prompt is refused instead
     if kind == "shell":
-        sending = [spec for spec in permission.allow_specs if shell_pattern_sends(spec)
-                   and not any(pattern_covers(blocker, spec) for blocker in permission.block_specs)]
+        sending, complete = _sending_patterns(agent, permission)
         if sending:
-            exact = [f"{rule_name}({spec})" for spec in sending]
-            storable = all(scrub(text, 400) == text for text in exact)   # never keep a pattern that holds a secret
+            exact = [f"{rule_name}({spec})" for spec in sending[: MAX_OPEN_PARTIAL + 1]]
+            # Never keep a pattern that holds a secret; and a long list is better gated as a whole.
+            storable = len(exact) <= MAX_OPEN_PARTIAL and all(scrub(text, 400) == text for text in exact)
             return Gate("open", f"allow rule {scrub(exact[0], 200)} lets it send data without a prompt",
                         data="open", open_partial=exact if storable else [])
+        if not complete:
+            return Gate("open", f"more than {MAX_SHELL_PATTERNS} allowed command patterns: too many to check "
+                                "one by one, so it counts as running unasked", data="open")
+        if never_asks:
+            # Not "deny": read-only commands run in every mode, so the shell still reads files.
+            return Gate("ask", "dontAsk mode refuses commands that no rule pre-approves; read-only commands "
+                               "still run", data="open")
         return Gate("ask", "asks before commands that are not read-only", data="open")
+    if never_asks:
+        if permission.allow_specs:
+            return Gate("ask", "dontAsk mode: it runs only where an allow rule pre-approves the call")
+        return Gate("deny", "dontAsk mode refuses calls that no rule pre-approves")
     if agent.kind == "claude-desktop":
         return Gate("ask", "approvals are kept by the app and are not visible to a scan")
     return Gate("ask", "asks before each use unless a rule or the user approves it")
@@ -1348,7 +1790,7 @@ def _strip_version(token: str) -> str:
 
 def _argument_urls(argv: Iterable[str]) -> list[str]:
     """URLs among the arguments: a wrapper such as ``mcp-remote`` names the real server there."""
-    return [a for a in argv if re.match(r"^(?:https?|wss?)://", a)]
+    return [a for a in argv if re.match(r"^(?:https?|wss?)://", a, re.I)]
 
 
 def identify_server(entry: ServerEntry, catalog: Mapping[str, Any]) -> tuple[dict[str, Any] | None, str]:
@@ -1420,21 +1862,37 @@ def _catalog_record(catalog_entry: Mapping[str, Any] | None, tool: str) -> dict[
     return None
 
 
-def _config_flags(entry: ServerEntry, flags: Iterable[Any]) -> list[str]:
-    """Which of a catalog entry's risk-relevant settings appear in this server entry."""
-    off = ("", "0", "false", "no", "off")
+def _config_flags(entry: ServerEntry, flags: Iterable[Any], *, when_unknown: bool) -> list[str]:
+    """Which of a catalog entry's risk-relevant settings are switched on in this server entry.
+
+    ``--read-only=false`` and ``READ_ONLY=0`` switch a setting off, and are read that way.
+    ``when_unknown`` decides a value the file does not hold (``${READ_ONLY}``): a setting that
+    widens what the server reaches counts as on, one that narrows it does not.
+    """
+    def on(value: Any) -> bool:
+        text = str(value).strip()
+        if referenced_names(text) or is_reference(text):
+            return when_unknown
+        return text.lower() not in ("", "0", "false", "no", "off")
+
     line = " ".join(entry.argv)
+    urls = [entry.url, *_argument_urls(entry.argv)]
+    query = [pair.partition("=") for url in urls for pair in url.partition("#")[0].partition("?")[2].split("&") if pair]
     found: list[str] = []
     for flag in flags:
         f = str(flag)
         if not f:
             continue
+        name, equals, wanted = f.partition("=")
         hit = (
-            any(a == f or a.startswith(f + "=") or (f.endswith("=") and a.startswith(f)) for a in entry.argv)
+            any(a == f or (a.startswith(f + "=") and on(a[len(f) + 1:])) for a in entry.argv)
+            or (f.endswith("=") and any(a.startswith(f) and on(a[len(f):]) for a in entry.argv))
             or (" " in f and f in line)
-            or any(k == f and str(v).strip().lower() not in off for k, v in entry.env.items())
-            or any(k.lower() == f.lower() and v.strip().lower() not in off for k, v in entry.headers.items())
-            or ((f.startswith("/") or f.endswith("=")) and f in entry.url)
+            or any(k == f and on(v) for k, v in entry.env.items())
+            or any(k.lower() == f.lower() and on(v) for k, v in entry.headers.items())
+            or (f.startswith("/") and any(f in url.partition("?")[0] for url in urls))
+            or (bool(equals) and any(k == name and (v.lower() == wanted.lower() if wanted else on(v))
+                                     for k, _sep, v in query))
         )
         if hit and f not in found:
             found.append(f)
@@ -1505,7 +1963,7 @@ class ToolRow:
     spec: ToolSpec
     labels: ToolLabels
     kind: str = "mcp"               # "shell" | "read" | "edit" | "fetch" | "search" | "none" | "mcp" | "other"
-    origin: str = "catalog"         # "builtin" | "catalog" | "observed" | "introspect"
+    origin: str = "catalog"         # "builtin" | "catalog" | "observed" | "introspect" | "user" (declared by hand)
     source_scope: str = ""          # who can plant text in its results: "public" | "org" | "local" | ""
     description: str = ""
     permission: Permission = field(default_factory=Permission)
@@ -1554,17 +2012,21 @@ def _server_row(cfg: AgentConfig, entry: ServerEntry, catalog: Mapping[str, Any]
     row = ServerRow(entry=entry, id=entry.id, catalog_entry=found, catalog_match=how)
     row.credentials = credentials_of(entry, found)
     if found:
-        row.risk_flags = _config_flags(entry, found.get("risk_increasing_config") or [])
-        row.risk_reducing = _config_flags(entry, found.get("risk_reducing_config") or [])
+        row.risk_flags = _config_flags(entry, found.get("risk_increasing_config") or [], when_unknown=True)
+        row.risk_reducing = _config_flags(entry, found.get("risk_reducing_config") or [], when_unknown=False)
     read_only = next((f for f in row.risk_reducing if re.search(r"read[-_]?only", f, re.I)), "")
 
     specs: list[tuple[str, dict[str, Any] | None, str, dict | None, str]] = []
     if listed is not None:
-        for item in listed:
-            name = item.get("name")
+        for item in listed[:MAX_LISTED_TOOLS]:
+            name = item.get("name") if isinstance(item, dict) else None
             if isinstance(name, str) and _TOOL_NAME.fullmatch(name):     # a server's answer is not trusted text
-                schema = item.get("inputSchema") if isinstance(item.get("inputSchema"), dict) else None
-                specs.append((name, _catalog_record(found, name), str(item.get("description") or ""), schema, "introspect"))
+                # Only the parameter names are of use, and only when the schema has the shape it should.
+                properties = _as_dict(_as_dict(item.get("inputSchema")).get("properties"))
+                schema = {"properties": {str(key)[:80]: {} for key in list(properties)[:100]}} if properties else None
+                description = item.get("description")
+                specs.append((name, _catalog_record(found, name), description if isinstance(description, str) else "",
+                              schema, "introspect"))
     elif found is not None:
         specs = [(name, record, "", None, "catalog") for name, record in _catalog_tools(found, entry)]
         if how == "name":
@@ -1600,28 +2062,45 @@ def _server_row(cfg: AgentConfig, entry: ServerEntry, catalog: Mapping[str, Any]
     return row
 
 
-def _attach_observed(cfg: AgentConfig, rows: list[ServerRow], existing: Mapping[str, ExistingTool],
-                     catalog: Mapping[str, Any]) -> None:
-    """Add tools that recorded sessions called but no configuration file explains.
+def _split_tool_name(agent: str, name: str, servers: Iterable[str]) -> tuple[str | None, str]:
+    """``(server, tool)`` of a tool name as this agent spells it; ``(None, name)`` for a built-in."""
+    if agent == "gemini-cli" and name.startswith("mcp_") and not name.startswith("mcp__"):
+        for server in sorted(servers, key=len, reverse=True):       # mcp_<server>_<tool>: the longest server wins
+            if name.startswith(f"mcp_{server}_") and len(name) > len(server) + 5:
+                return server, name[len(server) + 5:]
+        return None, name
+    return classify.parse_tool_name(name)
 
-    Plugin servers, claude.ai connectors and ``--mcp-config`` servers never appear in
-    the files a scan reads; the session graph is the only place they show up.
+
+def _attach_known(cfg: AgentConfig, rows: list[ServerRow], existing: Mapping[str, ExistingTool],
+                  catalog: Mapping[str, Any], *, include_observed: bool) -> None:
+    """Add tools the graph already knows and no configuration file explains.
+
+    Recorded sessions are one source: plugin servers, claude.ai connectors and
+    ``--mcp-config`` servers never appear in the files a scan reads, so the calls they
+    received are the only place they show up. The other is a person: a tool declared with
+    ``tainttrail tools set`` belongs to its server from then on, also when nothing else
+    knows the server's tools.
     """
     have = {tool.id for row in rows for tool in row.tools}
     by_server = {normalize_server_name(row.entry.name): row for row in rows if row.entry.transport != "builtin"}
     builtin = rows[0]
     for tool_id, prior in sorted(existing.items()):
-        if tool_id in have or prior.calls <= 0:
+        seen = include_observed and prior.calls > 0
+        if tool_id in have or not (seen or prior.props.get("declared") is True):
             continue
+        origin = "observed" if seen else "user"
         name = str(prior.props.get("name") or tool_id.split("::", 1)[-1])
-        server, tool = classify.parse_tool_name(name)
+        server, tool = _split_tool_name(cfg.kind, name, by_server)
         if server is None:
             labels = classify.classify_tool(name) if cfg.kind == "claude-code" else ToolLabels()
-            builtin.tools.append(ToolRow(ToolSpec(cfg.kind, name), labels, kind=_CLAUDE_KIND.get(name, "other"),
-                                         origin="observed"))
+            kind = _CLAUDE_KIND.get(name, "other") if cfg.kind == "claude-code" else "other"
+            builtin.tools.append(ToolRow(ToolSpec(cfg.kind, name), labels, kind=kind, origin=origin))
             continue
         row = by_server.get(server)
         if row is None:
+            if not seen:
+                continue        # declared for a server that no file and no session knows: it stays on its own
             entry = ServerEntry(cfg.kind, server, "observed", "", transport="unknown")
             row = _server_row(cfg, entry, catalog, [])     # no listing: only what was seen is added
             row.notes = ["seen in recorded sessions but not declared in a scanned file "
@@ -1632,9 +2111,60 @@ def _attach_observed(cfg: AgentConfig, rows: list[ServerRow], existing: Mapping[
         record = _catalog_record(row.catalog_entry, tool)
         row.tools.append(ToolRow(
             spec=ToolSpec(cfg.kind, name, server, tool, row.entry.name),
-            labels=_classify(row.catalog_entry, tool, "", None, catalog), origin="observed",
+            labels=_classify(row.catalog_entry, tool, "", None, catalog), origin=origin,
             source_scope=str((record or {}).get("source_scope") or ""),
         ))
+
+
+def _note_rules(cfg: AgentConfig, rules: RuleSet) -> None:
+    """Say which permission rules were not used, so that a rule nobody applied is never silent."""
+    def once(target: list[str], text: str) -> None:
+        if text not in target:
+            target.append(text)
+
+    if rules.too_long:
+        files = ", ".join(sorted({rule.source for rule in rules.too_long}))
+        once(cfg.problems, f"{files}: {len(rules.too_long)} permission rules longer than {MAX_RULE_CHARS} "
+                           "characters were not read")
+    if rules.unanchored_dropped:
+        once(cfg.problems, f"{cfg.name}: more than {MAX_UNANCHORED_RULES} deny or ask rules begin with a wildcard; "
+                           f"{rules.unanchored_dropped} of them were not read")
+    if cfg.kind == "claude-code":
+        for rule in rules.skipped_mcp[:5]:
+            once(cfg.notes, f"{rule.source}: Claude Code skips an mcp__ rule that has parentheses, so "
+                            f"{rule.kind} {scrub(rule.text, 120)} has no effect")
+
+
+def _warn_about_unknown_servers(cfg: AgentConfig, rows: list[ServerRow]) -> None:
+    """Point at allow rules that pre-approve tools of a server the scan knows nothing about.
+
+    Plugins and claude.ai connectors bring servers that are in no file a scan reads. A rule
+    that lets such a server's tools run unasked is the one trace of it, and those tools are
+    exactly the ones missing from the path analysis.
+    """
+    known = {normalize_server_name(row.entry.name) for row in rows if row.entry.transport != "builtin"}
+    unknown: dict[str, PermissionRule] = {}
+    for rule in cfg.rules:
+        if rule.kind != "allow" or rule.dialect != "claude" or len(rule.text) > MAX_RULE_CHARS:
+            continue
+        name, spec = parse_rule(rule.text)
+        if spec is not None or not name.startswith("mcp__") or len(name) <= 5:
+            continue
+        target = name[5:]
+        if any(target == server or target.startswith(server + "__") for server in known):
+            continue
+        server = target.split("__", 1)[0]
+        if "*" not in server:
+            unknown.setdefault(server, rule)
+    if not unknown:
+        return
+    named = "; ".join(f"{server} ({rule.text} in {rule.source})" for server, rule in list(unknown.items())[:5])
+    more = f"; and {len(unknown) - 5} more" if len(unknown) > 5 else ""
+    warning = (f"{cfg.name}: allow rules pre-approve tools of servers that no scanned file declares: {named}{more}. "
+               "If a plugin or a claude.ai connector provides such a server, its tools run unasked and are not part "
+               "of the path analysis until a recorded session has used them.")
+    if warning not in cfg.warnings:
+        cfg.warnings.append(warning)
 
 
 def build_agent(cfg: AgentConfig, existing: Mapping[str, ExistingTool], catalog: Mapping[str, Any], *,
@@ -1654,8 +2184,10 @@ def build_agent(cfg: AgentConfig, existing: Mapping[str, ExistingTool], catalog:
         if listed is None and entry.id in remembered:
             row.notes.append("its tool list is what an earlier `tainttrail scan --introspect` got from the server")
         rows.append(row)
-    if include_observed:
-        _attach_observed(cfg, rows, existing, catalog)
+    _attach_known(cfg, rows, existing, catalog, include_observed=include_observed)
+    rules = RuleSet(cfg.rules)
+    _note_rules(cfg, rules)
+    _warn_about_unknown_servers(cfg, rows)
 
     server_ids: set[str] = set()
     tool_ids: set[str] = set()
@@ -1671,7 +2203,7 @@ def build_agent(cfg: AgentConfig, existing: Mapping[str, ExistingTool], catalog:
                 continue                 # two server names that spell the same tool prefix: the first keeps it
             tool_ids.add(tool.id)
             unique.append(tool)
-            _finish_tool(cfg, row, tool, existing.get(tool.id))
+            _finish_tool(cfg, row, tool, existing.get(tool.id), rules)
         if len(unique) != len(row.tools):
             row.notes.append("some tool names collide with another server's; those tools are listed there")
         row.tools = unique
@@ -1693,7 +2225,8 @@ def _remembered_listings(existing: Mapping[str, ExistingTool]) -> dict[str, list
     return listings
 
 
-def _finish_tool(cfg: AgentConfig, row: ServerRow, tool: ToolRow, prior: ExistingTool | None) -> None:
+def _finish_tool(cfg: AgentConfig, row: ServerRow, tool: ToolRow, prior: ExistingTool | None,
+                 rules: RuleSet) -> None:
     """Carry over what the graph already knows about a tool, then apply rules and mode."""
     if prior is not None:
         tool.calls = prior.calls
@@ -1703,7 +2236,7 @@ def _finish_tool(cfg: AgentConfig, row: ServerRow, tool: ToolRow, prior: Existin
         if sticky and not (row.fresh_listing and prior.props.get("label_source") == "introspect"):
             tool.labels = ToolLabels.from_props(prior.props)
             tool.source_scope = str(prior.props.get("source_scope") or tool.source_scope)
-    permission = evaluate_permission(tool.spec, cfg.rules)
+    permission = rules.evaluate(tool.spec)
     if permission.permission == "default" and tool.spec.server is not None:
         entry = row.entry
         local = (entry.tool_permissions.get(tool.spec.tool)
@@ -1821,6 +2354,7 @@ def _summarise(cfg: AgentConfig, rows: list[ServerRow], result: ScanResult) -> d
                 f"({', '.join(rules[:3])}) although what they can do is a guess, not a catalog entry. "
                 f"`tainttrail tools --server {entry.name}` lists them; `tainttrail tools set` corrects one.")
     result.note_problems(cfg.problems)
+    result.warnings += [scrub(warning, 500) for warning in cfg.warnings if scrub(warning, 500) not in result.warnings]
     return {
         "kind": cfg.kind, "name": cfg.name, "config_paths": list(cfg.config_paths),
         "permission_mode": cfg.permission_mode, "permission_mode_source": cfg.permission_mode_source,
@@ -1891,15 +2425,17 @@ def _replace_agent(store: Store, cfg: AgentConfig, rows: list[ServerRow], existi
     ]
     for start in range(0, len(tools), 500):
         batch = tools[start:start + 500]
-        store.write("UNWIND $rows AS r MERGE (t:Tool {id: r.id}) SET t += r.props", {"rows": batch})
+        links = [{key: value for key, value in tool.items() if key != "props"} for tool in batch]
+        store.write("UNWIND $rows AS r MERGE (t:Tool {id: r.id}) SET t += r.props",
+                    {"rows": [{"id": tool["id"], "props": tool["props"]} for tool in batch]})
         store.write("UNWIND $rows AS r MATCH (s:Server {id: r.sid}) MATCH (t:Tool {id: r.id}) "
-                    "CREATE (s)-[:PROVIDES]->(t)", {"rows": batch})
-        store.write("UNWIND $rows AS r MATCH (t:Tool {id: r.id})-[h:HAS_CAPABILITY]->() DELETE h", {"rows": batch})
+                    "CREATE (s)-[:PROVIDES]->(t)", {"rows": links})
+        store.write("UNWIND $rows AS r MATCH (t:Tool {id: r.id})-[h:HAS_CAPABILITY]->() DELETE h", {"rows": links})
         store.write(
             "UNWIND $rows AS r MATCH (t:Tool {id: r.id}) UNWIND r.caps AS cap "
             "MATCH (k:Capability {name: cap}) "
             "CREATE (t)-[:HAS_CAPABILITY {source: r.source, confidence: r.confidence}]->(k)",
-            {"rows": batch},
+            {"rows": links},
         )
 
 
@@ -1950,6 +2486,10 @@ class IntrospectError(RuntimeError):
 
 
 _EXPAND = re.compile(r"\$\{(?:env:)?([A-Za-z_][A-Za-z0-9_]*)(?::-([^{}]*))?\}")
+MAX_SERVER_LINE = 4 * 1_048_576         # one message from a server; a longer line is not a tool list
+MAX_SERVER_BACKLOG = 16 * 1_048_576     # unread server output kept in memory
+MAX_LISTED_TOOLS = 2000
+MAX_CURSOR_CHARS = 512                  # a paging cursor is echoed back to the server: keep what we write small
 
 
 def _expand(value: str, environ: Mapping[str, str]) -> str:
@@ -1963,6 +2503,9 @@ def introspect_server(entry: ServerEntry, *, timeout: float = 10.0, environ: Map
 
     Speaks newline-delimited JSON-RPC 2.0 (``initialize``, ``notifications/initialized``,
     ``tools/list``). The server's own output is never stored: only the tool list returns.
+    The server is somebody else's program: whatever it does (stay silent, flood its output,
+    never read its input, leave a child behind that holds the pipe), this returns within
+    about ``timeout`` seconds and keeps a bounded amount of its output.
     """
     import queue
     import subprocess
@@ -1976,37 +2519,63 @@ def introspect_server(entry: ServerEntry, *, timeout: float = 10.0, environ: Map
     env = {**environ, **{k: _expand(v, environ) for k, v in entry.env.items()}}
     argv = [_expand(a, environ) for a in entry.argv]
     try:
+        # Unbuffered pipes. A buffered reader holds a lock while it waits for data, and closing
+        # it from here would wait with it for as long as anything keeps the pipe open.
         proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                                env=env, cwd=cwd, start_new_session=True)
+                                env=env, cwd=cwd, start_new_session=True, bufsize=0)
     except (OSError, ValueError) as exc:
         raise IntrospectError(f"could not start: {type(exc).__name__}") from exc
+    try:
+        os.set_blocking(proc.stdin.fileno(), False)  # type: ignore[union-attr]  # a server may never read its input
+    except (OSError, AttributeError, ValueError):
+        pass
 
-    lines: "queue.Queue[bytes | None]" = queue.Queue(maxsize=2000)
+    lines: "queue.Queue[bytes | None]" = queue.Queue()
+    backlog = [0]
+    guard = threading.Lock()
 
     def pump() -> None:
+        pending, oversized = b"", False
         try:
-            for raw in iter(lambda: proc.stdout.readline(1_048_576), b""):  # type: ignore[union-attr]
-                try:
-                    lines.put_nowait(raw)
-                except queue.Full:
-                    pass                # a server flooding its output: drop, never buffer without bound
+            while True:
+                chunk = proc.stdout.read(65536)  # type: ignore[union-attr]
+                if not chunk:
+                    break
+                *complete, pending = (pending + chunk).split(b"\n")
+                for line in complete:
+                    if oversized:               # the rest of a line that was too long to be a message
+                        oversized = False
+                        continue
+                    with guard:
+                        if backlog[0] + len(line) + 64 > MAX_SERVER_BACKLOG:
+                            continue            # a server flooding its output: drop, never buffer without bound
+                        backlog[0] += len(line) + 64
+                    lines.put(line)
+                if len(pending) > MAX_SERVER_LINE:
+                    pending, oversized = b"", True
         except (OSError, ValueError):
-            pass                        # the pipe was closed under us
+            pass                                # the pipe was closed under us
         finally:
-            try:
-                lines.put_nowait(None)
-            except queue.Full:
-                pass
+            lines.put(None)
 
     threading.Thread(target=pump, daemon=True).start()
-    deadline = time.monotonic() + max(0.1, timeout)
+    deadline = time.monotonic() + timeout
 
     def send(message: dict[str, Any]) -> None:
-        try:
-            proc.stdin.write(json.dumps(message).encode("utf-8") + b"\n")  # type: ignore[union-attr]
-            proc.stdin.flush()  # type: ignore[union-attr]
-        except OSError as exc:
-            raise IntrospectError("the server closed its input") from exc
+        data = memoryview(json.dumps(message).encode("utf-8") + b"\n")
+        while data:
+            try:
+                written = proc.stdin.write(data)  # type: ignore[union-attr]
+            except BlockingIOError:
+                written = None
+            except (OSError, ValueError) as exc:
+                raise IntrospectError("the server closed its input") from exc
+            if written:
+                data = data[written:]
+            elif time.monotonic() >= deadline:
+                raise IntrospectError(f"the server did not read its input within {timeout:g} s")
+            else:
+                time.sleep(0.01)
 
     def reply(request_id: int) -> dict[str, Any]:
         while True:
@@ -2019,9 +2588,11 @@ def introspect_server(entry: ServerEntry, *, timeout: float = 10.0, environ: Map
                 raise IntrospectError(f"no answer within {timeout:g} s") from None
             if raw is None:
                 raise IntrospectError("the server exited before answering")
+            with guard:
+                backlog[0] -= len(raw) + 64
             try:
                 message = json.loads(raw.decode("utf-8", "replace"))
-            except ValueError:
+            except (ValueError, RecursionError):
                 continue    # log lines on stdout are not ours to interpret
             if isinstance(message, dict) and message.get("id") == request_id:
                 if isinstance(message.get("error"), dict):
@@ -2040,9 +2611,10 @@ def introspect_server(entry: ServerEntry, *, timeout: float = 10.0, environ: Map
             send({"jsonrpc": "2.0", "id": 2 + page, "method": "tools/list",
                   "params": {"cursor": cursor} if cursor else {}})
             result = reply(2 + page)
-            tools += [t for t in result.get("tools") or [] if isinstance(t, dict)][: 2000 - len(tools)]
+            listed = result.get("tools")
+            tools += [t for t in (listed if isinstance(listed, list) else []) if isinstance(t, dict)][: MAX_LISTED_TOOLS - len(tools)]
             cursor = result.get("nextCursor")
-            if not cursor or len(tools) >= 2000:
+            if not isinstance(cursor, str) or not cursor or len(cursor) > MAX_CURSOR_CHARS or len(tools) >= MAX_LISTED_TOOLS:
                 break
         return tools
     finally:
@@ -2050,44 +2622,58 @@ def introspect_server(entry: ServerEntry, *, timeout: float = 10.0, environ: Map
 
 
 def _stop(proc: Any) -> None:
-    """End a server we started, and everything it started.
+    """End a server we started, and everything it started in its process group.
 
-    The process is signalled before its pipes are closed: a reader thread blocked on
-    the pipe holds the stream's lock, and closing first would wait for the server to
-    exit by itself.
+    The group is signalled even when the server itself has already gone: what it left
+    running would otherwise outlive the scan. Nothing here waits on the pipes.
     """
     import signal
     import subprocess
 
-    try:
-        if proc.stdin is not None:
-            proc.stdin.close()      # a well-behaved server leaves when its input ends
-    except OSError:
-        pass
-    for sig in (signal.SIGTERM, signal.SIGKILL):
-        if proc.poll() is not None:
-            break
+    def close(stream: Any) -> None:
+        try:
+            if stream is not None:
+                stream.close()
+        except (OSError, ValueError):
+            pass
+
+    close(proc.stdin)       # a well-behaved server leaves when its input ends
+    for sig in (signal.SIGTERM, getattr(signal, "SIGKILL", signal.SIGTERM)):   # Windows has no SIGKILL
         try:
             os.killpg(proc.pid, sig)
-        except (OSError, AttributeError):
+        except (OSError, AttributeError):       # no such group any more, or no process groups on this platform
             try:
-                proc.terminate() if sig == signal.SIGTERM else proc.kill()
+                if proc.poll() is None:
+                    proc.terminate() if sig == signal.SIGTERM else proc.kill()
             except OSError:
-                break
+                pass
         try:
             proc.wait(timeout=1.0)
         except subprocess.TimeoutExpired:
-            continue
-    try:
-        if proc.stdout is not None:
-            proc.stdout.close()
-    except OSError:
-        pass
+            pass
+    close(proc.stdout)
 
 
 def introspection_targets(configs: Iterable[AgentConfig]) -> list[ServerEntry]:
     """The servers ``--introspect`` would start: enabled, local, with a command."""
     return [e for cfg in configs for e in cfg.servers if e.enabled and e.transport == "stdio" and e.argv]
+
+
+def introspection_line(entry: ServerEntry) -> str:
+    """What ``--introspect`` is about to start, for a person to read before saying yes.
+
+    The command is shown at length, the variables the entry sets are named (a variable such
+    as ``NODE_OPTIONS`` or ``LD_PRELOAD`` changes what a harmless-looking command runs), and
+    when something was hidden or cut the line says so and names the file to read.
+    """
+    command = redact_argv(entry.argv, 4000)
+    line = f"{entry.agent}/{entry.name}: {command}"
+    names = [printable(name, 60) for name in sorted(entry.env)]
+    if names:
+        line += f"  [sets {', '.join(names[:12])}" + (f" and {len(names) - 12} more]" if len(names) > 12 else "]")
+    if "«" in command or "…" in command:
+        line += f"  [parts that look like credentials are hidden or the line is cut: read {entry.source_file}]"
+    return line
 
 
 # -- reading and correcting labels (tainttrail tools) ----------------------------------------------------
@@ -2179,8 +2765,10 @@ def _write_labels(store: Store, tool_id: str, name: str, labels: ToolLabels, ext
     with store.transaction():
         store.write(
             "MERGE (t:Tool {id: $id}) "
+            # A tool that exists only because a person named it is "declared": the next scan
+            # attaches it to its server instead of dropping it as unknown.
             "ON CREATE SET t.name = $name, t.agent_kind = $agent, t.server = $server, t.observed = false, "
-            "              t.permission = 'default' "
+            "              t.permission = 'default', t.origin = 'user', t.declared = true "
             "SET t += $props",
             {"id": tool_id, "name": name, "agent": tool_id.split("::", 1)[0], "server": server or BUILTIN_SERVER,
              "props": {**labels.to_props(), **extra}},
@@ -2214,17 +2802,52 @@ def set_tool_labels(store: Store, name: str, changes: Mapping[str, Any], *, agen
     return {"id": tool_id, "name": name, "created": props is None, **labels.to_props(), **extra}
 
 
+def _table_labels(store: Store, tool_id: str, name: str, props: Mapping[str, Any]) -> ToolLabels:
+    """What the tables say about a tool, the way a scan would work it out.
+
+    The agent's own tools first, then the catalog entry of the server the tool is attached
+    to (found by its package or URL, which the tool's name alone does not give away), then
+    the name.
+    """
+    agent = tool_id.split("::", 1)[0]
+    for builtin_name, labels, _kind, _scope in builtin_tools(agent):
+        if builtin_name == name:
+            return labels
+    row = store.one("MATCH (s:Server)-[:PROVIDES]->(:Tool {id: $id}) "
+                    "RETURN s.catalog_id AS catalog_id, s.catalog_match AS how", {"id": tool_id})
+    catalog = classify.load_catalog()
+    entry = next((s for s in catalog.get("servers") or [] if isinstance(s, dict) and row and row["catalog_id"]
+                  and s.get("id") == row["catalog_id"]), None)
+    if entry is None:
+        return classify.classify_tool(name)
+    own_name = str(props.get("tool") or classify.parse_tool_name(name)[1])
+    labels = _classify(entry, own_name, str(props.get("description") or ""), None, catalog)
+    if row["how"] == "name" and labels.source == "catalog":
+        labels.confidence = min(labels.confidence, 0.6)
+    return labels
+
+
 def reset_tool_labels(store: Store, name: str, *, agent: str | None = None) -> dict[str, Any]:
-    """Drop a user label: the tool goes back to what the tables say (a scan refines it)."""
+    """Drop a user label: the tool goes back to what the tables say.
+
+    A tool that only existed because it was declared by hand is no longer declared, so the
+    next scan removes it unless something else knows it.
+    """
     tool_id, props = _resolve_tool(store, name, agent)
     if props is None:
-        raise ValueError(f"no tool named {name} in the graph")
-    labels = classify.classify_tool(name)
-    _write_labels(store, tool_id, name, labels, {})
+        raise ValueError(f"no tool named {printable(name, 80)} in the graph")
+    labels = _table_labels(store, tool_id, name, props)
+    _write_labels(store, tool_id, name, labels, {"declared": None})
     return {"id": tool_id, "name": name, "created": False, **labels.to_props()}
 
 
 # -- commands --------------------------------------------------------------------------------------------
+
+
+def engine_message(exc: BaseException) -> str:
+    """The first line of a graph-engine error, short enough for one line of terminal output."""
+    lines = str(exc).strip().splitlines()
+    return printable(lines[0] if lines else type(exc).__name__, 200)
 
 
 def tolerant_output() -> None:
@@ -2290,20 +2913,23 @@ def cmd_scan(args: argparse.Namespace, cfg: Config) -> int:
     introspected: dict[str, list[dict[str, Any]]] | None = None
     notices: list[str] = []
     if getattr(args, "introspect", False):
+        timeout = getattr(args, "timeout", 10.0)
+        if not (math.isfinite(timeout) and 0 < timeout <= 3600):
+            print("tainttrail scan: --timeout takes a number of seconds between 0 and 3600", file=sys.stderr)
+            return 2
         targets = introspection_targets(configs)
         if not getattr(args, "yes", False):
             print("tainttrail scan --introspect would start these commands and ask each for its tools:",
                   file=sys.stderr)
             for entry in targets:
-                print(f"  {entry.agent}/{entry.name}: {redact_argv(entry.argv)}", file=sys.stderr)
+                print(f"  {introspection_line(entry)}", file=sys.stderr)
             print("Nothing was started. Run again with --yes to allow it.", file=sys.stderr)
             return 2
         introspected = {}
         for entry in targets:
-            print(f"starting {entry.agent}/{entry.name}: {redact_argv(entry.argv)}", file=sys.stderr)
+            print(f"starting {introspection_line(entry)}", file=sys.stderr)
             try:
-                introspected[entry.id] = introspect_server(entry, timeout=getattr(args, "timeout", 10.0),
-                                                           cwd=str(project))
+                introspected[entry.id] = introspect_server(entry, timeout=timeout, cwd=str(project))
                 notices.append(f"{entry.agent}/{entry.name}: the server listed {len(introspected[entry.id])} tools")
             except IntrospectError as exc:
                 notices.append(f"{entry.agent}/{entry.name}: not introspected ({exc}); the catalog list is used")
@@ -2315,6 +2941,10 @@ def cmd_scan(args: argparse.Namespace, cfg: Config) -> int:
             summary = _path_summary(store)
     except StoreError as exc:
         print(f"tainttrail scan: {exc}", file=sys.stderr)
+        return 1
+    except relate.Error as exc:     # for example a configuration too large to store in one transaction
+        print(f"tainttrail scan: the graph engine refused the scan ({engine_message(exc)}). "
+              "The map of the previous scan was kept.", file=sys.stderr)
         return 1
     result.warnings = notices + result.warnings
 

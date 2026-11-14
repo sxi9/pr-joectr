@@ -393,8 +393,53 @@ def test_project_server_approval_and_the_ways_a_server_is_switched_off(dirs):
     assert state["rejected"][0] is False and "disabledMcpjsonServers" in state["rejected"][1]
     assert state["toggled"][0] is False and "/mcp" in state["toggled"][1]
     assert state["denied"] == (False, "blocked by deniedMcpServers")
-    assert state["sdk"][0] is False and state["off"][0] is False
+    assert state["sdk"][0] is False
     assert state["no-type"][0] is False and "url without type" in state["no-type"][1]
+    # "disabled" is a field of other clients. Claude Code does not read it, so the server still loads.
+    off = next(s for s in cfg.servers if s.name == "off")
+    assert off.enabled is True and "does not read disabled" in " ".join(off.notes)
+
+
+CLAUDE_GITHUB_ENTRY = {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-github"]}
+
+
+@pytest.mark.parametrize("field", [
+    {"disabled": True}, {"enabled": False}, {"tools": []}, {"tools": ["get_me"]}, {"includeTools": ["get_me"]},
+    {"excludeTools": ["create_issue"]}, {"disabledTools": ["create_issue"]},
+])
+def test_a_field_of_another_client_cannot_hide_a_claude_code_server_or_its_tools(dirs, field):
+    """A cloned repository must not be able to switch its server off for the scan only."""
+    home, project = dirs
+    write(project / ".mcp.json", {"mcpServers": {"github": {**CLAUDE_GITHUB_ENTRY, **field}}})
+    write(project / ".claude" / "settings.json", settings(allow=["mcp__github"]))
+    with Store(":memory:") as store:
+        result = do_scan(store, home, project)
+        server = servers(store)["github"]
+        assert server["enabled"] is True and server["tools"] > 100
+        assert tool(store, "mcp__github__create_issue")["gate"] == "open"
+        assert f"Claude Code does not read {next(iter(field))}" in server["notes"]
+        assert "does not read" in scan.render_scan(result, None)
+
+
+def test_each_client_still_reads_its_own_switches(dirs):
+    home, project = dirs
+    entry = {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-github"]}
+    write(project / ".devin" / "mcp_config.json", {"mcpServers": {
+        "off": {**entry, "disabled": True}, "narrow": {**entry, "disabledTools": ["create_issue"]}}})
+    write(project / ".github" / "mcp.json", {"mcpServers": {
+        "none": {**entry, "type": "stdio", "tools": []}, "one": {**entry, "type": "stdio", "tools": ["get_me"]},
+        "all": {**entry, "type": "stdio", "tools": ["*"], "disabled": True}}})
+    write(project / ".gemini" / "settings.json", {"mcpServers": {
+        "picky": {**entry, "includeTools": ["get_me", "create_issue"], "excludeTools": ["create_issue"], "disabled": True}}})
+    with Store(":memory:") as store:
+        do_scan(store, home, project)
+        windsurf, vscode, gemini = (servers(store, a) for a in ("windsurf", "vscode", "gemini-cli"))
+        assert windsurf["off"]["enabled"] is False and windsurf["narrow"]["enabled"] is True
+        assert "mcp__narrow__create_issue" not in tools_of(store, "windsurf/narrow")
+        assert vscode["none"]["enabled"] is False and "tools list is empty" in vscode["none"]["status"]
+        assert tools_of(store, "vscode/one") == {"mcp__one__get_me"}
+        assert vscode["all"]["enabled"] is True and vscode["all"]["tools"] > 100, "VS Code has no 'disabled' field"
+        assert gemini["picky"]["enabled"] is True and tools_of(store, "gemini-cli/picky") == {"mcp_picky_get_me"}
 
 
 def test_allowlist_and_managed_servers(dirs, tmp_path):
@@ -449,7 +494,9 @@ def test_rules_merge_across_files_and_the_highest_precedence_file_is_named(dirs)
     ("acceptEdits", "ask", "ask", "open", "ask"),
     ("bypassPermissions", "open", "open", "open", "open"),
     ("auto", "open", "open", "open", "open"),
-    ("dontAsk", "deny", "deny", "open", "deny"),
+    # dontAsk refuses what would prompt. The shell is not refused as a whole: its read-only
+    # commands run in every mode, so it stays a way to read files.
+    ("dontAsk", "ask", "deny", "open", "deny"),
 ])
 def test_the_default_permission_mode_changes_what_default_means(dirs, mode, bash, webfetch, read, github):
     home, project = dirs
@@ -586,11 +633,11 @@ def test_servers_are_identified_by_host_package_command_or_name(argv, url, name,
     assert ((found or {}).get("id"), evidence) == (expected, how)
 
 
-@pytest.mark.xfail(reason="classify.match_server compares packages as substrings, so mcp/github is taken for "
-                          "mcp/git; scan.identify_server compares whole tokens instead", strict=False)
-def test_classify_match_server_tells_package_names_apart():
-    entry = classify.match_server("x", command="docker", args=["run", "-i", "--rm", "mcp/github"])
-    assert (entry or {}).get("id") == "github"
+def test_the_guards_classifier_tells_package_names_apart_the_way_the_scan_does():
+    """One package name can be the beginning of another: mcp/git, mcp/github, mcp/gitlab."""
+    for image, expected in (("mcp/github", "github"), ("mcp/gitlab", "gitlab"), ("mcp/git", "git")):
+        entry = classify.match_server("x", command="docker", args=["run", "-i", "--rm", image])
+        assert (entry or {}).get("id") == expected, image
 
 
 def test_an_unknown_server_is_kept_and_reported_without_inventing_tools(dirs):
@@ -1402,3 +1449,808 @@ def test_labels_a_model_set_survive_a_rescan_and_account_data_is_never_copied(di
         # ~/.claude.json also holds account details; only the server and project keys are read.
         text = graph_text(store)
         assert "someone@example.test" not in text and "oauthAccount" not in text and "numStartups" not in text
+
+
+# -- review: ways past the scan, and false alarms ---------------------------------------------------------------
+# Each test below failed before the change it describes. Hosts and secrets are the reserved
+# test ones (attacker.example, *.test, canary-...).
+
+
+@pytest.mark.parametrize("pattern,sends", [
+    # The text before the first wildcard is what limits a rule; anything may follow it.
+    ("git:*", True), ("git *", True), ("gh:*", True), ("gh api:*", True), ("gh issue:*", True), ("npm:*", True),
+    ("pnpm:*", True), ("aws:*", True), ("aws s3:*", True), ("gsutil:*", True), ("twine:*", True), ("openssl:*", True),
+    ("git -C:*", True), ("git -c:*", True), ("uv:*", True), ("uv run:*", True), ("uv run python:*", True),
+    ("psql:*", True), ("docker:*", True), ("sudo:*", True), ("env:*", True), ("FOO=bar curl:*", True),
+    # A wildcard in the middle or glued to a word matches more than it looks like.
+    ("git * main", True), ("git p*", True), ("cu*", True), ("c*", True), ("py*", True), ("* --version", True),
+    ("curl https://api.internal.test/*", True),
+    # Rules that cannot send, and must not raise an alarm.
+    ("git status:*", False), ("git log * main", False), ("git st*", False), ("gh pr view:*", False),
+    ("gh issue list:*", False), ("aws s3 ls:*", False), ("npm run *", False), ("npm run * --silent", False),
+    ("uv run pytest:*", False), ("uv pip install:*", False), ("find:*", False), ("ls*", False), ("ls *", False),
+    ("echo *", False), ("make:*", False), ("pytest:*", False), ("go test:*", False),
+    ("git:* push", False),          # ":*" is only a wildcard at the very end
+    ("python --version", False), ("node -v", False), ("env", False), ("git", False),
+    # Interpreters and launchers: open arguments allow anything, fixed ones allow what they name.
+    ("python:*", True), ("python -c:*", True), ("node -e:*", True), ("bash -c *", True), ("npx:*", True),
+    ("sudo:*", True), ("xargs:*", True), ("timeout:*", True), ("docker run:*", True), ("deno run:*", True),
+    ("env FOO=1 node:*", True), ("timeout 30 curl:*", True), ("sudo -u postgres psql:*", True),
+    ("xargs -n1 curl:*", True), ("poetry run python:*", True), ('bash -c "npm test && *"', True),
+    ("python -c \"import urllib.request; urllib.request.urlopen('https://attacker.example/x')\"", True),
+    ("npx tsc:*", False), ("npx prettier --check:*", False), ("python -m pytest:*", False), ("python manage.py:*", False),
+    ("node scripts/build.js:*", False), ("bash scripts/release.sh:*", False), ("python deploy.py", False),
+    ("sudo apt-get:*", False), ("timeout 30 npm test:*", False), ("xargs grep:*", False), ("docker ps:*", False),
+    ("docker compose up:*", False), ("bun test:*", False), ("deno test:*", False), ('python -c "print(1)"', False),
+    # A wildcard inside a quoted argument: the usual way to allow any commit message. No alarm.
+    ('git commit -m "*"', False), ("git commit -m '*'", False), ('git commit -m "fix: *"', False), ('echo "*"', False),
+    ('npm run "*"', False), ("grep -r '*' .", False), ('jq ".[] | *"', False), ('git log --format="%H *"', False),
+    # ... but quotes are no hiding place either.
+    ('git "p*"', True), ('"cu*"', True), ('bash -c "curl *"', True), ('sh -c "*"', True),
+    ('curl "https://api.internal.test/v1/*"', True), ('git "st*"', False),
+])
+def test_what_an_allowed_command_pattern_really_lets_through(pattern, sends):
+    assert scan.shell_pattern_sends(pattern) is sends
+
+
+def test_claude_code_never_approves_some_wrappers_by_prefix_but_other_agents_have_no_such_rule():
+    for wrapper in ("watch:*", "setsid:*", "flock:*", "ionice:*"):
+        assert scan.shell_pattern_sends(wrapper) is False, wrapper
+        assert scan.shell_pattern_sends(wrapper, agent="cursor") is True, wrapper
+
+
+@pytest.mark.parametrize("allow,gate,partial", [
+    (["Bash(git:*)"], "open", ["Bash(git:*)"]),             # git push to any remote
+    (["Bash(gh:*)", "Bash(npm run *)"], "open", ["Bash(gh:*)"]),
+    (["Bash(cu*)"], "open", ["Bash(cu*)"]),
+    (["Bash(git * main)"], "open", ["Bash(git * main)"]),
+    (["Bash(git status:*)", "Bash(git diff:*)", "Bash(npm run *)", "Bash(find:*)", "Bash(ls:*)"], "ask", []),
+])
+def test_common_allow_rules_that_open_the_shell_are_seen_and_harmless_ones_are_not(dirs, allow, gate, partial):
+    home, project = dirs
+    claude_github(home, project, allow=allow)
+    with Store(":memory:") as store:
+        do_scan(store, home, project)
+        bash = tool(store, "Bash")
+        assert (bash["gate"], bash["open_partial"]) == (gate, partial)
+
+
+def test_an_ask_rule_still_closes_a_wide_allow_pattern(dirs):
+    home, project = dirs
+    claude_github(home, project, allow=["Bash(git:*)"], ask=["Bash(git push:*)"])
+    with Store(":memory:") as store:
+        do_scan(store, home, project)
+        assert tool(store, "Bash")["gate"] == "open", "git:* allows more than git push (git -c ..., send-email)"
+    claude_github(home, project, allow=["Bash(git:*)"], ask=["Bash(git:*)"])
+    with Store(":memory:") as store:
+        do_scan(store, home, project)
+        assert tool(store, "Bash")["gate"] == "ask"
+
+
+def test_cursor_and_gemini_command_patterns_are_prefixes(dirs):
+    home, project = dirs
+    write(project / ".cursor" / "mcp.json", {"mcpServers": {"fetch": {"command": "uvx", "args": ["mcp-server-fetch"]}}})
+    write(project / ".gemini" / "settings.json", {"tools": {"allowed": ["run_shell_command(git)"]}})
+    for allow, deny, gate in ((["Shell(git)"], [], "open"), (["Shell(ls)", "Shell(grep)"], [], "ask"),
+                              (["Shell(git)"], ["Shell(git)"], "ask"), (["Shell(curl)"], ["Shell(rm)"], "open")):
+        write(project / ".cursor" / "cli.json", {"permissions": {"allow": allow, "deny": deny}})
+        with Store(":memory:") as store:
+            do_scan(store, home, project)
+            shell = tool(store, "Shell", "cursor")
+            assert shell["gate"] == gate, (allow, deny)
+            if gate == "open":
+                assert shell["open_partial"] == [allow[0]], "the rule is kept as it is written"
+            assert tool(store, "run_shell_command", "gemini-cli")["gate"] == "open", "git <anything>, push included"
+
+
+def test_dont_ask_mode_does_not_hide_what_allow_rules_pre_approve(dirs):
+    """dontAsk refuses what would prompt. What a rule pre-approves, and read-only commands, still run."""
+    home, project = dirs
+    claude_github(home, project, allow=["Bash(curl:*)", "mcp__github__issue_read", "WebFetch(domain:docs.example.test)"])
+    write(home / ".claude" / "settings.json", settings(mode="dontAsk"))
+    with Store(":memory:") as store:
+        do_scan(store, home, project)
+        bash = tool(store, "Bash")
+        assert (bash["gate"], bash["open_partial"]) == ("open", ["Bash(curl:*)"]), "curl runs unasked in dontAsk mode"
+        assert tool(store, "mcp__github__issue_read")["gate"] == "open"
+        assert tool(store, "mcp__github__create_issue")["gate"] == "deny", "no rule approves it: refused"
+        fetch = tool(store, "WebFetch")
+        assert fetch["gate"] == "ask" and "pre-approves" in fetch["gate_reason"], "one domain is still fetched"
+    # Without a sending pattern the shell cannot send, but its read-only commands keep it a way to read files.
+    claude_github(home, project, allow=["mcp__github__issue_read", "mcp__github__create_issue"], deny=["Read"])
+    with Store(":memory:") as store:
+        from tainttrail import paths
+
+        do_scan(store, home, project)
+        bash = tool(store, "Bash")
+        assert (bash["gate"], bash["gate_data"]) == ("ask", "open") and "read-only commands still run" in bash["gate_reason"]
+        report = paths.find_paths(store, limit=5000)
+        assert any(p.data == "Bash" and p.sink == "mcp__github__create_issue" and p.status == "open" for p in report.paths)
+
+
+@pytest.mark.parametrize("deny,denied,rule", [
+    (["mcp__*(nonsense:true)"], False, ""),         # Claude Code skips an mcp__ rule that has parentheses
+    (["mcp__github(x:y)"], False, ""),
+    (["mcp__github__create_issue(title:x)"], False, ""),
+    (["mcp__*"], True, "mcp__*"),
+    (["mcp__git*"], True, "mcp__git*"),             # deny and ask take a glob over the whole tool name
+    (["mcp__*__create_*"], True, "mcp__*__create_*"),
+    (["*issue"], True, "*issue"),
+    (["mcp__gitlab*"], False, ""),
+])
+def test_deny_rules_that_look_like_they_cover_everything(dirs, deny, denied, rule):
+    home, project = dirs
+    claude_github(home, project, allow=["mcp__github"], deny=deny)
+    with Store(":memory:") as store:
+        result = do_scan(store, home, project)
+        create = tool(store, "mcp__github__create_issue")
+        assert (create["permission"] == "deny", create["permission_rule"] if denied else "") == (denied, rule)
+        assert create["permission_partial"] == [], "a rule that is skipped is not listed as if it did something"
+        if "(" in deny[0]:
+            notes = " ".join(result.agents[0]["notes"])
+            assert "skips an mcp__ rule that has parentheses" in notes and deny[0] in notes
+
+
+def test_tool_name_globs_work_for_deny_and_ask_and_approve_nothing_under_allow():
+    web = [ToolSpec("claude-code", n) for n in ("WebFetch", "WebSearch", "Write")]
+    assert [scan.evaluate_permission(t, rules(deny=["Web*"])).permission for t in web] == ["deny", "deny", "default"]
+    assert [scan.evaluate_permission(t, rules(ask=["W*"])).permission for t in web] == ["ask", "ask", "ask"]
+    assert [scan.evaluate_permission(t, rules(allow=["W*", "*", "Web*"])).permission for t in web] == ["default"] * 3
+    assert scan.evaluate_permission(GH_GET, rules(allow=["mcp__git*__get_issue", "mcp__*__get_issue"])).permission == "default"
+    background = scan.evaluate_permission(BASH, rules(deny=["B*(run_in_background:true)"]))
+    assert (background.permission, background.partial) == ("default", ["deny B*(run_in_background:true)"])
+
+
+def test_a_bare_read_deny_removes_read_but_is_only_best_effort_for_the_other_reading_tools(dirs):
+    assert scan.evaluate_permission(READ, rules(deny=["Read"])).permission == "deny"
+    grep = scan.evaluate_permission(GREP, rules(deny=["Read"]))
+    assert (grep.permission, grep.partial) == ("default", ["deny Read"])
+    assert scan.evaluate_permission(GREP, rules(deny=["Grep"])).permission == "deny"
+    assert scan.evaluate_permission(WRITE, rules(deny=["Edit"])).permission == "deny", "Edit rules do cover every edit tool"
+    home, project = dirs
+    claude_github(home, project, deny=["Read", "Bash"])
+    with Store(":memory:") as store:
+        do_scan(store, home, project)
+        assert (tool(store, "Read")["gate"], tool(store, "Grep")["gate"]) == ("deny", "open"), "Grep still prints file contents"
+
+
+@pytest.mark.parametrize("args,env,read_only", [
+    (["--read-only"], {}, True), (["--read-only=true"], {}, True), ([], {"GITHUB_READ_ONLY": "1"}, True),
+    (["--read-only=false"], {}, False), (["--read-only=0"], {}, False), ([], {"GITHUB_READ_ONLY": "false"}, False),
+    ([], {"GITHUB_READ_ONLY": "${READ_ONLY}"}, False),          # the file does not say: do not assume the safe case
+    ([], {"GITHUB_READ_ONLY": "$READ_ONLY"}, False),
+])
+def test_read_only_mode_is_believed_only_when_it_is_switched_on(dirs, args, env, read_only):
+    home, project = dirs
+    write(project / ".mcp.json", {"mcpServers": {"github": {
+        "command": "docker", "args": ["run", "-i", "ghcr.io/github/github-mcp-server", *args], "env": env}}})
+    with Store(":memory:") as store:
+        do_scan(store, home, project)
+        assert (tool(store, "mcp__github__create_issue") is None) is read_only
+        assert bool(servers(store)["github"]["risk_reducing"]) is read_only
+
+
+def test_a_risk_flag_whose_value_is_not_in_the_file_still_counts(dirs):
+    home, project = dirs
+    write(project / ".mcp.json", {"mcpServers": {"aws": {
+        "command": "uvx", "args": ["awslabs.aws-api-mcp-server"],
+        "env": {"AWS_API_MCP_ALLOW_UNRESTRICTED_LOCAL_FILE_ACCESS": "${UNRESTRICTED}", "READ_OPERATIONS_ONLY": "${RO}"}}}})
+    with Store(":memory:") as store:
+        do_scan(store, home, project)
+        server = servers(store)["aws"]
+        assert server["risk_flags"] == ["AWS_API_MCP_ALLOW_UNRESTRICTED_LOCAL_FILE_ACCESS"] and server["risk_reducing"] == []
+
+
+def test_a_setting_in_a_url_is_read_by_name_and_value(dirs):
+    entry = lambda url: ServerEntry("claude-code", "supabase", "project", "f", transport="http", url=url)  # noqa: E731
+    flags = ["read_only=true", "project_ref=", "/readonly"]
+    found = lambda url: scan._config_flags(entry(url), flags, when_unknown=False)  # noqa: E731
+    assert found("https://mcp.supabase.test/mcp?read_only=true&project_ref=abc") == ["read_only=true", "project_ref="]
+    assert found("https://mcp.supabase.test/mcp?read_only=false&project_ref=") == []
+    assert found("https://mcp.supabase.test/mcp?note=read_only=true") == []
+    assert found("https://api.example.test/mcp/readonly") == ["/readonly"]
+    assert found("https://api.example.test/mcp?next=/readonly") == []
+
+
+# -- review: hosts ------------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("url,host", [
+    ("https://attacker.example\\@api.githubcopilot.com/mcp/", "attacker.example"),      # a backslash ends the host
+    ("https://attacker.example\\.api.githubcopilot.com/mcp/", "attacker.example"),
+    ("https://api.githubcopilot.com@attacker.example/mcp/", "attacker.example"),
+    ("https://api.githubcopilot.com.attacker.example/mcp/", "api.githubcopilot.com.attacker.example"),
+    ("https://attacker.example/#@api.githubcopilot.com/", "attacker.example"),
+    ("https://attacker.example/?x=@api.githubcopilot.com/", "attacker.example"),
+    ("HTTPS://API.GITHUBCOPILOT.COM./mcp/", "api.githubcopilot.com"),
+])
+def test_the_host_a_scan_names_is_the_host_the_agent_reaches(dirs, url, host):
+    assert scan.url_host(url) == host
+    entry = ServerEntry("claude-code", "remote", "project", "f", transport="http", url=url)
+    found, how = scan.identify_server(entry, classify.load_catalog())
+    assert ((found or {}).get("id"), how) == (("github", "host") if host == "api.githubcopilot.com" else (None, ""))
+    home, project = dirs
+    write(project / ".mcp.json", {"mcpServers": {"remote": {"type": "http", "url": url}}})
+    with Store(":memory:") as store:
+        do_scan(store, home, project)
+        stored = servers(store)["remote"]
+        assert stored["url_host"] == host and host in stored["url"].lower(), "the real host is shown, not hidden as a credential"
+
+
+def test_a_wrapped_remote_server_is_found_whatever_the_case_of_its_scheme():
+    entry = ServerEntry("claude-code", "tickets", "project", "f", argv=["npx", "-y", "mcp-remote", "HTTPS://mcp.linear.app/sse"])
+    assert scan.identify_server(entry, classify.load_catalog())[1] == "host"
+
+
+# -- review: redaction --------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("url,expected", [
+    ("//admin:canary-pg-password-0004@db.internal.test/x", "//«redacted»@db.internal.test/x"),
+    ("admin:canary-pg-password-0004@db.internal.test:5432/prod", "«redacted»@db.internal.test:5432/prod"),
+    ("localhost:3000/mcp?token=canary-url-query-0003", "localhost:3000/mcp?token=«redacted»"),
+    ("https://x.test/mcp?canary-url-query-0003", "https://x.test/mcp?«redacted»"),            # a query with no name
+    ("https://x.test/mcp?abcdefghijklmnopqrstuvwx&debug", "https://x.test/mcp?«redacted»&debug"),
+    ("https://x.test/t/canary%2Durl%2Dquery%2D0003/sse", "https://x.test/t/«redacted»/sse"),   # %-escaped
+    ("https://x.test/cb?t%6Fken=abc", "https://x.test/cb?t%6Fken=«redacted»"),
+    ("https://x.test/mcp#access_token=canary-url-query-0003", "https://x.test/mcp"),
+    ("/mcp?x=1", "/mcp?x=1"),
+])
+def test_urls_written_in_unusual_ways_lose_their_credentials_too(url, expected):
+    assert scan.redact_url(url) == expected
+    assert scan.redact_url(expected) == expected
+    for canary in CANARIES.values():
+        assert canary not in scan.scrub(scan.redact_url(url))
+
+
+@pytest.mark.parametrize("argv,hidden,kept", [
+    (["psql", "PGPASSWORD=hunter2"], "hunter2", "psql PGPASSWORD=«»"),
+    (["server", "--pass", "hunter2"], "hunter2", "server --pass «»"),
+    (["server", "--pass=hunter2"], "hunter2", "server --pass=«»"),
+    (["server", "--db-passwd", "hunter2"], "hunter2", "--db-passwd «»"),
+    (["server", "AUTHTOKEN=abc123"], "abc123", "AUTHTOKEN=«»"),
+    (["server", "--connection-string", "Server=x;User=sa;Password=hunter2;"], "hunter2", "Server=x;User=sa;Password=«»;"),
+    (["sh", "-c", "export DB_PASS='p w'; exec server"], "p w", "exec server"),
+    (["server", "--config", '{"password": "hunter2", "port": 5432}'], "hunter2", '"port": 5432'),
+    (["server", "-H", "Authorization: Token abc123def"], "abc123def", "Authorization: Token «»"),
+    (["server", "-H", "Authorization: abc123def"], "abc123def", "Authorization: «»"),
+])
+def test_short_passwords_and_one_word_names_are_redacted(argv, hidden, kept):
+    import re
+
+    line = scan.redact_argv(argv)
+    assert hidden not in line
+    assert kept in re.sub(r"«[a-z_]+»", "«»", line), line      # whichever detector saw it, its kind is all that is left
+    assert scan.scrub(line) == line
+
+
+def test_names_that_say_secret_in_one_word():
+    for name in ("PGPASSWORD", "DB_PASS", "AUTHTOKEN", "apiToken", "MYSQL_PWD", "CLIENTSECRET", "AWS_SECRET_ACCESS_KEY",
+                 "accessKey", "ACCESSKEY", "--pass", "X-Api-Tokens", "GITHUB_PERSONAL_ACCESS_TOKEN", "credentials"):
+        assert scan.secretish_name(name), name
+    for name in ("BYPASS_PROXY", "COMPASS_URL", "PASSENGER_COUNT", "LOG_LEVEL", "MONKEY_PATCH", "TOKENIZER", "REGION",
+                 "--passive", "KEYBOARD_LAYOUT", "SECRETARY", "--repository"):
+        assert not scan.secretish_name(name), name
+
+
+@pytest.mark.parametrize("text,value", [
+    ("password=hunter2", "hunter2"), ("pwd: zq1", "zq1"), ("secret = 's3cr3t'", "s3cr3t"), ('{"api_key": "zq1"}', "zq1"),
+    ("DB_PASS=x1y", "x1y"), ("Authorization: Token zq1zq1", "zq1zq1"),
+])
+def test_scrub_redacts_assignments_whatever_their_length_and_stays_idempotent(text, value):
+    import re
+
+    once = scan.scrub(text)
+    assert value not in once and re.search(r"«[a-z_]+»", once), once
+    assert scan.scrub(once) == once
+
+
+@pytest.mark.parametrize("text", [
+    "token=${TOKEN}", "password: $DB_PASSWORD", "api_key: <YOUR_KEY>", "secret=changeme", "password: none", "pass: true",
+    "max_tokens=4096", "Bash(gh auth token:*)", "Bash(npm run token:refresh)", "mcp/secret:latest", "tokens are rotated daily",
+    "--password ${DB_PASSWORD}", "Authorization: Bearer ${API_TOKEN}", "Authorization:${AUTH_HEADER}", "passwords are hashed",
+])
+def test_scrub_leaves_references_placeholders_and_ordinary_text_alone(text):
+    assert scan.scrub(text) == text
+
+
+def test_invisible_and_direction_changing_characters_are_made_visible(dirs):
+    hidden = ("\u202e", "\u2066", "\u2069", "\u200b", "\u200d", "\u2028", "\ufeff", "\u00ad", "\U000e0041", "\ufe0f", "\x9b")
+    for ch in hidden:
+        assert scan.scrub(f"safe{ch}text") == "safe?text", repr(ch)
+        assert scan.printable(f"safe{ch}text") == "safe?text", repr(ch)
+    assert scan.scrub("naïve café — 日本語 ünïcödé") == "naïve café — 日本語 ünïcödé", "ordinary non-ASCII text is untouched"
+    home, project = dirs
+    write(project / ".mcp.json", {"mcpServers": {
+        "notes\u202egnp.exe": {"command": "node", "args": ["x.js", "--label=a\u200bb"]},
+        "fetch": {"command": "uvx", "args": ["mcp-server-fetch"]}}})
+    listed = [{"name": "ok_tool", "description": "Reads the inbox.\U000e0049\U000e0047\U000e004e\U000e004f\U000e0052\U000e0045 hidden"}]
+    with Store(":memory:") as store:
+        result = do_scan(store, home, project, introspected={"claude-code/notes?gnp.exe": listed})
+        texts = (scan.render_scan(result, None), scan.render_tools(scan.list_tools(store)), graph_text(store))
+        for text in texts:
+            assert not any(ch in text for ch in hidden)
+        assert "notes?gnp.exe" in servers(store)
+        assert tool(store, "mcp__notes_gnp_exe__ok_tool")["description"] == "Reads the inbox.?????? hidden"
+
+
+def test_a_long_text_is_never_cut_through_the_middle_of_a_token():
+    """Only the first part of a long text is looked at. A token the cut goes through must not leave its head behind:
+    eight to nineteen characters of it are too short to be recognised as a token, and long enough to matter."""
+    token = CANARIES["random argument"]
+    blob = ("Qm7Rk2Vx9Lp4Tz8Wc3Yb6Nd1Hf5Jg0Ks" * 7)[:200]       # redacted to one word, so the tail of the text is printed
+    for lead in range(2382, 2400):
+        text = (blob + " ") * 11 + "x" * (lead - 11 * 201) + " " + token
+        assert len(text) > 2400 and text[:2400].endswith(" " + token[: 2400 - lead - 1])
+        out = scan.scrub(text)
+        assert len(out) < 600 and token[:8] not in out, f"the head of a token survived a cut at {lead}"
+
+
+# -- review: tools a person declares ------------------------------------------------------------------------------
+
+
+def test_a_tool_declared_by_hand_belongs_to_its_server_from_the_next_scan_on(dirs):
+    home, project = dirs
+    write(project / ".mcp.json", {"mcpServers": {"mystery": {"command": "node", "args": ["server.js"]}}})
+    write(project / ".claude" / "settings.json", settings(allow=["mcp__mystery"]))
+    with Store(":memory:") as store:
+        from tainttrail import paths
+
+        result = do_scan(store, home, project)
+        assert any("server mystery: no tools are known" in w for w in result.warnings)
+        changed = scan.set_tool_labels(store, "mcp__mystery__send_all", {"external_sink": True, "sink_scope": "public"})
+        assert changed["created"] is True
+        scan.set_tool_labels(store, "mcp__elsewhere__send", {"external_sink": True})
+
+        for include_observed in (True, False):      # a declared tool is not "only seen in sessions"
+            result = do_scan(store, home, project, include_observed=include_observed)
+            assert tools_of(store, "claude-code/mystery") == {"mcp__mystery__send_all"}
+            sent = tool(store, "mcp__mystery__send_all")
+            assert (sent["origin"], sent["label_source"], sent["gate"], sent["permission_rule"]) == \
+                ("user", "user", "open", "mcp__mystery")
+            assert not any("server mystery: no tools are known" in w for w in result.warnings)
+            assert any(p.sink == "mcp__mystery__send_all" for p in paths.find_paths(store, limit=500).paths)
+            # A tool declared for a server that nothing configures stays on its own, and is kept.
+            assert "elsewhere" not in servers(store) and tool(store, "mcp__elsewhere__send")["label_source"] == "user"
+
+        # Taking the label back takes the declaration back: nothing else knows the tool, so the next scan drops it.
+        scan.reset_tool_labels(store, "mcp__mystery__send_all")
+        do_scan(store, home, project)
+        assert tool(store, "mcp__mystery__send_all") is None and tools_of(store, "claude-code/mystery") == set()
+
+
+def test_resetting_a_label_gives_back_what_a_scan_would_compute(dirs):
+    home, project = dirs
+    write(project / ".mcp.json", {"mcpServers": {"gh": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-github"]}}})
+    write(project / ".cursor" / "mcp.json", {"mcpServers": {"fetch": {"command": "uvx", "args": ["mcp-server-fetch"]}}})
+    with Store(":memory:") as store:
+        from tainttrail import paths
+
+        do_scan(store, home, project)
+        before = {name: tool(store, name, agent) for name, agent in (("mcp__gh__create_issue", "claude-code"), ("Shell", "cursor"))}
+        cursor_paths = paths.find_paths(store, agent="cursor").total
+        scan.set_tool_labels(store, "mcp__gh__create_issue", {"external_sink": False})
+        scan.set_tool_labels(store, "Shell", {"external_sink": False, "private_data": False}, agent="cursor")
+        assert paths.find_paths(store, agent="cursor").total < cursor_paths
+        scan.reset_tool_labels(store, "mcp__gh__create_issue")      # the server is called "gh": only its package says GitHub
+        scan.reset_tool_labels(store, "Shell", agent="cursor")      # a built-in of Cursor, unknown to the Claude Code table
+        for name, agent in (("mcp__gh__create_issue", "claude-code"), ("Shell", "cursor")):
+            after = tool(store, name, agent)
+            for key in ("untrusted_input", "private_data", "external_sink", "local_write", "code_exec", "label_source",
+                        "label_confidence", "sink_scope"):
+                assert after[key] == before[name][key], (name, key)
+        assert paths.find_paths(store, agent="cursor").total == cursor_paths, "no scan was needed to get the paths back"
+
+
+# -- review: asking a server that does not behave ------------------------------------------------------------------
+
+
+HANDSHAKE = textwrap.dedent('''
+    import json, os, sys
+    open(os.environ["MARK"], "w").write(str(os.getpid()))
+    def answer(msg, result):
+        print(json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": result}), flush=True)
+''')
+
+
+def server_entry(tmp_path: Path, body: str, *, handshake: bool = False) -> ServerEntry:
+    """A server entry that runs ``body`` as a Python script (after the helper above, when asked)."""
+    script = write(tmp_path / "odd_server.py", text=(HANDSHAKE if handshake else "") + textwrap.dedent(body))
+    return ServerEntry("claude-code", "odd", "project", str(tmp_path / ".mcp.json"), argv=[sys.executable, str(script)],
+                       env={"MARK": str(tmp_path / "started")})
+
+
+def test_a_server_that_leaves_a_child_holding_its_output_cannot_hang_the_scan(tmp_path):
+    import os
+    import time
+
+    entry = server_entry(tmp_path, '''
+        import os, subprocess, sys, time
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True)
+        open(os.environ["MARK"], "w").write(f"{os.getpid()} {child.pid}")
+        time.sleep(30)
+    ''')
+    started = time.monotonic()
+    try:
+        with pytest.raises(scan.IntrospectError, match="no answer within"):
+            scan.introspect_server(entry, timeout=2)
+        assert time.monotonic() - started < 10, "the time limit holds although something still has the pipe open"
+    finally:
+        server_pid, child_pid = (int(p) for p in (tmp_path / "started").read_text().split())
+        try:
+            os.kill(child_pid, 9)       # it left our process group on purpose; tidy up after the test
+        except ProcessLookupError:
+            pass
+    with pytest.raises(ProcessLookupError):
+        os.kill(server_pid, 0)
+
+
+def test_a_server_that_floods_its_output_is_stopped_and_little_of_it_is_kept(tmp_path, monkeypatch):
+    import time
+    import tracemalloc
+
+    monkeypatch.setattr(scan, "MAX_SERVER_BACKLOG", 200_000)
+    entry = server_entry(tmp_path, '''
+        import os, sys
+        open(os.environ["MARK"], "w").write(str(os.getpid()))
+        line = ("x" * 4000 + "\\n").encode()
+        while True:
+            os.write(1, line * 16)
+    ''')
+    tracemalloc.start()
+    started = time.monotonic()
+    with pytest.raises(scan.IntrospectError, match="no answer within"):
+        scan.introspect_server(entry, timeout=1.5)
+    took, (_now, peak) = time.monotonic() - started, tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    assert took < 10 and peak < 40_000_000, f"{took:.1f} s, {peak / 1e6:.0f} MB"
+
+
+def test_a_server_cannot_make_the_scan_write_without_end(tmp_path):
+    import time
+
+    entry = server_entry(tmp_path, '''
+        answer({"id": 1}, {})
+        page = 2
+        while True:         # never reads its input; answers every page in advance with a huge cursor
+            answer({"id": page}, {"tools": [{"name": f"t{page}"}], "nextCursor": "c" * 200000})
+            page += 1
+            if page > 60:
+                import time; time.sleep(30)
+    ''', handshake=True)
+    started = time.monotonic()
+    listed = scan.introspect_server(entry, timeout=5)
+    assert [t["name"] for t in listed] == ["t2"], "an oversized cursor is not sent back; the listing stops there"
+    assert time.monotonic() - started < 10
+
+
+def test_a_tool_list_of_the_wrong_shape_is_an_empty_one(tmp_path):
+    entry = server_entry(tmp_path, '''
+        for line in sys.stdin:
+            msg = json.loads(line)
+            if msg.get("method") == "initialize":
+                answer(msg, {})
+            elif msg.get("method") == "tools/list":
+                answer(msg, {"tools": "all of them", "nextCursor": 7})
+    ''', handshake=True)
+    assert scan.introspect_server(entry, timeout=20) == []
+
+
+@pytest.mark.parametrize("schema", [
+    {"properties": ["to", "body"]}, {"properties": "to"}, {"properties": 7}, ["properties"], "object",
+    {"properties": {"to": 1, "body": [2]}}, {"properties": {"x" * 5000: {}}},
+])
+def test_a_tool_schema_of_the_wrong_shape_cannot_break_a_scan(dirs, schema):
+    home, project = dirs
+    write(project / ".mcp.json", {"mcpServers": {"reports": {"command": "node", "args": ["x.js"]}}})
+    listed = [{"name": "send_report", "inputSchema": schema, "description": ["not", "text"]},
+              {"name": "get_weather", "inputSchema": {"properties": {"city": {}}}, "description": 7}]
+    with Store(":memory:") as store:
+        do_scan(store, home, project, introspected={"claude-code/reports": listed})
+        assert tools_of(store, "claude-code/reports") == {"mcp__reports__send_report", "mcp__reports__get_weather"}
+        assert tool(store, "mcp__reports__send_report")["external_sink"] is True, "the name still says what it does"
+        assert tool(store, "mcp__reports__get_weather")["description"] == ""
+
+
+def test_stopping_a_server_works_where_there_are_no_process_groups(tmp_path, monkeypatch):
+    import os
+    import signal
+
+    def no_groups(pid, sig):
+        raise AttributeError("os.killpg is not available on this platform")
+
+    monkeypatch.setattr(os, "killpg", no_groups)
+    monkeypatch.delattr(signal, "SIGKILL")
+    entry = server_entry(tmp_path, '''
+        import os, time
+        open(os.environ["MARK"], "w").write(str(os.getpid()))
+        time.sleep(30)
+    ''')
+    with pytest.raises(scan.IntrospectError, match="no answer within"):
+        scan.introspect_server(entry, timeout=1)
+    with pytest.raises(ProcessLookupError):
+        os.kill(int((tmp_path / "started").read_text()), 0)
+
+
+@pytest.mark.parametrize("value", ["inf", "nan", "-5", "0", "100000"])
+def test_a_timeout_that_is_not_a_time_is_refused_before_anything_starts(dirs, cfg, tmp_path, capsys, value):
+    home, project = dirs
+    marker = fake_server(tmp_path, project)
+    assert scan_cli(cfg, home, project, "--introspect", "--yes", "--timeout", value) == 2
+    assert "--timeout takes a number of seconds" in capsys.readouterr().err and not marker.exists()
+
+
+def test_the_list_of_commands_to_start_shows_what_a_person_needs_to_judge_them(dirs, cfg, capsys):
+    home, project = dirs
+    long_tail = "x" * 900 + " --then-the-part-that-matters"
+    write(project / ".mcp.json", {"mcpServers": {
+        "plain": {"command": "node", "args": ["server.js"]},
+        "preloaded": {"command": "node", "args": ["server.js", long_tail],
+                      "env": {"NODE_OPTIONS": "--require ./x.js", "LD_PRELOAD": "/tmp/x.so", "API\x1b[2K": "1"}},
+        "keyed": {"command": "node", "args": ["server.js", "--api-key", CANARIES["flag value"]]},
+    }})
+    assert scan_cli(cfg, home, project, "--introspect") == 2
+    err = capsys.readouterr().err
+    lines = {line.split(":")[0].strip(): line for line in err.splitlines() if line.startswith("  claude-code/")}
+    assert lines["claude-code/plain"].strip() == "claude-code/plain: node server.js"
+    assert "--then-the-part-that-matters" in lines["claude-code/preloaded"], "a long command is shown, not cut at 600"
+    assert "[sets API?[2K, LD_PRELOAD, NODE_OPTIONS]" in lines["claude-code/preloaded"]
+    assert CANARIES["flag value"] not in err and "\x1b" not in err
+    assert f"read {project / '.mcp.json'}" in lines["claude-code/keyed"], "what was hidden can be read in the file"
+
+
+# -- review: sizes ----------------------------------------------------------------------------------------------------
+
+
+def test_fifty_thousand_rules_do_not_make_the_scan_crawl(dirs):
+    import time
+
+    home, project = dirs
+    claude_trio(home, project)
+    many = [f"mcp__server{i}__tool{i % 7}" for i in range(20_000)] + [f"mcp__fetch__f{i}*" for i in range(10_000)]
+    write(project / ".claude" / "settings.json", {"permissions": {
+        "allow": many + ["mcp__slack__slack_post_message"], "ask": [f"Bash(deploy step{i}:*)" for i in range(10_000)],
+        "deny": [f"x{i}*" for i in range(10_000)] + ["mcp__fetch__fetch"]}})
+    with Store(":memory:") as store:
+        started = time.monotonic()
+        do_scan(store, home, project)
+        assert time.monotonic() - started < 5, "rules are looked up from the tool's side, not tried one by one"
+        assert tool(store, "mcp__slack__slack_post_message")["permission"] == "allow"
+        assert tool(store, "mcp__fetch__fetch")["permission"] == "deny"
+        assert len(tool(store, "Bash")["permission_partial"]) == scan.MAX_PARTIAL_RULES
+
+
+def test_rules_in_any_number_keep_their_order_and_meaning():
+    """The index behind the rules must not change which rule wins."""
+    import random
+
+    rng = random.Random(20261114)
+    names = ["Bash", "Read", "Grep", "Write", "WebFetch", "Agent", "mcp__github__get_issue", "mcp__github__create_issue",
+             "mcp__git__status"]
+    specs = [ToolSpec("claude-code", n, *((n.split("__")[1], n.split("__")[2], n.split("__")[1]) if n.startswith("mcp__") else ()))
+             for n in names]
+    texts = ["Bash", "Bash(curl:*)", "Bash(*)", "Read", "Read(./.env)", "Edit", "Edit(src/**)", "Task", "WebFetch(domain:*)",
+             "mcp__github", "mcp__github__*", "mcp__github__get_*", "mcp__git", "mcp__*", "*", "B*", "mcp__git*", "W*",
+             "mcp__github__create_issue", "mcp__github(x)", "*Fetch", "Grep(x)", "Agent(Explore)"]
+
+    def slow(tool, rule_list):          # every rule tried on the tool, in order: the definition
+        result = None
+        for kind in ("deny", "ask", "allow"):
+            for rule in rule_list:
+                name, spec = scan.parse_rule(rule.text)
+                if rule.kind == kind and result is None and scan._match_claude(kind, name, spec, tool) == "full":
+                    result = (kind, rule.text)
+        return result or ("default", "")
+
+    for _ in range(300):
+        rule_list = [PermissionRule(rng.choice(("allow", "ask", "deny")), rng.choice(texts), "f", "project")
+                     for _ in range(rng.randint(0, 12))]
+        ruleset = scan.RuleSet(rule_list)
+        for tool_spec in specs:
+            found = ruleset.evaluate(tool_spec)
+            assert (found.permission, found.rule) == slow(tool_spec, rule_list), (tool_spec.name, [(r.kind, r.text) for r in rule_list])
+
+
+def test_rules_that_were_not_read_are_reported_never_dropped_in_silence(dirs):
+    home, project = dirs
+    claude_github(home, project, allow=["Bash(" + "curl " * 500 + ")", "mcp__github__get_me"],
+                  deny=[f"*x{i}" for i in range(scan.MAX_UNANCHORED_RULES + 3)])
+    with Store(":memory:") as store:
+        result = do_scan(store, home, project)
+        assert any("1 permission rules longer than 2000 characters were not read" in p for p in result.problems)
+        assert any("3 of them were not read" in p for p in result.problems)
+        assert tool(store, "mcp__github__get_me")["permission"] == "allow", "the rules that were read still apply"
+
+
+def test_more_allowed_command_patterns_than_can_be_checked_count_as_an_open_shell(dirs, monkeypatch):
+    home, project = dirs
+    monkeypatch.setattr(scan, "MAX_SHELL_PATTERNS", 50)
+    claude_github(home, project, allow=[f"Bash(npm run task{i}:*)" for i in range(50)])
+    with Store(":memory:") as store:
+        do_scan(store, home, project)
+        assert tool(store, "Bash")["gate"] == "ask", "fifty harmless patterns were all looked at"
+    claude_github(home, project, allow=[f"Bash(npm run task{i}:*)" for i in range(60)] + ["Bash(curl:*)"])
+    with Store(":memory:") as store:
+        do_scan(store, home, project)
+        bash = tool(store, "Bash")
+        assert bash["gate"] == "open" and "too many to check" in bash["gate_reason"] and bash["open_partial"] == []
+
+
+def test_a_scan_the_graph_engine_refuses_ends_with_one_line_and_the_old_map(dirs, cfg, capsys, monkeypatch):
+    import relate
+
+    home, project = dirs
+    claude_trio(home, project)
+    assert scan_cli(cfg, home, project, "--json") == 0
+    capsys.readouterr()
+    with Store(cfg.db_path) as store:
+        before = graph_text(store)
+
+    def too_large(store, *args, **kwargs):
+        store.write("MATCH (s:Server) DETACH DELETE s")     # part of the work is done when the engine gives up
+        raise relate.DataError("This statement tried to commit a single WAL record of at least 64 MB.\nsecond line")
+
+    monkeypatch.setattr(scan, "_replace_agent", too_large)
+    assert scan_cli(cfg, home, project) == 1
+    err = capsys.readouterr().err
+    assert "the graph engine refused the scan (This statement tried to commit" in err and "second line" not in err
+    assert "Traceback" not in err and "previous scan was kept" in err
+    with Store(cfg.db_path) as store:
+        assert graph_text(store) == before
+
+
+def test_cursor_cli_permissions_are_also_read_from_the_xdg_config_directory(dirs):
+    home, project = dirs
+    write(project / ".cursor" / "mcp.json", {"mcpServers": {"fetch": {"command": "uvx", "args": ["mcp-server-fetch"]}}})
+    write(home / ".config" / "cursor" / "cli-config.json", {"permissions": {"allow": ["Mcp(fetch:*)"]}})
+    with Store(":memory:") as store:
+        do_scan(store, home, project)
+        assert tool(store, "mcp__fetch__fetch", "cursor")["permission"] == "allow"
+
+
+def test_a_file_with_absurd_numbers_of_things_is_read_up_to_a_limit_and_reported(dirs, monkeypatch):
+    import time
+
+    home, project = dirs
+    monkeypatch.setattr(scan, "MAX_SERVERS_PER_FILE", 30)
+    monkeypatch.setattr(scan, "MAX_RULES", 500)
+    servers_ = {f"s{i:04d}": {"command": "node", "args": ["x.js"]} for i in range(200)}
+    servers_["s0000"] = {
+        "command": "node", "args": ["x.js", *(f"--flag{i}=v" for i in range(5000)), "--token", CANARIES["flag value"]],
+        "env": {**{f"VAR_{i}": "${REF_" + str(i) + "}" for i in range(400)}, "MANY": " ".join("${R%d}" % i for i in range(20000))},
+        "headers": {f"X-Key-{i}": "Bearer ${T}" for i in range(300)},
+    }
+    servers_["s0001"] = {"type": "http", "url": "https://x.test/" + "/".join(f"seg{i}" for i in range(200_000)) + "?token=" + CANARIES["url query"]}
+    servers_.update({f"junk{i}": "not an object" for i in range(500)})
+    write(project / ".mcp.json", {"mcpServers": servers_})
+    write(project / ".claude" / "settings.json", settings(allow=[f"mcp__s0000__t{i}" for i in range(2000)], deny=["WebFetch"]))
+    with Store(":memory:") as store:
+        started = time.monotonic()
+        result = do_scan(store, home, project)
+        assert time.monotonic() - started < 20
+        assert len(servers(store)) == 31, "thirty servers and the built-in tools"
+        assert any("more than 30 MCP servers; the rest were not read" in p for p in result.problems)
+        assert any("more than 500 permission rules; the rest were not read" in p for p in result.problems)
+        assert sum("is not an object" in p for p in result.problems) <= 20
+        assert tool(store, "WebFetch")["permission"] == "deny", "deny rules come first and were read"
+        assert store.scalar("MATCH (:Server {id: 'claude-code/s0000'})-[:HOLDS]->(c:Credential) RETURN count(c)") == scan.MAX_CREDENTIALS
+        command = servers(store)["s0000"]["command"]
+        assert len(command) <= 600 and command.startswith("node x.js --flag0=v")
+        url = servers(store)["s0001"]["url"]
+        assert len(url) <= 300 and url.startswith("https://x.test/seg0/seg1")
+        for text in (graph_text(store), json.dumps(result.to_dict()), scan.render_scan(result, None)):
+            assert CANARIES["flag value"] not in text and CANARIES["url query"] not in text
+        assert "more arguments" in scan.redact_argv(["node", *("x" for _ in range(scan.MAX_ARGUMENTS + 7))], 100_000)
+
+
+# -- review: allowlists, and servers the scan cannot see -------------------------------------------------------------
+
+
+@pytest.mark.parametrize("pattern,url,matches", [
+    ("https://mcp.example.test/*", "https://mcp.example.test/api", True),
+    ("https://mcp.example.test", "https://mcp.example.test/api/v1?x=1", True),         # no path: every path
+    ("https://mcp.example.test/*", "https://mcp.example.test", True),
+    ("https://Mcp.Example.test/*", "https://mcp.example.test./api", True),             # case and a trailing dot
+    ("https://mcp.example.test/*", "https://mcp.example.test:8443/api", False),        # default port only
+    ("https://mcp.example.test:8443/*", "https://mcp.example.test:8443/api", True),
+    ("https://mcp.example.test:*/*", "https://mcp.example.test:8443/api", True),
+    ("https://*.example.test/*", "https://mcp.example.test:8443/api", True),           # a wildcard host: every port
+    ("https://*.example.test/*", "https://example.test.attacker.example/api", False),
+    ("*://mcp.example.test/*", "http://mcp.example.test/api", True),
+    ("https://mcp.example.test/api/*", "https://mcp.example.test/other", False),
+    ("https://mcp.example.test/*", "https://attacker.example\\@mcp.example.test/api", False),
+    ("http://localhost:*/*", "http://localhost:3000/mcp", True),
+])
+def test_server_url_entries_match_the_way_claude_code_documents(pattern, url, matches):
+    assert scan.server_url_matches(pattern, url) is matches
+
+
+def test_an_allowlist_does_not_switch_off_what_it_allows_or_what_skips_it(dirs, tmp_path):
+    home, project = dirs
+    system = tmp_path / "etc-claude-code"
+    write(project / ".mcp.json", {"mcpServers": {
+        "listed": {"type": "http", "url": "https://mcp.example.test/api/v1"},
+        "other": {"type": "http", "url": "https://other.example.test/mcp"}}})
+    write(home / ".claude" / "settings.json", {"allowedMcpServers": [{"serverUrl": "https://mcp.example.test"}]})
+    write(system / "managed-settings.json", {"managedMcpServers": {"corp": {"type": "http", "url": "https://corp.example.test/mcp"}}})
+    [cfg] = scan.discover(home, project, system=system, agents=["claude-code"])
+    state = {s.name: (s.enabled, s.status) for s in cfg.servers}
+    assert state["listed"][0] is True, "a pattern without a path allows every path on that host"
+    assert state["other"] == (False, "not in allowedMcpServers")
+    assert state["corp"][0] is True, "servers the organisation provides need no allowlist entry"
+
+
+def test_allow_rules_for_servers_nobody_declared_are_pointed_out(dirs, cfg, store):
+    home, project = dirs
+    claude_github(home, project, allow=["mcp__github__get_me", "mcp__plugin_notes_vault", "mcp__claude_ai_Slack__post",
+                                        "mcp__plugin_notes_vault__read_secret", "mcp__*", "Bash(npm test)"])
+    data = json.loads((project / ".claude" / "settings.json").read_text())
+    data.update(enabledPlugins={"notes@acme-tools": True, "off@acme-tools": False},
+                extraKnownMarketplaces={"acme-tools": {"source": {"source": "github", "repo": "acme/tools"}}})
+    write(project / ".claude" / "settings.json", data)
+
+    def unknown_servers() -> str:
+        result = do_scan(store, home, project)
+        [warning] = [w for w in result.warnings if "no scanned file declares" in w]
+        assert "no scanned file declares" in scan.render_scan(result, None)
+        notes = " ".join(result.agents[0]["notes"])
+        assert "enables 1 plugins (notes@acme-tools)" in notes and "MCP servers and hooks that a scan does not read" in notes
+        return warning.split("declares:")[1].split(". If")[0]
+
+    named = unknown_servers()
+    assert "plugin_notes_vault (mcp__plugin_notes_vault in" in named and "claude_ai_Slack" in named
+    assert "github" not in named, "a declared server is not reported"
+    # Once a recorded session has used the plugin's server it is on the map, and no longer unknown.
+    record_call(store, cfg, "mcp__plugin_notes_vault__read_secret")
+    named = unknown_servers()
+    assert "plugin_notes_vault" not in named and "claude_ai_Slack" in named
+    assert tool(store, "mcp__plugin_notes_vault__read_secret")["gate"] == "open"
+
+
+def test_scans_and_readers_running_at_once_leave_one_consistent_map(dirs, cfg):
+    """Each command is its own process and the graph admits one opener at a time: they queue, and never corrupt."""
+    import os
+    import subprocess
+
+    home, project = dirs
+    claude_trio(home, project, allow=["mcp__slack", "mcp__fetch"])
+    env = {**os.environ, "TAINTTRAIL_HOME": str(cfg.home), "TAINTTRAIL_KEY": "test-key-not-a-secret", "NO_COLOR": "1"}
+    base = [sys.executable, "-m", "tainttrail", "--project", str(cfg.root)]
+    scan_cmd = [*base, "scan", "--home", str(home), "--path", str(project), "--json"]
+    assert subprocess.run(scan_cmd, env=env, capture_output=True, text=True, timeout=120).returncode == 0
+    commands = [scan_cmd, [*base, "paths", "--json"], scan_cmd, [*base, "tools", "--json"], [*base, "fix", "--json"]]
+    running = [subprocess.Popen(c, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for c in commands]
+    finished = 0
+    for command, proc in zip(commands, running):
+        out, err = proc.communicate(timeout=180)
+        assert "Traceback" not in err, err[-600:]
+        if proc.returncode == 0:
+            json.loads(out)
+            finished += 1
+        else:       # on a loaded machine a command may give up waiting for its turn: it says so, and changes nothing
+            assert proc.returncode == 1 and ("busy" in err or "held by another process" in err), (command[5], err[-400:])
+    assert finished >= 1
+    with Store(cfg.db_path) as store:
+        assert set(servers(store)) == {"builtin", "fetch", "filesystem", "slack"}
+        tools = store.scalar("MATCH (t:Tool) RETURN count(t)")
+        assert store.scalar("MATCH (:Server)-[p:PROVIDES]->(:Tool) RETURN count(p)") == tools > 30
+        assert store.scalar("MATCH (a:Agent {id: 'claude-code'}) RETURN count(a)") == 1
+        assert store.scalar("MATCH (c:Credential) RETURN count(c)") == 2
+
+
+def test_a_declared_tool_is_attached_under_the_name_its_agent_gives_it(dirs):
+    """Gemini CLI spells MCP tools mcp_<server>_<tool>; a hand-declared one must still find its server."""
+    home, project = dirs
+    write(project / ".gemini" / "settings.json", {
+        "mcpServers": {"notes": {"command": "node", "args": ["notes.js"]}, "notes_archive": {"command": "node", "args": ["a.js"]}},
+        "tools": {"allowed": ["mcp_notes_archive_export"]}})
+    with Store(":memory:") as store:
+        do_scan(store, home, project)
+        for name in ("mcp_notes_send", "mcp_notes_archive_export", "custom_builtin"):
+            scan.set_tool_labels(store, name, {"external_sink": True}, agent="gemini-cli")
+        do_scan(store, home, project)
+        assert tools_of(store, "gemini-cli/notes") == {"mcp_notes_send"}
+        assert tools_of(store, "gemini-cli/notes_archive") == {"mcp_notes_archive_export"}, "the longest server name wins"
+        assert "custom_builtin" in tools_of(store, "gemini-cli/builtin")
+        export = tool(store, "mcp_notes_archive_export", "gemini-cli")
+        assert (export["origin"], export["permission"], export["gate"], export["tool"]) == ("user", "allow", "open", "export")

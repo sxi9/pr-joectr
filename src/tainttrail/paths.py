@@ -19,7 +19,10 @@ therefore returns the paths in factored form: one row per (source server, data s
 sink server) with the number of tools on each leg and the number of paths, both computed
 inside the query. A second query names the tools on each leg; every source x data x sink
 combination of a row is a path, and each one can be checked on its own with the witness
-query.
+query. A third adds the legs up over the servers: one row of totals per agent, which is
+what counting and what-if checks use. The rows of the first query grow with the cube of
+the number of servers, so past ``MAX_LISTED_FAMILIES`` of them the same paths are handed
+out merged per source server instead.
 
 ``fix`` then looks for the cheapest set of permission changes that leaves no path open,
 and checks its answer by applying it in a transaction that is rolled back
@@ -38,6 +41,8 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping
+
+import relate
 
 from . import schema as S
 from .config import Config
@@ -101,6 +106,31 @@ RETURN a.id AS agent, src.server AS source_server, dat.server AS data_server, sn
        src.tools * dat.tools * snk.open AS open_paths,
        src.tools * dat.tools * snk.unpinned AS unpinned_paths
 ORDER BY open_paths DESC, paths DESC, source_server, data_server, sink_server"""
+
+# The same three legs, added up over the agent's servers: what the rows of the path query
+# sum to. Every source combines with every data tool and every sink of the agent, so the
+# totals are products of three counts. One row at any size, which is what counting and
+# what-if checks need (the path query's rows grow with the cube of the number of servers).
+TOTALS_QUERY = f"""
+MATCH (a:Agent {{id: $agent}})
+CALL (a) {{
+  {_LEG.format(capability=S.CAP_UNTRUSTED_INPUT)}
+  RETURN count(t) AS sources
+}}
+CALL (a) {{
+  {_LEG.format(capability=S.CAP_PRIVATE_DATA)}
+  RETURN count(t) AS data
+}}
+CALL (a) {{
+  {_LEG.format(capability=S.CAP_EXTERNAL_SINK)}
+  RETURN count(t) AS sinks,
+         sum(CASE WHEN {_RUNS_UNASKED} AND NOT t.id IN $ask THEN 1 ELSE 0 END) AS open_sinks,
+         sum(CASE WHEN coalesce(t.permission, 'default') <> 'ask' AND NOT t.id IN $ask THEN 1 ELSE 0 END) AS unpinned_sinks
+}}
+RETURN a.id AS agent, sources, data, sinks, open_sinks, unpinned_sinks,
+       sources * data * sinks AS paths,
+       sources * data * open_sinks AS open_paths,
+       sources * data * unpinned_sinks AS unpinned_paths"""
 
 # Which tools stand on each leg. Same conditions and parameters as the path query; it
 # names the tools that the path query counts.
@@ -401,24 +431,95 @@ class Family:
     paths: int              # the three counts are computed by the path query
     open_paths: int
     unpinned_paths: int
+    combinations: int = 1   # server triples it stands for; more than one in a merged family
+    merged: bool = False
 
 
-def path_families(store: Store, agent: str, *, deny: Iterable[str] = (), ask: Iterable[str] = ()) -> list[Family]:
-    """Run the toxic-path query for one agent. ``deny`` and ``ask`` pose a what-if without writing."""
+MAX_LISTED_FAMILIES = 40_000        # server triples the path query lists one by one
+OTHER_SERVERS = "(other servers)"   # shown in place of a server name in a merged family
+ANY_SERVER = "(any server)"
+_Leg = tuple[list[str], frozenset[str], frozenset[str]]
+_NO_LEG: _Leg = ([], frozenset(), frozenset())
+
+
+def _merged_families(agent: str, legs: Mapping[tuple[str, str], _Leg]) -> list[Family]:
+    """The agent's paths as a few products per source server, for when the server triples are too many to list.
+
+    For a source server ``a`` the paths split three ways: data and sink on ``a`` as well (the
+    single-server case), data on ``a`` and the sink elsewhere, and data elsewhere with the
+    sink anywhere. The three parts are disjoint and together are every path that starts on
+    ``a``, so counting, ranking and the fix advisor work on them as on listed families.
+    """
+    def servers(capability: str) -> list[str]:
+        return sorted(server for server, cap in legs if cap == capability)
+
+    all_data = sorted(i for s in servers(S.CAP_PRIVATE_DATA) for i in legs[(s, S.CAP_PRIVATE_DATA)][0])
+    all_sinks = sorted(i for s in servers(S.CAP_EXTERNAL_SINK) for i in legs[(s, S.CAP_EXTERNAL_SINK)][0])
+    all_open = frozenset(i for s in servers(S.CAP_EXTERNAL_SINK) for i in legs[(s, S.CAP_EXTERNAL_SINK)][1])
+    all_unpinned = frozenset(i for s in servers(S.CAP_EXTERNAL_SINK) for i in legs[(s, S.CAP_EXTERNAL_SINK)][2])
+    data_servers, sink_servers = len(servers(S.CAP_PRIVATE_DATA)), len(servers(S.CAP_EXTERNAL_SINK))
+    families: list[Family] = []
+
+    def add(source_server: str, data_server: str, sink_server: str, sources: list[str], data: list[str],
+            sinks: list[str], open_sinks: frozenset[str], unpinned: frozenset[str], combinations: int) -> None:
+        if sources and data and sinks:
+            pairs = len(sources) * len(data)
+            families.append(Family(agent, source_server, data_server, sink_server, sources, data, sinks,
+                                   open_sinks, unpinned, pairs * len(sinks), pairs * len(open_sinks),
+                                   pairs * len(unpinned), combinations, True))
+
+    for a in servers(S.CAP_UNTRUSTED_INPUT):
+        sources = legs[(a, S.CAP_UNTRUSTED_INPUT)][0]
+        own_data = legs.get((a, S.CAP_PRIVATE_DATA), _NO_LEG)[0]
+        own_sinks, own_open, own_unpinned = legs.get((a, S.CAP_EXTERNAL_SINK), _NO_LEG)
+        if own_data and own_sinks:
+            held, kept = set(own_data), set(own_sinks)
+            other_data = [i for i in all_data if i not in held]
+            other_sinks = [i for i in all_sinks if i not in kept]
+            add(a, a, a, sources, own_data, own_sinks, own_open, own_unpinned, 1)
+            add(a, a, OTHER_SERVERS, sources, own_data, other_sinks, all_open - own_open,
+                all_unpinned - own_unpinned, sink_servers - 1)
+            add(a, OTHER_SERVERS, ANY_SERVER, sources, other_data, all_sinks, all_open, all_unpinned,
+                (data_servers - 1) * sink_servers)
+        elif own_data:
+            held = set(own_data)
+            add(a, a, ANY_SERVER, sources, own_data, all_sinks, all_open, all_unpinned, sink_servers)
+            add(a, OTHER_SERVERS, ANY_SERVER, sources, [i for i in all_data if i not in held], all_sinks, all_open,
+                all_unpinned, (data_servers - 1) * sink_servers)
+        else:
+            add(a, ANY_SERVER, ANY_SERVER, sources, all_data, all_sinks, all_open, all_unpinned,
+                data_servers * sink_servers)
+    return families
+
+
+def path_families(store: Store, agent: str, *, deny: Iterable[str] = (), ask: Iterable[str] = (),
+                  merged: bool | None = None) -> list[Family]:
+    """Run the toxic-path query for one agent. ``deny`` and ``ask`` pose a what-if without writing.
+
+    One family per (source server, data server, sink server) while there are at most
+    ``MAX_LISTED_FAMILIES`` of them; beyond that the same paths come back merged per source
+    server, because the listing would outgrow what the graph engine builds in one statement.
+    ``merged=True`` asks for the merged form at any size: enough for a caller that needs
+    the legs and not the server triples.
+    """
     params = {"agent": agent, "deny": list(deny), "ask": list(ask)}
-    legs: dict[tuple[str, str], tuple[list[str], frozenset[str], frozenset[str]]] = {}
+    legs: dict[tuple[str, str], _Leg] = {}
     for row in store.run(LEGS_QUERY, params):
         legs[(row["server"], row["capability"])] = (
             sorted(row["tools"]), frozenset(row["open"]), frozenset(row["unpinned"]))
-    nothing: tuple[list[str], frozenset[str], frozenset[str]] = ([], frozenset(), frozenset())
+    triples = 1
+    for capability in (S.CAP_UNTRUSTED_INPUT, S.CAP_PRIVATE_DATA, S.CAP_EXTERNAL_SINK):
+        triples *= sum(1 for _server, cap in legs if cap == capability)
+    if merged or (merged is None and triples > MAX_LISTED_FAMILIES):
+        return _merged_families(agent, legs)
     families = []
     for row in store.run(PATH_QUERY, params):
-        sinks, open_sinks, unpinned_sinks = legs.get((row["sink_server"], S.CAP_EXTERNAL_SINK), nothing)
+        sinks, open_sinks, unpinned_sinks = legs.get((row["sink_server"], S.CAP_EXTERNAL_SINK), _NO_LEG)
         families.append(Family(
             agent=row["agent"], source_server=row["source_server"], data_server=row["data_server"],
             sink_server=row["sink_server"],
-            sources=legs.get((row["source_server"], S.CAP_UNTRUSTED_INPUT), nothing)[0],
-            data=legs.get((row["data_server"], S.CAP_PRIVATE_DATA), nothing)[0],
+            sources=legs.get((row["source_server"], S.CAP_UNTRUSTED_INPUT), _NO_LEG)[0],
+            data=legs.get((row["data_server"], S.CAP_PRIVATE_DATA), _NO_LEG)[0],
             sinks=sinks, open_sinks=open_sinks, unpinned_sinks=unpinned_sinks,
             paths=int(row["paths"]), open_paths=int(row["open_paths"]), unpinned_paths=int(row["unpinned_paths"]),
         ))
@@ -555,6 +656,8 @@ class PathReport:
     legs: dict[str, dict[str, list[str]]] = field(default_factory=dict)   # agent -> role -> tool ids
     families: list[Family] = field(default_factory=list, repr=False)
     facts: dict[str, ToolFacts] = field(default_factory=dict, repr=False)
+    combinations: int = 0       # (source server, data server, sink server) triples that carry a path
+    merged: bool = False        # too many triples to list: ``groups`` are per source server instead
 
     @property
     def top_score(self) -> int:
@@ -566,6 +669,7 @@ class PathReport:
         return {
             "agents": self.agents, "total": self.total, "open": self.open, "gated": self.gated,
             "top_score": self.top_score, "group_count": len(self.groups),
+            "combinations": self.combinations, "merged": self.merged,
             "groups": [g.to_dict() for g in shown],
             "paths": [p.to_dict() for p in self.paths], "query": PATH_QUERY.strip(),
         }
@@ -582,6 +686,8 @@ def find_paths(store: Store, *, agent: str | None = None, limit: int = 20, min_s
         families = path_families(store, row["id"])
         report.facts.update(facts)
         report.families += families
+        report.combinations += sum(f.combinations for f in families)
+        report.merged = report.merged or any(f.merged for f in families)
         names = {t.server_id: _server_label(t) for t in facts.values()}
         builtin = {t.server_id for t in facts.values() if t.builtin}
         ranking = _Ranking(facts)
@@ -624,9 +730,9 @@ def find_paths(store: Store, *, agent: str | None = None, limit: int = 20, min_s
 
 def count_paths(store: Store, agent: str, *, deny: Iterable[str] = (), ask: Iterable[str] = ()) -> dict[str, int]:
     """The path query's totals for one agent: all paths, open ones, and ones no ask rule holds."""
-    rows = store.run(PATH_QUERY, {"agent": agent, "deny": list(deny), "ask": list(ask)})
-    return {"paths": sum(int(r["paths"]) for r in rows), "open": sum(int(r["open_paths"]) for r in rows),
-            "unpinned": sum(int(r["unpinned_paths"]) for r in rows)}
+    row = store.one(TOTALS_QUERY, {"agent": agent, "deny": list(deny), "ask": list(ask)}) or {}
+    return {"paths": int(row.get("paths") or 0), "open": int(row.get("open_paths") or 0),
+            "unpinned": int(row.get("unpinned_paths") or 0)}
 
 
 def witness(store: Store, path: ToxicPath) -> dict[str, Any] | None:
@@ -660,14 +766,38 @@ def simulate(store: Store, *, deny: Iterable[str] = (), ask: Iterable[str] = (),
 BASELINE_FORMAT = "tainttrail-paths-baseline/1"
 
 
-def baseline_of(report: PathReport) -> dict[str, Any]:
-    return {"format": BASELINE_FORMAT, "agents": report.legs}
+def baseline_of(report: PathReport, keep: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """The report's legs as a baseline. ``keep`` is an earlier baseline whose other agents stay as they are."""
+    agents = {**((keep or {}).get("agents") or {}), **report.legs}
+    return {"format": BASELINE_FORMAT, "agents": agents}
 
 
-def save_baseline(path: str | os.PathLike[str], report: PathReport) -> None:
-    target = Path(path)
+def _write_atomically(target: Path, text: str, mode: int | None = None) -> None:
+    """Write a file by renaming a finished temporary file onto it.
+
+    A reader never sees half a file, and a symbolic link planted at the path is replaced,
+    not followed: nothing is ever written through it to wherever it points.
+    """
+    import tempfile
+
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(json.dumps(baseline_of(report), indent=1, sort_keys=True) + "\n", encoding="utf-8")
+    fd, temporary = tempfile.mkstemp(prefix=target.name + ".", suffix=".tmp", dir=str(target.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        if mode is not None:
+            os.chmod(temporary, mode)
+        os.replace(temporary, target)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+
+
+def save_baseline(path: str | os.PathLike[str], report: PathReport, *, keep: Mapping[str, Any] | None = None) -> None:
+    _write_atomically(Path(path), json.dumps(baseline_of(report, keep), indent=1, sort_keys=True) + "\n")
 
 
 def load_baseline(path: str | os.PathLike[str]) -> dict[str, Any] | None:
@@ -682,9 +812,18 @@ def load_baseline(path: str | os.PathLike[str]) -> dict[str, Any] | None:
         data = json.loads(text)
     except ValueError as exc:
         raise ValueError(f"{path} is not valid JSON") from exc
-    if not isinstance(data, dict) or data.get("format") != BASELINE_FORMAT or not isinstance(data.get("agents"), dict):
+    if not isinstance(data, dict) or data.get("format") != BASELINE_FORMAT or not _baseline_agents_ok(data.get("agents")):
         raise ValueError(f"{path} is not a TaintTrail path baseline")
     return data
+
+
+def _baseline_agents_ok(agents: Any) -> bool:
+    """``{agent: {role: [tool id, ...]}}`` and nothing else: the file may be anybody's by the time CI reads it."""
+    return isinstance(agents, dict) and all(
+        isinstance(agent, str) and isinstance(legs, dict) and all(
+            isinstance(role, str) and isinstance(ids, list) and all(isinstance(i, str) for i in ids)
+            for role, ids in legs.items())
+        for agent, legs in agents.items())
 
 
 def new_paths(report: PathReport, baseline: Mapping[str, Any] | None, *, limit: int = 20,
@@ -1251,7 +1390,8 @@ def propose_fix(store: Store, *, agent: str | None = None, strict: bool = False,
         if agent and row["id"] != agent:
             continue
         facts = tool_facts(store, row["id"])
-        instance = build_instance(row["id"], path_families(store, row["id"]), facts, strict=strict)
+        # The advisor reasons about legs, not about server triples: the merged form is all it needs.
+        instance = build_instance(row["id"], path_families(store, row["id"], merged=True), facts, strict=strict)
         solution = solve_instance(instance, method=method, exact_limit=exact_limit)
         changes = [c for i in solution.chosen for c in instance.candidates[i].changes]
         changes.sort(key=lambda c: (c.action, c.scope != "server", c.target, c.rule))
@@ -1302,16 +1442,38 @@ def merge_settings(settings: dict[str, Any], snippet: Mapping[str, Any]) -> list
     return added
 
 
+def _not_json(name: str) -> Any:
+    raise ValueError(f"{name} is not JSON")
+
+
+def _backup_once(target: Path, mode: int) -> str | None:
+    """Keep the file as it is now beside it as ``<name>.bak``, unless something already has that name.
+
+    The backup is created, never opened: a link somebody planted under that name (in a
+    cloned repository, say) is left alone, and nothing is written to where it points.
+    """
+    backup = str(target) + ".bak"
+    if os.path.lexists(backup):
+        return None
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+    try:
+        fd = os.open(backup, flags, mode)
+    except FileExistsError:
+        return None
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(target.read_bytes())
+    os.chmod(backup, mode)
+    return backup
+
+
 def apply_settings(path: str | os.PathLike[str], snippet: Mapping[str, Any]) -> ApplyResult:
     """Merge permission rules into a settings file.
 
     The file is rewritten only when something is added, the first rewrite leaves the
-    original beside it as ``<name>.bak``, and a file that is not a JSON object is refused
-    rather than overwritten.
+    original beside it as ``<name>.bak``, and a file that is not a JSON object, or that
+    could not be written back as valid JSON, is refused rather than overwritten.
     """
-    import shutil
     import stat
-    import tempfile
 
     target = Path(os.path.realpath(os.fspath(path)))
     existed = target.exists()
@@ -1319,12 +1481,13 @@ def apply_settings(path: str | os.PathLike[str], snippet: Mapping[str, Any]) -> 
     if existed:
         try:
             text = target.read_text(encoding="utf-8-sig")
-        except OSError as exc:
-            raise FixError(f"{target} cannot be read ({exc.strerror or type(exc).__name__})") from exc
+        except (OSError, UnicodeDecodeError) as exc:
+            reason = getattr(exc, "strerror", None) or type(exc).__name__
+            raise FixError(f"{target} cannot be read ({reason}); it was left untouched") from exc
         if text.strip():
             try:
-                settings = json.loads(text)
-            except ValueError as exc:
+                settings = json.loads(text, parse_constant=_not_json)     # NaN and Infinity are not JSON
+            except (ValueError, RecursionError) as exc:
                 raise FixError(f"{target} is not valid JSON; it was left untouched") from exc
         if not isinstance(settings, dict):
             raise FixError(f"{target} does not hold a JSON object; it was left untouched")
@@ -1334,34 +1497,45 @@ def apply_settings(path: str | os.PathLike[str], snippet: Mapping[str, Any]) -> 
         raise FixError(f"{target}: {exc}; it was left untouched") from exc
     if not added:
         return ApplyResult(str(target), [], None, False)
-    backup = None
     try:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        if existed and not os.path.exists(str(target) + ".bak"):
-            backup = str(target) + ".bak"
-            shutil.copy2(target, backup)
-        fd, temporary = tempfile.mkstemp(prefix=target.name + ".", suffix=".tmp", dir=str(target.parent))
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                fh.write(json.dumps(settings, indent=2, ensure_ascii=False) + "\n")
-            if existed:
-                os.chmod(temporary, stat.S_IMODE(os.stat(target).st_mode))
-            os.replace(temporary, target)
-        except BaseException:
-            try:
-                os.unlink(temporary)
-            except OSError:
-                pass
-            raise
+        rewritten = json.dumps(settings, indent=2, ensure_ascii=False, allow_nan=False) + "\n"
+    except (ValueError, RecursionError) as exc:    # 1e999 reads as infinity, which no JSON parser takes back
+        raise FixError(f"{target} holds a value that cannot be written back as JSON; it was left untouched") from exc
+    try:
+        mode = stat.S_IMODE(os.stat(target).st_mode) if existed else None
+        backup = _backup_once(target, mode) if mode is not None else None
+        _write_atomically(target, rewritten, mode)
     except OSError as exc:
         raise FixError(f"{target} could not be written ({exc.strerror or type(exc).__name__})") from exc
     return ApplyResult(str(target), added, backup, True)
+
+
+def refuse_link_out_of_project(target: Path) -> None:
+    """Refuse to follow ``<project>/.claude/settings.json`` when it is a link that leads elsewhere.
+
+    A cloned repository can ship that path as a symbolic link to any file its reader owns.
+    A file named with ``--settings`` is the caller's own choice and is not checked.
+    """
+    real = os.path.realpath(target)
+    expected = os.path.join(os.path.realpath(target.parent.parent), target.parent.name, target.name)
+    if real != expected:
+        raise FixError(f"{target} is a symbolic link to {real}; it was left untouched. "
+                       f"To change that file, name it: --settings {real}")
 
 
 # -- commands ----------------------------------------------------------------------------------------------
 
 _PART_LABELS = {"exposure": "exposure", "data": "data", "sink": "sink", "unattended": "unattended",
                 "confidence": "confidence", "single_server": "single server"}
+
+
+MAX_SPELLED_OUT = 10_000        # paths one command spells out; each one is a sentence and six numbers
+JSON_GROUPS = 1000              # server combinations in the JSON output unless --groups says otherwise
+
+
+def _engine_message(exc: BaseException) -> str:
+    lines = str(exc).strip().splitlines()
+    return (lines[0] if lines else type(exc).__name__)[:200]
 
 
 def severity(score: int) -> str:
@@ -1372,7 +1546,8 @@ def add_paths_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--agent", metavar="KIND", help="only this agent (for example claude-code)")
     parser.add_argument("--limit", type=int, default=5, metavar="N", help="spell out the N worst paths (default 5)")
     parser.add_argument("--groups", type=int, default=None, metavar="N",
-                        help="show the N worst server combinations (default: 12 as text, all as JSON)")
+                        help="show the N worst server combinations (default: 12 as text, 1000 as JSON; "
+                             "group_count in the JSON says how many there are)")
     parser.add_argument("--min-score", type=int, default=0, metavar="N", help="list only paths scoring at least N")
     parser.add_argument("--status", choices=("open", "gated"),
                         help="list only paths whose sink runs unasked (open) or asks first (gated)")
@@ -1419,6 +1594,9 @@ def cmd_paths(args: argparse.Namespace, cfg: Config) -> int:
     if limit < 0 or (groups is not None and groups < 0):
         print("tainttrail paths: --limit and --groups cannot be negative", file=sys.stderr)
         return 2
+    if limit > MAX_SPELLED_OUT:
+        print(f"tainttrail paths: --limit cannot be more than {MAX_SPELLED_OUT}", file=sys.stderr)
+        return 2
     baseline_path = getattr(args, "baseline", None) or str(cfg.home / "paths-baseline.json")
     store = _open_or_explain(cfg, "paths", read_only=True)
     if store is None:
@@ -1430,10 +1608,18 @@ def cmd_paths(args: argparse.Namespace, cfg: Config) -> int:
     except StoreError as exc:
         print(f"tainttrail paths: {exc}", file=sys.stderr)
         return 1
+    except relate.Error as exc:
+        print(f"tainttrail paths: the graph engine refused the query ({_engine_message(exc)})", file=sys.stderr)
+        return 1
 
     if getattr(args, "accept", False):
         try:
-            save_baseline(baseline_path, report)
+            # Accepting one agent's paths must not forget what was accepted for the others.
+            keep = load_baseline(baseline_path) if getattr(args, "agent", None) else None
+            save_baseline(baseline_path, report, keep=keep)
+        except ValueError as exc:
+            print(f"tainttrail paths: {exc}. Remove it, or name another file with --baseline.", file=sys.stderr)
+            return 1
         except OSError as exc:
             print(f"tainttrail paths: {baseline_path} could not be written ({exc.strerror})", file=sys.stderr)
             return 1
@@ -1464,7 +1650,7 @@ def cmd_paths(args: argparse.Namespace, cfg: Config) -> int:
         verdict = {"failed": True, "reason": f"a path scores {report.top_score}, at or above the limit of {threshold}"}
 
     if getattr(args, "json", False):
-        out = report.to_dict(groups)
+        out = report.to_dict(JSON_GROUPS if groups is None else groups)
         out["gate"] = verdict
         if fresh is not None:
             out["new"] = {"count": fresh[0], "paths": [p.to_dict() for p in fresh[1]]}
@@ -1519,6 +1705,9 @@ def render_paths(report: PathReport, *, color: bool = False, paint: Any = None, 
         if len(report.groups) > groups:
             lines.append(paint(f"  ... and {len(report.groups) - groups} more server combinations (--groups N)",
                                "dim", color=color))
+        if report.merged:
+            lines.append(paint(f"  {report.combinations:,} server combinations carry a path: too many to list one "
+                               "by one, so they are shown per source server", "dim", color=color))
         shown = report.paths if filtered else [g.top for g in report.groups if g.top][: len(report.paths)]
         if shown:
             title = "Paths matching the filter" if filtered else "The worst path of each of those combinations"
@@ -1586,6 +1775,8 @@ def cmd_fix(args: argparse.Namespace, cfg: Config) -> int:
                 print(f"tainttrail fix: --apply would change {target}. Add --yes to confirm.", file=sys.stderr)
                 return 2
             if apply and snippet["permissions"]:
+                if not getattr(args, "settings", None):
+                    refuse_link_out_of_project(target)
                 applied = apply_settings(target, snippet)
                 with store.transaction():   # the settings now say so; make the map agree
                     apply_changes(store, [c for c in proposal.changes if c.agent == "claude-code"],
@@ -1600,6 +1791,9 @@ def cmd_fix(args: argparse.Namespace, cfg: Config) -> int:
         return 1
     except StoreError as exc:
         print(f"tainttrail fix: {exc}", file=sys.stderr)
+        return 1
+    except relate.Error as exc:
+        print(f"tainttrail fix: the graph engine refused the query ({_engine_message(exc)})", file=sys.stderr)
         return 1
 
     if getattr(args, "json", False):
@@ -1652,6 +1846,11 @@ def render_fix(proposal: FixProposal, *, target: str, applied: ApplyResult | Non
         if snippet["permissions"].get("ask"):
             lines.append(paint("An ask rule prompts in every permission mode; in headless runs (claude -p) it "
                                "refuses the call.", "dim", color=color))
+        if any(c.scope == "pattern" and c.agent == "claude-code" for c in proposal.changes):
+            lines.append(paint("Asking for an allowed command pattern makes every command it covers prompt, and an "
+                               "ask rule outranks any narrower allow rule. To keep the harmless commands unasked, "
+                               "narrow the allow rule itself instead (for example to `git status:*`): that edit is yours "
+                               "to make.", "dim", color=color))
     for fix in proposal.agents:
         if fix.agent == "claude-code" or not fix.changes:
             continue

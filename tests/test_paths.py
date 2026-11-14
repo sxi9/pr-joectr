@@ -958,3 +958,230 @@ def test_no_command_prints_a_secret_that_sits_in_a_configuration_file(dirs, cfg,
             assert canary not in text, f"the {what} was printed or stored"
     # The shell is open because of an allow rule that holds a token; the fix names the tool, not the rule.
     assert '"Bash"' in outputs[7] and "Bearer" not in outputs[7]
+
+
+# -- review: counts, sizes and files that are not ours ------------------------------------------------------------
+
+
+def test_the_totals_query_adds_up_to_the_rows_of_the_path_query(dirs):
+    home, project = dirs
+    claude_trio(home, project, allow=["mcp__slack", "mcp__fetch"], ask=["mcp__slack__slack_reply_to_thread"],
+                deny=["mcp__filesystem__read_file"])
+    with Store(":memory:") as store:
+        do_scan(store, home, project)
+        what_ifs = [dict(deny=[], ask=[]), dict(deny=["claude-code::mcp__fetch__fetch"], ask=[]),
+                    dict(deny=["claude-code::Bash", "claude-code::Read"], ask=["claude-code::mcp__slack__slack_post_message"])]
+        for what_if in what_ifs:
+            rows = store.run(paths.PATH_QUERY, {"agent": "claude-code", **what_if})
+            [total] = store.run(paths.TOTALS_QUERY, {"agent": "claude-code", **what_if})
+            for key in ("paths", "open_paths", "unpinned_paths"):
+                assert total[key] == sum(r[key] for r in rows) > 0, (key, what_if)
+            counted = paths.count_paths(store, "claude-code", **what_if)
+            assert counted == {"paths": total["paths"], "open": total["open_paths"], "unpinned": total["unpinned_paths"]}
+        assert store.run(paths.TOTALS_QUERY, {"agent": "nobody", "deny": [], "ask": []}) == []
+        assert paths.count_paths(store, "nobody") == {"paths": 0, "open": 0, "unpinned": 0}
+
+
+def test_merged_families_are_the_same_paths_as_listed_ones(dirs, monkeypatch):
+    """Past a number of server triples the paths come back per source server. Nothing else may change."""
+    home, project = dirs
+    claude_trio(home, project, allow=["mcp__slack", "mcp__fetch"], ask=["mcp__slack__slack_reply_to_thread"])
+    with Store(":memory:") as store:
+        do_scan(store, home, project)
+        listed = paths.find_paths(store, limit=60)
+        baseline = paths.baseline_of(listed)
+        fix = paths.propose_fix(store)
+        monkeypatch.setattr(paths, "MAX_LISTED_FAMILIES", 3)
+        merged = paths.find_paths(store, limit=60)
+        assert merged.merged and not listed.merged and len(merged.groups) < len(listed.groups)
+        assert merged.combinations == listed.combinations == len(listed.groups)
+        assert expand(merged) == expand(listed) == set(plain_paths(store))
+        assert sum(len(f.sources) * len(f.data) * len(f.sinks) for f in merged.families) == listed.total, "no path twice"
+        assert (merged.total, merged.open, merged.gated) == (listed.total, listed.open, listed.gated)
+        assert merged.legs == listed.legs and merged.top_score == listed.top_score
+        assert [(p.key, p.score) for p in merged.paths] == [(p.key, p.score) for p in listed.paths]
+        for wanted in ("open", "gated"):
+            assert [p.score for p in paths.best_paths(merged.families, merged.facts, limit=30, status=wanted)] == \
+                   [p.score for p in paths.best_paths(listed.families, listed.facts, limit=30, status=wanted)]
+        single = [g for g in merged.groups if g.single_server]
+        assert {g.source_server for g in single} == {g.source_server for g in listed.groups if g.single_server}
+        assert any(g.sink_server == paths.ANY_SERVER for g in merged.groups)
+        assert paths.new_paths(merged, baseline) == (0, [])
+        again = paths.propose_fix(store)
+        assert (again.cost, sorted(c.rule for c in again.changes)) == (fix.cost, sorted(c.rule for c in fix.changes))
+        text = paths.render_paths(merged)
+        assert "too many to list one by one" in text and "(any server)" in text
+        assert merged.to_dict(2)["merged"] is True and merged.to_dict(2)["combinations"] == len(listed.groups)
+
+
+def test_sixty_servers_with_all_three_legs_are_handled(mem):
+    """68,921 server triples: more than are listed one by one (and at a few times this, more than the engine builds)."""
+    tools = [node(role, f"srv{s:02d}", caps) for s in range(40) for role, caps in (("src", "U"), ("dat", "P"), ("snk", "S"))]
+    tools += [node("only_source", "feeds", "U"), node("only_data", "vault", "P"), node("only_sink", "outbox", "S")]
+    build(mem, tools)
+    started = time.monotonic()
+    report = paths.find_paths(mem, limit=10)
+    proposal = paths.propose_fix(mem)
+    assert time.monotonic() - started < 30
+    assert report.merged and report.combinations == 41 ** 3 and report.total == report.open == 41 ** 3
+    assert len(report.groups) < 200 and len(report.paths) == 10
+    assert report.paths[0].single_server and report.paths[0].components["single_server"] == 10
+    assert (proposal.live_before, proposal.live_after) == (41 ** 3, 0)
+    assert 40 < proposal.cost <= 41 and {c.action for c in proposal.changes} == {"ask"}, "gate the 41 sinks"
+    assert paths.simulate(mem, deny=[tid("srv00", "src")])["paths_after"] == 40 * 41 * 41
+
+
+def test_a_baseline_of_the_wrong_shape_is_refused_not_trusted(tmp_path, cfg, capsys):
+    for agents in ('{"claude-code": []}', '{"claude-code": {"sources": 5}}', '{"claude-code": "x"}', '[]',
+                   '{"claude-code": {"sources": "abc"}}', '{"claude-code": {"sinks": [1, [2], null]}}', '{"a": {"x": {"y": 1}}}'):
+        bad = write(tmp_path / "bad.json", text='{"format": "tainttrail-paths-baseline/1", "agents": ' + agents + "}")
+        with pytest.raises(ValueError, match="is not a TaintTrail path baseline"):
+            paths.load_baseline(bad)
+    with Store(cfg.db_path) as store:
+        build(store, [node("page", "web", "U"), node("vault", "kv", "P"), node("send", "out", "S")])
+    assert paths_cli(cfg, "--fail-on-new", "--baseline", bad) == 1
+    assert "is not a TaintTrail path baseline" in capsys.readouterr().err
+
+
+def test_accepting_one_agents_paths_keeps_what_was_accepted_for_the_others(cfg, tmp_path, capsys):
+    with Store(cfg.db_path) as store:
+        for agent in ("claude-code", "cursor"):
+            build(store, [node("page", "web", "U"), node("vault", "kv", "P"), node("send", "out", "S")], agent=agent)
+    baseline = tmp_path / "baseline.json"
+    assert paths_cli(cfg, "--accept", "--baseline", baseline) == 0
+    with Store(cfg.db_path) as store:
+        build(store, [node("post", "chat", "S")], agent="windsurf")     # no path: nothing of its own to accept
+        store.write("MATCH (s:Server {id: 'cursor/out'}) CREATE (t:Tool {id: 'cursor::mcp__out__more', name: 'mcp__out__more', "
+                    "server: 'out', gate: 'open', external_sink: true}) CREATE (s)-[:PROVIDES]->(t) "
+                    "WITH t MATCH (k:Capability {name: 'external_sink'}) CREATE (t)-[:HAS_CAPABILITY]->(k)")
+    assert paths_cli(cfg, "--fail-on-new", "--baseline", baseline) == 3, "cursor has a new sink"
+    assert paths_cli(cfg, "--accept", "--agent", "cursor", "--baseline", baseline) == 0
+    assert sorted(json.loads(baseline.read_text())["agents"]) == ["claude-code", "cursor"]
+    assert paths_cli(cfg, "--fail-on-new", "--baseline", baseline) == 0
+    capsys.readouterr()
+    write(baseline, text="{broken")
+    assert paths_cli(cfg, "--accept", "--agent", "cursor", "--baseline", baseline) == 1, "a broken file is not built upon"
+    assert "not valid JSON" in capsys.readouterr().err and baseline.read_text() == "{broken"
+    assert paths_cli(cfg, "--accept", "--baseline", baseline) == 0, "accepting everything replaces it"
+
+
+def test_a_baseline_is_never_written_through_a_link_somebody_planted(cfg, tmp_path):
+    import os
+
+    with Store(cfg.db_path) as store:
+        build(store, [node("page", "web", "U"), node("vault", "kv", "P"), node("send", "out", "S")])
+    victim = write(tmp_path / "victim.txt", text="mine\n")
+    os.symlink(victim, cfg.home / "paths-baseline.json")
+    assert paths_cli(cfg, "--accept") == 0
+    assert victim.read_text() == "mine\n", "the link was replaced by the baseline, not followed"
+    assert not (cfg.home / "paths-baseline.json").is_symlink()
+    assert json.loads((cfg.home / "paths-baseline.json").read_text())["format"] == paths.BASELINE_FORMAT
+    assert paths_cli(cfg, "--fail-on-new") == 0
+
+
+@pytest.mark.parametrize("content", ['{"timeout": NaN}', '{"limits": [Infinity]}', '{"a": -Infinity}', '{"budget": 1e999}'])
+def test_a_settings_file_that_would_not_come_back_as_json_is_left_untouched(tmp_path, content):
+    """Python reads these; nothing else would read what Python writes back. The agent would lose its settings."""
+    path = write(tmp_path / "settings.json", text=content)
+    with pytest.raises(paths.FixError, match="left untouched"):
+        paths.apply_settings(path, {"permissions": {"ask": ["mcp__fetch"]}})
+    assert path.read_text() == content and not Path(str(path) + ".bak").exists()
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_the_backup_is_created_never_opened(tmp_path):
+    import os
+
+    original = {"mcpServers": {"x": {"command": "planted"}}, "permissions": {"allow": ["mcp__fetch"]}}
+    path = write(tmp_path / ".claude" / "settings.json", original)
+    elsewhere = tmp_path / "elsewhere" / "mcp.json"
+    elsewhere.parent.mkdir()
+    os.symlink(elsewhere, str(path) + ".bak")           # a dangling link where the backup goes
+    result = paths.apply_settings(path, {"permissions": {"ask": ["mcp__fetch__fetch"]}})
+    assert result.changed and result.backup is None
+    assert not elsewhere.exists(), "nothing was written to where the link points"
+    assert json.loads(path.read_text())["permissions"]["ask"] == ["mcp__fetch__fetch"]
+    # An ordinary earlier backup is kept as it is, too.
+    other = write(tmp_path / "other.json", {"permissions": {}})
+    write(tmp_path / "other.json.bak", text="an earlier backup")
+    assert paths.apply_settings(other, {"permissions": {"deny": ["WebFetch"]}}).backup is None
+    assert (tmp_path / "other.json.bak").read_text() == "an earlier backup"
+    # And a backup that is made carries the file's own mode.
+    private = write(tmp_path / "private.json", {"permissions": {}})
+    private.chmod(0o600)
+    made = paths.apply_settings(private, {"permissions": {"deny": ["WebFetch"]}})
+    assert made.backup and Path(made.backup).stat().st_mode & 0o777 == 0o600
+
+
+def test_fix_does_not_follow_a_project_settings_link_out_of_the_project(dirs, cfg, capsys):
+    import os
+
+    home, project = dirs
+    claude_github(home, project, allow=["mcp__github"])
+    write(project / ".claude" / "settings.local.json", settings(allow=["mcp__github"]))
+    outside = write(home / "dotfiles" / "claude-settings.json", {"model": "something"})
+    (project / ".claude" / "settings.json").unlink()
+    os.symlink(outside, project / ".claude" / "settings.json")
+    scan_cli(cfg, home, project)
+    capsys.readouterr()
+    assert fix_cli(cfg, "--apply", "--yes") == 1
+    err = capsys.readouterr().err
+    assert "is a symbolic link to" in err and f"--settings {outside}" in err
+    assert json.loads(outside.read_text()) == {"model": "something"} and not Path(str(outside) + ".bak").exists()
+    with Store(cfg.db_path) as store:
+        assert paths.find_paths(store).open > 0, "the map was not changed either"
+    # Naming the file is the caller's own decision: then the link is followed, and the linked file is the one rewritten.
+    assert fix_cli(cfg, "--apply", "--yes", "--settings", project / ".claude" / "settings.json") == 0
+    assert "permissions" in json.loads(outside.read_text()) and (project / ".claude" / "settings.json").is_symlink()
+    # A project that is itself reached through a link is fine.
+    link = home / "link-to-app"
+    os.symlink(project, link)
+    paths.refuse_link_out_of_project(link / ".claude" / "settings.local.json")
+
+
+def test_paths_command_bounds_its_output_and_survives_the_engine_saying_no(dirs, cfg, capsys, monkeypatch):
+    import relate
+
+    home, project = dirs
+    claude_trio(home, project, allow=["mcp__slack", "mcp__fetch"])
+    scan_cli(cfg, home, project)
+    capsys.readouterr()
+    assert paths_cli(cfg, "--limit", paths.MAX_SPELLED_OUT + 1) == 2
+    assert "--limit cannot be more than" in capsys.readouterr().err
+    monkeypatch.setattr(paths, "JSON_GROUPS", 3)
+    assert paths_cli(cfg, "--json") == 0
+    report = json.loads(capsys.readouterr().out)
+    assert len(report["groups"]) == 3 < report["group_count"] == report["combinations"]
+    assert paths_cli(cfg, "--json", "--groups", "5") == 0
+    assert len(json.loads(capsys.readouterr().out)["groups"]) == 5
+
+    def refuse(*args, **kwargs):
+        raise relate.DataError("This statement tried to build a single value of 256 MB.\nmore detail")
+
+    monkeypatch.setattr(paths, "find_paths", refuse)
+    monkeypatch.setattr(paths, "propose_fix", refuse)
+    assert paths_cli(cfg) == 1 and fix_cli(cfg) == 1
+    err = capsys.readouterr().err
+    assert err.count("the graph engine refused the query (This statement tried to build") == 2
+    assert "Traceback" not in err and "more detail" not in err
+
+
+def test_a_wide_git_rule_is_fixed_by_asking_for_it_and_the_next_scan_agrees(dirs, cfg, capsys):
+    """`Bash(git:*)` is one of the most common allow rules, and it allows `git push <any remote>`."""
+    home, project = dirs
+    claude_github(home, project, allow=["Bash(git:*)", "Bash(npm run *)", 'Bash(git commit -m "*")'])
+    scan_cli(cfg, home, project)
+    capsys.readouterr()
+    assert fix_cli(cfg) == 0
+    out = capsys.readouterr().out
+    assert "ask   Bash(git:*)" in out and "narrow the allow rule itself" in out
+    assert "Bash(npm run *)" not in out.split("Rules for")[1], "harmless patterns are left alone"
+    assert fix_cli(cfg, "--apply", "--yes", "--json") == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["settings"] == {"permissions": {"ask": ["Bash(git:*)"]}} and result["live_after"] == 0
+    scan_cli(cfg, home, project)
+    capsys.readouterr()
+    with Store(cfg.db_path) as store:
+        bash = tool(store, "Bash")
+        assert (bash["gate"], bash["open_partial"]) == ("ask", [])
+        assert paths.find_paths(store).open == 0
